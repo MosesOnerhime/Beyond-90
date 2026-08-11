@@ -7,6 +7,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local BallConfig = require(Shared.Config.BallConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local PitchConfig = require(Shared.Config.PitchConfig)
+local BallControlService = require(script.Parent.BallControlService)
 
 local BallService = {}
 
@@ -66,6 +67,7 @@ local function getBallSpawnPosition(): Vector3
 end
 
 local function resetBall(ball: BasePart)
+	BallControlService.Reset(ball)
 	ball.AssemblyLinearVelocity = Vector3.zero
 	ball.AssemblyAngularVelocity = Vector3.zero
 	ball.CFrame = CFrame.new(getBallSpawnPosition())
@@ -194,24 +196,34 @@ local function isOutOfDevelopmentBounds(position: Vector3): boolean
 	return math.abs(position.X) > halfWidth or math.abs(position.Z) > halfLength
 end
 
-local function validateBallState(ball: BasePart)
+local function validateBallState(ball: BasePart): boolean
 	local position = ball.Position
 
 	if not isFiniteVector(position) or position.Y < BallConfig.Safety.ResetFallY or isOutOfDevelopmentBounds(position) then
 		resetBall(ball)
-		return
+		return false
 	end
 
 	if not isFiniteVector(ball.AssemblyLinearVelocity) or not isFiniteVector(ball.AssemblyAngularVelocity) then
 		resetBall(ball)
-		return
+		return false
 	end
 
 	clampBallSpeed(ball)
+	return true
 end
 
 local function updateBallInteractions(ball: Part)
-	validateBallState(ball)
+	if not validateBallState(ball) then
+		return
+	end
+
+	local isControlled = BallControlService.Update(ball)
+
+	if isControlled then
+		clampBallSpeed(ball)
+		return
+	end
 
 	for _, player in Players:GetPlayers() do
 		local touchContext = getCharacterTouchContext(player, ball)
@@ -229,6 +241,7 @@ local function startInteractionLoop()
 
 	playerRemovingConnection = Players.PlayerRemoving:Connect(function(player)
 		lastTouchByPlayer[player] = nil
+		BallControlService.CleanupPlayer(player, activeBall)
 	end)
 
 	heartbeatConnection = RunService.Heartbeat:Connect(function(deltaTime)
@@ -275,6 +288,7 @@ function BallService.Initialize()
 	ball:SetAttribute("ServerOwned", true)
 	ball:SetNetworkOwner(nil)
 	activeBall = ball
+	BallControlService.Initialize(ball)
 	startInteractionLoop()
 
 	return ball
