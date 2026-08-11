@@ -704,6 +704,8 @@ Beyond 90 should first be an excellent football game.
 
 Everything else comes after that.
 
+---
+
 # 26. MVP Development Rule
 
 Beyond 90 should be developed as a sequence of small, playable milestones.
@@ -715,6 +717,7 @@ At any given stage, prioritize the smallest playable version of the current
 feature.
 
 Each milestone should:
+
 - Have a clearly defined goal.
 - Be independently testable.
 - Preserve existing functionality.
@@ -722,6 +725,7 @@ Each milestone should:
 - Be committed to Git once stable.
 
 Do not implement:
+
 - Progression before the core football loop is fun.
 - Monetization before progression is established.
 - Clubs before the core multiplayer experience is stable.
@@ -730,15 +734,19 @@ Do not implement:
 
 When a future system is required architecturally, create only the minimal
 interface or foundation needed for the current milestone.
+
 Do not build the full future system prematurely.
 
+---
 
 # 27. GameplayFootball Reference Strategy
 
-The primary external football-gameplay reference for Beyond 90 is:
+GameplayFootball — specifically the vi3itor fork at:
 
-    GameplayFootball — vi3itor fork
     https://github.com/vi3itor/GameplayFootball.git
+
+is the primary external football-gameplay reference for Beyond 90 unless
+explicitly instructed otherwise.
 
 GameplayFootball is a RESEARCH AND REFERENCE SOURCE.
 
@@ -749,42 +757,16 @@ It is NOT:
 - Beyond 90's specification
 - A project to directly port from C++ to Luau
 
-The purpose of studying GameplayFootball is to understand how another football
-game solves football-specific gameplay problems and extract useful concepts.
+For substantial football gameplay systems, research relevant GameplayFootball
+source before making major implementation decisions.
 
-The intended process is:
-
-    GameplayFootball
-        ↓
-    Study the relevant system
-        ↓
-    Understand the football concept
-        ↓
-    Identify strengths and weaknesses
-        ↓
-    Evaluate Roblox constraints
-        ↓
-    Design the Beyond 90 equivalent
-        ↓
-    Implement incrementally
-        ↓
-    Playtest and tune
-
-Technical similarity to GameplayFootball is NOT a goal.
-
-Creating excellent football gameplay for Beyond 90 is the goal.
-
----
-
-## Systems Where GameplayFootball May Be Relevant
-
-GameplayFootball should be investigated where useful when designing systems
-such as:
+Relevant systems include, where appropriate:
 
 - Player movement
-- Acceleration and deceleration
+- Acceleration/deceleration
 - Orientation and turning
 - Sprinting
+- Ball physics
 - Ball interaction
 - Ball control
 - Dribbling
@@ -795,135 +777,92 @@ such as:
 - Through balls
 - Crosses
 - Shooting
-- Ball trajectories
+- Ball trajectories/spin
 - Tackling
-- Defensive interactions
+- Defensive interaction
 - Headers
 - Goalkeepers
 - Player positioning
 - Off-ball movement
 - Match state
-- Football rules
-- Restarts
+- Football rules/restarts
 - Animation/gameplay coordination
 - General football gameplay architecture
 
-Research only what is relevant to the current milestone.
+The required workflow for substantial gameplay systems is:
 
-Do not reverse-engineer the entire repository before continuing development.
-
----
-
-## Do Not Port GameplayFootball Directly
+    GameplayFootball research
+        ↓
+    Identify relevant files/functions
+        ↓
+    Understand confirmed behavior
+        ↓
+    Separate confirmed behavior from inference
+        ↓
+    Identify useful concepts and limitations
+        ↓
+    Evaluate Roblox constraints
+        ↓
+    Design an original Beyond 90 solution
+        ↓
+    Implement incrementally
+        ↓
+    Playtest and tune
+        ↓
+    Document important conclusions
 
 Do NOT:
 
-- Blindly translate C++ functions into Luau.
-- Reproduce GameplayFootball's class hierarchy merely because it exists.
-- Recreate its engine architecture inside Roblox.
-- Make Beyond 90 dependent on GameplayFootball.
-- Copy substantial implementation code without an explicit reason and license
-  review.
-- Adopt behavior simply because GameplayFootball uses it.
+- Blindly translate C++ into Luau.
+- Reproduce GameplayFootball's class hierarchy.
+- Recreate its engine architecture in Roblox.
+- Copy large implementation sections without an explicit decision to do so.
+- Adopt behavior solely because GameplayFootball uses it.
+- Automate gameplay decisions that should belong to human players.
 
-Instead, extract:
+Instead, extract useful:
 
 - Football concepts
 - Algorithms
 - Heuristics
 - State relationships
 - Gameplay principles
-- Useful mathematical ideas
-- Useful architectural lessons
+- Mathematical ideas
+- Architectural lessons
 
 Then determine how Beyond 90 should accomplish the same gameplay goal using
 Roblox-native systems.
 
-
-The GameplayFootball repository should remain external to the Beyond 90 runtime
-source tree.
-
-Do not vendor or copy the GameplayFootball repository into:
-
-    src/
-
-Do not make Rojo map any GameplayFootball files into Roblox Studio.
-
-If a local clone is used for research, keep it outside the production runtime
-tree or in another clearly separated development location.
-
-GameplayFootball must never become a runtime dependency of Beyond 90.
-
----
-
-# 28. Beyond 90 Takes Priority Over References
-
-Whenever GameplayFootball's approach conflicts with Beyond 90's requirements,
-Beyond 90 takes priority.
+Beyond 90 requirements always take priority.
 
 Beyond 90 is designed around:
 
 - Human-vs-human multiplayer
-- Real-player-controlled footballers whenever possible
+- Real-player-controlled footballers wherever possible
 - Competitive online play
-- 3v3
-- 5v5
-- 7v7
-- 11v11
-- PC
-- Mobile
-- Console
-- Roblox physics
-- Roblox networking
-- Latency tolerance
+- 3v3, 5v5, 7v7 and 11v11
+- PC, mobile and console
+- Roblox physics/networking
 - Server authority
+- Latency tolerance
 - Exploit resistance
 - Performance
 - Responsive controls
-- Tactical football
-- Football readability
+- Tactical readability
 - Player agency
-- Accessible controls
-- High skill ceiling
+- High skill expression
 
-GameplayFootball was built for a different engine and architecture.
+The target networking principle is:
 
-A concept must make sense for Roblox and Beyond 90 before it is adopted.
+    RESPONSIVE LOCALLY
+            +
+    AUTHORITATIVE GLOBALLY
 
----
+GameplayFootball-derived concepts must be redesigned where necessary for
+Roblox networking, physics, performance, security, character systems and
+cross-platform requirements.
 
-# 29. Gameplay Research Workflow
-
-Before implementing a substantial football mechanic where GameplayFootball is
-relevant:
-
-1. Inspect the existing Beyond 90 implementation.
-2. Identify which current Beyond 90 system owns the responsibility.
-3. Inspect the relevant GameplayFootball source.
-4. Trace the feature through enough functions/files to understand the complete
-   behavior.
-5. Separate confirmed behavior from inference.
-6. Identify the football principle behind the implementation.
-7. Identify weaknesses or assumptions that should not be reproduced.
-8. Evaluate Roblox networking, physics, character, security and performance
-   constraints.
-9. Design the original Beyond 90 equivalent.
-10. Define the smallest implementation milestone.
-11. Implement incrementally.
-12. Playtest.
-13. Tune.
-14. Document important conclusions.
-
-Do not immediately modify Beyond 90 gameplay code simply because an interesting
-reference implementation was discovered.
-
-Understand the reference first.
-
----
-
-# 30. GameplayFootball Research Documentation
-
-Substantial GameplayFootball research should be stored under:
+Substantial GameplayFootball research should be documented under:
 
     docs/research/gameplay-football/
 
@@ -940,66 +879,52 @@ Examples:
     player-positioning.md
     animation-gameplay.md
 
-Research documents should use the following structure where appropriate:
+Research documents must distinguish:
 
 ## GameplayFootball Behavior
 
-Describe behavior confirmed directly from the source.
+Confirmed behavior from the inspected source.
 
 ## Interpretation
 
-Explain why we believe the system was designed that way.
+Reasoning about why the reference behaves that way.
 
-Clearly label inference as inference.
+If something is inferred rather than directly demonstrated by source, label it
+as inference.
 
 ## Useful Concepts
 
-Identify concepts that may be valuable to Beyond 90.
+Concepts potentially valuable to Beyond 90.
 
 ## Problems / Limitations
 
-Identify behavior or architecture that should not be reproduced.
+Things that should not be reproduced directly.
 
 ## Roblox Considerations
 
 Consider:
 
 - Networking
+- Replication
 - Server authority
 - Physics
-- Character systems
-- Animation
 - Performance
 - Security
+- Input
+- Animation
+- Character systems
 - Mobile
 - Console
-- Replication
 - Latency
 
 ## Beyond 90 Proposal
 
-Describe the original Roblox-native system proposed for Beyond 90.
+Describe the original Roblox-native design recommended for Beyond 90.
 
-Research documentation explains what we learned.
-
-It does NOT define how Beyond 90 works.
-
----
-
-# 31. Architecture Documentation
-
-Once research results in an actual Beyond 90 architectural decision, document
-that separately under:
+Important architectural conclusions about Beyond 90 should live separately
+under:
 
     docs/architecture/
-
-For example:
-
-    docs/research/gameplay-football/passing.md
-
-may influence:
-
-    docs/architecture/passing-system.md
 
 The distinction is:
 
@@ -1009,39 +934,112 @@ The distinction is:
 
     Architecture documentation
         =
-    How Beyond 90 works
+    How Beyond 90 actually works
 
-Do not allow Beyond 90 architecture documentation to become documentation of
-GameplayFootball.
+Research findings do not automatically become Beyond 90 architecture.
+
+Preserve the existing Beyond 90 architecture unless research demonstrates a
+clear reason to refactor it.
+
+Do not create duplicate movement, ball, control, possession, camera or match
+systems simply because GameplayFootball organizes them differently.
+
+GameplayFootball research must still follow incremental milestone development.
+
+Research only what is relevant to the current milestone.
+
+Do not reverse-engineer the entire repository before continuing development.
+
+GameplayFootball contains systems intended for AI-controlled footballers.
+
+Because Beyond 90 expects human-controlled footballers, distinguish:
+
+    Football intelligence useful to game systems
+
+from:
+
+    Decision-making needed only because an AI player must decide what to do
+
+Useful football intelligence may include:
+
+- Ball reachability
+- Ball trajectories
+- Passing lanes
+- Open space
+- Pitch regions
+- Orientation
+- Pressure
+- Distances
+- Relative movement
+- Tactical geometry
+- Interception geometry
+
+Do not automatically adopt AI decision-making that would reduce human player
+agency.
+
+Do not automate away player skill.
+
+Any reference-inspired values should normally become configurable Beyond 90
+parameters rather than unexplained magic numbers.
+
+The principles behind reference values matter more than the exact numbers.
+
+Tune gameplay values specifically for Beyond 90 through playtesting.
+
+GameplayFootball must remain external to the Beyond 90 runtime source tree.
+
+Do not vendor, copy or clone GameplayFootball into:
+
+    src/
+
+Do not make Rojo map GameplayFootball files into Roblox Studio.
+
+If a local clone is used for research, keep it outside the production runtime
+tree or in another clearly separated development location.
+
+GameplayFootball must never become a runtime dependency of Beyond 90.
+
+Respect GameplayFootball's license and maintain Beyond 90's own implementation,
+architecture and identity.
+
+If substantial external code is ever intentionally reused:
+
+1. Review its license first.
+2. Determine attribution or notice requirements.
+3. Document the decision.
+4. Keep reused code identifiable where appropriate.
+
+Legal permission to copy something does not automatically mean copying it is
+the correct engineering decision.
 
 ---
 
-# 32. Source Accuracy
+# 28. GameplayFootball Source Accuracy
 
-When analyzing GameplayFootball, distinguish clearly between:
+When discussing GameplayFootball, explicitly distinguish:
 
 CONFIRMED FROM SOURCE
-    Behavior directly demonstrated by inspected source code.
+
+    Behavior directly demonstrated by inspected source.
 
 INFERENCE
-    A conclusion inferred from interactions between systems.
+
+    A conclusion inferred from interactions between source systems.
 
 RECOMMENDATION
+
     Something proposed specifically for Beyond 90.
 
-Never state:
-
-    "GameplayFootball does X"
-
-unless that behavior has actually been verified from the relevant source.
+Never claim GameplayFootball performs a behavior unless the relevant source has
+actually been inspected.
 
 If uncertain, inspect the source rather than guessing.
 
 Avoid large copied code blocks.
 
-Focus on understanding behavior and concepts.
+Focus primarily on understanding behavior, concepts and design reasoning.
 
-When creating research documentation, record the exact reference revision used.
+For substantial research, record the exact reference revision used.
 
 At minimum include:
 
@@ -1060,141 +1058,22 @@ Example:
     Commit: <commit SHA>
     Researched: <date>
 
-This prevents future changes to the external repository from making old
-research ambiguous.
-
-If later research uses a different revision, do not silently treat the new
-behavior as if it were present in the previously researched version.
+If later research uses a different revision, do not silently treat behavior
+from the newer revision as though it existed in the previously researched
+version.
 
 ---
 
-# 33. Human-Controlled Football
+# 29. Broadcast Camera Reference Exception
 
-GameplayFootball contains systems intended for AI-controlled footballers.
+GameplayFootball may be researched for general camera concepts where useful,
+but it does NOT define Beyond 90's Broadcast Camera.
 
-Beyond 90 is fundamentally different because competitive footballers are
-expected to be controlled primarily by real players.
+The Broadcast Camera remains a Beyond 90-specific defining feature.
 
-When researching AI-related systems, separate:
+Its priorities remain:
 
-    Football intelligence useful to game systems
-
-from:
-
-    Decision-making required only because an AI footballer must decide what to
-    do
-
-Useful football intelligence may include:
-
-- Ball trajectories
-- Reachability
-- Space
-- Pitch regions
-- Passing lanes
-- Pressure
-- Orientation
-- Relative movement
-- Player distances
-- Ball interception geometry
-
-Do not automatically adopt AI decision-making such as choosing when or where a
-human player should pass, shoot or move.
-
-Do not automate away player skill.
-
----
-
-# 34. Networking Principle
-
-Beyond 90 should aim for:
-
-    RESPONSIVE LOCALLY
-            +
-    AUTHORITATIVE GLOBALLY
-
-Critical competitive state should remain server-authoritative wherever
-practical.
-
-Clients must not authoritatively determine:
-
-- Goals
-- Score
-- Match results
-- Ball ownership
-- Critical possession changes
-- Successful tackles
-- Competitive statistics
-- Rankings
-- Currency
-- Persistent progression
-
-At the same time, responsiveness matters.
-
-Where appropriate, investigate Roblox-native techniques such as:
-
-- Client-side prediction
-- Server reconciliation
-- Interpolation
-- Safe extrapolation
-- Input buffering
-- Latency compensation
-- Visual prediction
-- Server validation
-- Network ownership strategies
-- State replication
-
-Do not sacrifice competitive integrity simply to make gameplay responsive.
-
-Do not sacrifice responsiveness unnecessarily simply to make implementation
-easier.
-
----
-
-# 35. Gameplay Configuration
-
-Football gameplay values should normally be configurable rather than scattered
-throughout implementation code.
-
-Examples may include:
-
-- Ball control distances
-- First-touch strength
-- Dribble touch strength
-- Dribble frequency
-- Acceleration
-- Deceleration
-- Turn responsiveness
-- Sprint behavior
-- Pass strength
-- Shot strength
-- Ball spin
-- Tackle ranges
-- Input buffering
-- Network tolerances
-
-Values inspired by external research should NOT automatically be copied.
-
-The principles behind those values matter more than the exact numbers.
-
-Tune values specifically for Beyond 90 through playtesting.
-
----
-
-# 36. Broadcast Camera Reference Exception
-
-GameplayFootball may be studied for general camera ideas where useful.
-
-However, GameplayFootball does NOT define Beyond 90's Broadcast Camera.
-
-The Broadcast Camera is one of Beyond 90's defining systems.
-
-Its vision remains:
-
-> A football game that feels like playing inside a football broadcast.
-
-The Broadcast Camera should prioritize:
-
-- Elevated top-side-of-pitch perspective
+- Elevated broadcast-style perspective
 - Tactical readability
 - Passing-lane visibility
 - Open-space visibility
@@ -1202,41 +1081,45 @@ The Broadcast Camera should prioritize:
 - Team shape
 - Smooth tracking
 - Smooth zoom
-- Situational framing
+- Smooth situational framing
 - Match-size-specific presets
-- Minimal unnecessary movement
-- Football readability over cinematic spectacle
+- Minimal unnecessary camera movement
+- Football readability over unnecessary cinematic movement
 
 Modern football broadcasts and modern football games may also be used as
-references.
+references where useful.
 
 The final camera must be designed specifically for Beyond 90.
 
 ---
 
-# 37. External Reference Licensing And Originality
+# 30. Reference Design Priority
 
-Respect the licenses of external reference projects.
+When reference-derived solutions conflict, prioritize:
 
-Prefer conceptual extraction over copying implementation.
+    FUN
+    ↓
+    FOOTBALL READABILITY
+    ↓
+    PLAYER AGENCY / SKILL EXPRESSION
+    ↓
+    COMPETITIVE FAIRNESS
+    ↓
+    RESPONSIVENESS
+    ↓
+    NETWORK ROBUSTNESS
+    ↓
+    PERFORMANCE
+    ↓
+    SCALABILITY
+    ↓
+    POLISH
 
-If substantial external code is ever intentionally reused:
+Technical similarity to GameplayFootball is NOT a goal.
 
-1. Review its license first.
-2. Determine attribution/notice requirements.
-3. Document the decision.
-4. Keep reused code clearly identifiable where appropriate.
+Creating excellent football gameplay for Beyond 90 is the goal.
 
-Beyond 90 should maintain its own identity and architecture.
-
-Legal permission to copy something does not automatically mean copying it is
-the best engineering decision.
-
----
-
-# 38. Gameplay Reference Principle
-
-When working with external football-game references, remember:
+The governing principle is:
 
 > GameplayFootball teaches us how another developer solved the football problem.
 >
@@ -1246,7 +1129,7 @@ When working with external football-game references, remember:
 
 Study references aggressively.
 
-Copy concepts selectively.
+Extract concepts selectively.
 
 Question assumptions.
 
