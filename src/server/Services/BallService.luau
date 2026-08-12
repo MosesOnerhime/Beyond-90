@@ -8,6 +8,7 @@ local BallConfig = require(Shared.Config.BallConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local PitchConfig = require(Shared.Config.PitchConfig)
 local BallControlService = require(script.Parent.BallControlService)
+local PitchService = require(script.Parent.PitchService)
 
 local BallService = {}
 
@@ -54,6 +55,100 @@ local function getOrCreateFootball(ballFolder: Folder): Part
 	return ball
 end
 
+local function clearBallVisuals(ball: BasePart)
+	for _, child in ball:GetChildren() do
+		if child:GetAttribute("Beyond90BallVisual") == true then
+			child:Destroy()
+		end
+	end
+end
+
+local function configureVisualPart(part: BasePart, ball: BasePart)
+	part:SetAttribute("Beyond90BallVisual", true)
+	part.Anchored = false
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.Massless = true
+	part.Material = Enum.Material.SmoothPlastic
+	part.Parent = ball
+
+	local weld = Instance.new("WeldConstraint")
+	weld:SetAttribute("Beyond90BallVisual", true)
+	weld.Part0 = ball
+	weld.Part1 = part
+	weld.Parent = part
+end
+
+local function createVisualBand(ball: BasePart, name: string, size: Vector3, color: Color3, orientation: Vector3)
+	local band = Instance.new("Part")
+	band.Name = name
+	band.Shape = Enum.PartType.Block
+	band.Size = size
+	band.Color = color
+	band.CFrame = ball.CFrame * CFrame.Angles(
+		math.rad(orientation.X),
+		math.rad(orientation.Y),
+		math.rad(orientation.Z)
+	)
+	configureVisualPart(band, ball)
+end
+
+local function createBrandMark(ball: BasePart)
+	local surfaceGui = Instance.new("SurfaceGui")
+	surfaceGui.Name = "Beyond90BrandMark"
+	surfaceGui:SetAttribute("Beyond90BallVisual", true)
+	surfaceGui.Face = Enum.NormalId.Front
+	surfaceGui.LightInfluence = 0
+	surfaceGui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	surfaceGui.PixelsPerStud = 140
+	surfaceGui.Parent = ball
+
+	local label = Instance.new("TextLabel")
+	label.Name = "BrandText"
+	label:SetAttribute("Beyond90BallVisual", true)
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.GothamBold
+	label.Text = BallConfig.Visual.BrandText
+	label.TextColor3 = BallConfig.Visual.AccentColor
+	label.TextScaled = true
+	label.Parent = surfaceGui
+end
+
+local function configureBallVisuals(ball: BasePart)
+	clearBallVisuals(ball)
+
+	local radius = BallConfig.Radius
+	local visualConfig = BallConfig.Visual
+	local bandThickness = radius * 0.16
+	local bandLength = radius * 1.9
+
+	ball.Color = visualConfig.BaseColor
+	createVisualBand(
+		ball,
+		"CharcoalPanelBandA",
+		Vector3.new(bandLength, bandThickness, radius * 0.08),
+		visualConfig.PanelColor,
+		Vector3.new(0, 0, 0)
+	)
+	createVisualBand(
+		ball,
+		"CharcoalPanelBandB",
+		Vector3.new(bandThickness, bandLength, radius * 0.08),
+		visualConfig.PanelColor,
+		Vector3.new(0, 0, 35)
+	)
+	createVisualBand(
+		ball,
+		"PurpleAccentBand",
+		Vector3.new(bandLength * 0.72, bandThickness * 0.75, radius * 0.09),
+		visualConfig.AccentColor,
+		Vector3.new(0, 0, -35)
+	)
+	createBrandMark(ball)
+end
+
 local function isFiniteNumber(value: number): boolean
 	return value == value and value > -math.huge and value < math.huge
 end
@@ -63,6 +158,13 @@ local function isFiniteVector(vector: Vector3): boolean
 end
 
 local function getBallSpawnPosition(): Vector3
+	local pitchState = PitchService.GetState()
+
+	if pitchState and pitchState.BallCenterPosition then
+		local center = pitchState.BallCenterPosition
+		return Vector3.new(center.X, pitchState.GroundY + BallConfig.Radius + 0.1, center.Z)
+	end
+
 	return Vector3.new(PitchConfig.BallCenterPosition.X, BallConfig.SpawnHeight, PitchConfig.BallCenterPosition.Z)
 end
 
@@ -189,7 +291,19 @@ local function applyBasicTouch(player: Player, ball: BasePart, touchContext)
 end
 
 local function isOutOfDevelopmentBounds(position: Vector3): boolean
+	local pitchState = PitchService.GetState()
 	local padding = BallConfig.Safety.ResetOutOfBoundsPadding
+
+	if pitchState then
+		local fromCenter = position - pitchState.Center
+		local widthDistance = fromCenter:Dot(pitchState.WidthAxis)
+		local lengthDistance = fromCenter:Dot(pitchState.LengthAxis)
+		local halfWidth = pitchState.Width / 2 + padding
+		local halfLength = pitchState.Length / 2 + padding
+
+		return math.abs(widthDistance) > halfWidth or math.abs(lengthDistance) > halfLength
+	end
+
 	local halfWidth = PitchConfig.Width / 2 + padding
 	local halfLength = PitchConfig.Length / 2 + padding
 
@@ -213,23 +327,25 @@ local function validateBallState(ball: BasePart): boolean
 	return true
 end
 
-local function updateBallInteractions(ball: Part)
+local function updateBallInteractions(ball: Part, deltaTime: number, allowFreeTouch: boolean)
 	if not validateBallState(ball) then
 		return
 	end
 
-	local isControlled = BallControlService.Update(ball)
+	local isControlled = BallControlService.Update(ball, deltaTime)
 
 	if isControlled then
 		clampBallSpeed(ball)
 		return
 	end
 
-	for _, player in Players:GetPlayers() do
-		local touchContext = getCharacterTouchContext(player, ball)
+	if allowFreeTouch then
+		for _, player in Players:GetPlayers() do
+			local touchContext = getCharacterTouchContext(player, ball)
 
-		if touchContext then
-			applyBasicTouch(player, ball, touchContext)
+			if touchContext then
+				applyBasicTouch(player, ball, touchContext)
+			end
 		end
 	end
 end
@@ -245,17 +361,18 @@ local function startInteractionLoop()
 	end)
 
 	heartbeatConnection = RunService.Heartbeat:Connect(function(deltaTime)
-		accumulatedTime += deltaTime
-
-		if accumulatedTime < BallConfig.BasicTouch.CheckInterval then
+		if not activeBall then
 			return
 		end
 
-		accumulatedTime = 0
+		accumulatedTime += deltaTime
+		local allowFreeTouch = accumulatedTime >= BallConfig.BasicTouch.CheckInterval
 
-		if activeBall then
-			updateBallInteractions(activeBall)
+		if allowFreeTouch then
+			accumulatedTime = 0
 		end
+
+		updateBallInteractions(activeBall, deltaTime, allowFreeTouch)
 	end)
 end
 
@@ -268,12 +385,11 @@ function BallService.Initialize()
 
 	ball.Shape = Enum.PartType.Ball
 	ball.Size = Vector3.new(radius * 2, radius * 2, radius * 2)
-	ball.Position = Vector3.new(PitchConfig.BallCenterPosition.X, BallConfig.SpawnHeight, PitchConfig.BallCenterPosition.Z)
+	ball.Position = getBallSpawnPosition()
 	ball.Anchored = false
 	ball.CanCollide = true
 	ball.CanQuery = true
 	ball.CanTouch = true
-	ball.Color = Color3.fromRGB(245, 245, 245)
 	ball.Material = Enum.Material.SmoothPlastic
 	ball.TopSurface = Enum.SurfaceType.Smooth
 	ball.BottomSurface = Enum.SurfaceType.Smooth
@@ -287,6 +403,7 @@ function BallService.Initialize()
 	ball:SetAttribute("Beyond90Football", true)
 	ball:SetAttribute("ServerOwned", true)
 	ball:SetNetworkOwner(nil)
+	configureBallVisuals(ball)
 	activeBall = ball
 	BallControlService.Initialize(ball)
 	startInteractionLoop()

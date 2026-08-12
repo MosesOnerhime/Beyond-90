@@ -44,8 +44,41 @@ AI may be used for:
 - Referee systems
 - Supporting systems
 - NPCs outside competitive matches
+- Football-contact assistance that preserves human intent
 
 The default competitive experience should prioritize human players.
+
+Human-controlled football does NOT require every low-level movement or
+ball-contact correction to come directly from raw player input.
+
+Bounded assistance may be used to help a human-controlled footballer execute
+the football action the player is already attempting.
+
+Examples may include:
+
+- Subtle movement correction toward an intended ball contact
+- Orientation assistance for a control touch
+- Contact-position adjustment
+- Touch timing assistance
+- Input buffering
+- Safe local prediction
+
+Such assistance must preserve the player's tactical and directional intent.
+
+The game must NOT decide on behalf of the player:
+
+- Where they should attack
+- Who they should pass to
+- Whether they should pass
+- Whether they should shoot
+- Which tactical run they should make
+- Which opponent they should defend
+
+The distinction is:
+
+    ASSIST EXECUTION OF PLAYER INTENT
+                ≠
+    CHOOSE THE PLAYER'S FOOTBALL DECISION
 
 ---
 
@@ -449,6 +482,8 @@ Systems may be revisited as playtesting exposes dependencies.
 In particular:
 
 - Ball control must be stable enough before passing and shooting depend on it.
+- Player movement and ball control may be revisited together when the reference
+  behavior demonstrates that they are coupled.
 - The Broadcast Camera should be prototyped early enough to influence gameplay
   readability, but it should not block development of the core football loop.
 - Do not build complex progression or monetization systems before the core
@@ -468,37 +503,80 @@ Prefer:
 - Explicit responsibilities
 - Reusable functions
 - Configuration modules
-- Server-authoritative gameplay
+- Server-authoritative competitive state
+- Responsive client-side execution where appropriate
 - Client-side presentation where appropriate
 
 Avoid:
 
 - Giant scripts
 - Duplicate logic
-- Magic numbers
+- Magic numbers without context
 - Unnecessary global state
 - Tight coupling
 - Temporary hacks presented as final architecture
+- Reimplementing proven reference behavior differently without a reason
+
+A simpler implementation is not automatically better if it produces
+substantially worse football behavior.
+
+Likewise, a more complex reference algorithm should not be adopted unless its
+complexity contributes meaningfully to gameplay.
 
 ---
 
 # 17. Networking
 
-Competitive gameplay must be server authoritative wherever practical.
+Beyond 90 should aim for:
 
-The client should not be trusted for critical gameplay decisions such as:
+    RESPONSIVE LOCALLY
+            +
+    AUTHORITATIVE GLOBALLY
+
+Critical competitive state must remain server-authoritative wherever practical.
+
+The client must not authoritatively determine:
 
 - Goals
+- Score
 - Match results
 - Currency
 - Player statistics
 - Competitive rankings
-- Possession validation
-- Important ball interactions
+- Critical possession changes
+- Successful tackles
+- Competitive ball outcomes
+- Persistent progression
 
-RemoteEvents and RemoteFunctions should be validated on the server.
+RemoteEvents and RemoteFunctions must be validated on the server.
 
-Never assume that data sent by the client is trustworthy.
+Never assume data sent by the client is trustworthy.
+
+However, server authority does NOT require every visible or movement-related
+response to wait for a server round trip.
+
+Where appropriate, investigate and use Roblox-native techniques such as:
+
+- Client-side prediction
+- Server reconciliation
+- Interpolation
+- Safe extrapolation
+- Input buffering
+- Latency compensation
+- Visual prediction
+- Locally responsive movement assistance
+- Server validation
+- Controlled network ownership strategies
+- State replication
+
+For human-controlled footballers, movement and football-contact assistance may
+run locally when necessary for responsiveness, provided critical competitive
+ball state remains authoritative and the server can validate relevant outcomes.
+
+Do not sacrifice competitive integrity merely to make gameplay responsive.
+
+Do not sacrifice responsiveness unnecessarily merely to simplify server
+implementation.
 
 ---
 
@@ -523,6 +601,8 @@ automatically appear in the VS Code project.
 
 The source-of-truth should remain the Rojo project.
 
+External research repositories must not be mapped into Roblox Studio.
+
 ---
 
 # 19. AI Development Rules
@@ -531,28 +611,37 @@ AI assistants such as Codex or Claude may assist with development.
 
 Before modifying code:
 
-1. Understand the existing architecture.
-2. Inspect relevant files.
-3. Determine how the requested feature fits into the existing systems.
-4. Avoid creating duplicate systems.
-5. Preserve existing functionality.
-6. Explain significant architectural decisions.
+1. Read AGENTS.md completely.
+2. Understand the existing Beyond 90 architecture.
+3. Inspect relevant Beyond 90 files.
+4. Determine which existing system owns the requested responsibility.
+5. Inspect relevant external reference research where applicable.
+6. Inspect the actual GameplayFootball source when the feature is covered by
+   the GameplayFootball Reference Strategy.
+7. Avoid creating duplicate systems.
+8. Preserve existing functionality that remains valid.
+9. Explain significant architectural decisions.
+10. Prefer incremental, testable changes.
 
-Do not rewrite large parts of the project simply because a different
-implementation is possible.
+Do not rewrite large parts of the project merely because another architecture
+is aesthetically preferable.
 
-Prefer incremental changes.
+However, do not preserve a failed gameplay abstraction merely because work has
+already been invested in it.
 
-When an external gameplay reference is relevant, research it before making
-major architectural changes.
+If verified GameplayFootball behavior demonstrates that an existing Beyond 90
+approach is solving the football problem poorly, replacing that approach is
+allowed and may be preferable.
+
+When GameplayFootball is relevant, do not invent a substantially different
+football algorithm before first evaluating whether the verified reference
+algorithm can be translated appropriately.
+
+Research findings do not automatically authorize a refactor unless the task
+explicitly includes implementation.
 
 Do not modify production gameplay code during a research-only task unless
 explicitly instructed to proceed with implementation.
-
-Research findings do not automatically authorize a refactor.
-
-Any reference-inspired architecture must still be justified against the
-existing Beyond 90 architecture.
 
 ---
 
@@ -561,7 +650,7 @@ existing Beyond 90 architecture.
 For any significant feature, AI should first identify:
 
 - What system owns the feature?
-- Is it client-side or server-side?
+- Is it client-side, server-side, or split?
 - What existing modules interact with it?
 - Does it need networking?
 - Does it need configuration?
@@ -570,6 +659,14 @@ For any significant feature, AI should first identify:
 - Does it need to work across PC/mobile/console?
 - Does it affect the Broadcast Camera?
 - Does it need to be scalable for 3v3 through 11v11?
+- Is GameplayFootball relevant?
+- If GameplayFootball is relevant, what verified reference behavior should act
+  as the baseline?
+- Which parts of that behavior are football logic?
+- Which parts are engine-specific?
+- Which parts are animation-specific?
+- Which parts are AI decision-making rather than human-control assistance?
+- Which parts require Roblox-specific adaptation?
 
 Only then should implementation begin.
 
@@ -609,6 +706,28 @@ After implementing a feature, test where applicable:
 - Edge cases
 - Performance
 - Regression of existing systems
+- Comparison against intended reference behavior where applicable
+
+For GameplayFootball-inspired mechanics, testing should evaluate both:
+
+    DOES THE IMPLEMENTATION WORK?
+
+and:
+
+    DOES THE BEHAVIOR RESEMBLE THE VERIFIED REFERENCE BEHAVIOR WE INTENDED TO
+    REPRODUCE?
+
+When possible, compare Beyond 90 and GameplayFootball side-by-side for:
+
+- Touch cadence
+- Ball spacing
+- Player-ball coordination
+- Acceleration/deceleration
+- Turning
+- Possession behavior
+- Loose-ball transitions
+- First-touch behavior
+- Relevant mechanic-specific behavior
 
 Only test camera transitions when the feature interacts with or can affect the
 camera system.
@@ -642,6 +761,20 @@ Beyond 90 should feel:
 - Difficult to master
 
 Avoid unnecessary complexity.
+
+Do not confuse "player agency" with "zero assistance."
+
+Football games may require invisible low-level assistance to convert player
+intent into believable football interactions.
+
+Assistance is acceptable when it:
+
+- Preserves the player's intended direction/action
+- Improves physical contact reliability
+- Improves responsiveness
+- Makes football interactions readable
+- Remains competitively consistent
+- Leaves tactical decisions to the player
 
 Every system should ultimately contribute to creating memorable football
 moments.
@@ -695,7 +828,10 @@ When uncertain, prioritize:
 
 Do not sacrifice core gameplay quality for unnecessary features.
 
-Do not automate away decisions that should belong to the player.
+Do not automate tactical decisions that should belong to the player.
+
+Bounded assistance that helps execute the player's existing football intent is
+allowed and should not automatically be treated as a loss of player agency.
 
 Do not sacrifice competitive integrity simply to make a system easier to
 implement.
@@ -720,7 +856,7 @@ Each milestone should:
 
 - Have a clearly defined goal.
 - Be independently testable.
-- Preserve existing functionality.
+- Preserve existing functionality that remains valid.
 - Avoid unnecessary dependencies on future systems.
 - Be committed to Git once stable.
 
@@ -737,6 +873,12 @@ interface or foundation needed for the current milestone.
 
 Do not build the full future system prematurely.
 
+Incremental development does NOT mean preserving an unsuccessful foundation.
+
+If playtesting repeatedly demonstrates that the current abstraction is wrong,
+replace the smallest necessary part of that abstraction before adding more
+patches.
+
 ---
 
 # 27. GameplayFootball Reference Strategy
@@ -745,20 +887,14 @@ GameplayFootball — specifically the vi3itor fork at:
 
     https://github.com/vi3itor/GameplayFootball.git
 
-is the primary external football-gameplay reference for Beyond 90 unless
-explicitly instructed otherwise.
+is the primary external football-gameplay reference and behavioral baseline for
+Beyond 90 unless explicitly instructed otherwise.
 
-GameplayFootball is a RESEARCH AND REFERENCE SOURCE.
+GameplayFootball is used because it provides a working implementation of many
+football-specific gameplay problems that Beyond 90 must also solve.
 
-It is NOT:
-
-- Beyond 90's codebase
-- Beyond 90's architecture
-- Beyond 90's specification
-- A project to directly port from C++ to Luau
-
-For substantial football gameplay systems, research relevant GameplayFootball
-source before making major implementation decisions.
+For fundamental football mechanics, verified GameplayFootball behavior should
+normally be studied BEFORE inventing a different solution.
 
 Relevant systems include, where appropriate:
 
@@ -789,78 +925,250 @@ Relevant systems include, where appropriate:
 - Animation/gameplay coordination
 - General football gameplay architecture
 
-The required workflow for substantial gameplay systems is:
+GameplayFootball is NOT:
 
-    GameplayFootball research
+- Beyond 90's runtime dependency
+- Beyond 90's C++ architecture
+- Beyond 90's engine
+- A requirement to reproduce every GameplayFootball feature
+- A reason to import AI tactical decision-making into human-controlled play
+
+The goal is NOT technical similarity.
+
+The goal is to avoid unnecessarily reinventing proven football behavior.
+
+---
+
+## GameplayFootball Behavioral Fidelity
+
+For fundamental football mechanics where GameplayFootball behavior has been
+verified from source and is desirable for Beyond 90, the default starting point
+should be BEHAVIORAL FIDELITY.
+
+This means Beyond 90 may closely translate verified:
+
+- Algorithms
+- Mathematical relationships
+- State transitions
+- Control logic
+- Possession logic
+- Ball-control logic
+- Touch planning
+- Movement-assistance logic
+- Timing relationships
+- Direction/orientation relationships
+- Prediction relationships
+- Player-ball coordination logic
+
+when those systems contribute to the desired Beyond 90 experience.
+
+"Do not port GameplayFootball directly" means:
+
+    DO NOT PORT THE ENGINE/ARCHITECTURE LITERALLY.
+
+It does NOT mean:
+
+    REINVENT VERIFIED FOOTBALL ALGORITHMS FOR NO REASON.
+
+The preferred process is:
+
+    GameplayFootball behavior
         ↓
-    Identify relevant files/functions
+    Trace the exact source implementation
         ↓
-    Understand confirmed behavior
+    Understand the full call chain
         ↓
-    Separate confirmed behavior from inference
+    Identify football logic
         ↓
-    Identify useful concepts and limitations
+    Identify AI-only logic
         ↓
-    Evaluate Roblox constraints
+    Identify animation-specific logic
         ↓
-    Design an original Beyond 90 solution
+    Identify engine-specific logic
         ↓
-    Implement incrementally
+    Preserve useful behavior/math/state relationships
         ↓
-    Playtest and tune
+    Translate them into Roblox-native systems
         ↓
-    Document important conclusions
+    Adapt only where Roblox or Beyond 90 requires it
+        ↓
+    Playtest against the reference behavior
+        ↓
+    Tune for Beyond 90
+
+When a verified reference algorithm solves the exact football problem currently
+being implemented, prefer translating that algorithm before designing a
+different one.
+
+If Beyond 90 later improves upon the reference through playtesting, that is
+encouraged.
+
+---
+
+## What May Be Ported Closely
+
+Where useful and legally compliant, Beyond 90 may closely reproduce verified:
+
+- Football algorithms
+- Mathematical formulas
+- State relationships
+- Possession conditions
+- Time-to-ball logic
+- Ball prediction concepts
+- Touch-vector calculations
+- Dribbling/control relationships
+- Movement blending
+- Contact-assistance rules
+- Timing relationships
+- Pass/shot targeting logic
+- Other football-specific behavior
+
+Exact constants may be used as INITIAL reference values only when:
+
+1. Their meaning has been verified.
+2. Units are understood.
+3. They are converted appropriately for Beyond 90.
+4. Their relationship to player scale/ball scale is understood.
+
+Do not assume a GameplayFootball meter maps directly to a Roblox stud.
+
+Prefer preserving meaningful ratios before preserving raw absolute numbers.
+
+All resulting values should remain configurable where practical.
+
+---
+
+## What Must NOT Be Ported Blindly
 
 Do NOT:
 
-- Blindly translate C++ into Luau.
-- Reproduce GameplayFootball's class hierarchy.
-- Recreate its engine architecture in Roblox.
-- Copy large implementation sections without an explicit decision to do so.
-- Adopt behavior solely because GameplayFootball uses it.
-- Automate gameplay decisions that should belong to human players.
+- Translate every C++ statement mechanically into Luau.
+- Reproduce GameplayFootball's class hierarchy merely because it exists.
+- Recreate GameplayFootball's engine architecture inside Roblox.
+- Build a second custom physics engine when Roblox physics already provides the
+  required simulation.
+- Import AI tactical decision-making for human-controlled players.
+- Reproduce desktop-only assumptions without evaluating mobile/console.
+- Adopt network assumptions that do not apply to Roblox.
+- Preserve reference behavior that is demonstrably worse for Beyond 90.
+- Add unnecessary complexity merely for source fidelity.
 
-Instead, extract useful:
+The question is:
 
-- Football concepts
-- Algorithms
-- Heuristics
-- State relationships
-- Gameplay principles
-- Mathematical ideas
-- Architectural lessons
+    "What behavior makes this football system work?"
 
-Then determine how Beyond 90 should accomplish the same gameplay goal using
-Roblox-native systems.
+not:
 
-Beyond 90 requirements always take priority.
+    "How do we make the Roblox source look like the C++ source?"
 
-Beyond 90 is designed around:
+---
 
-- Human-vs-human multiplayer
-- Real-player-controlled footballers wherever possible
-- Competitive online play
-- 3v3, 5v5, 7v7 and 11v11
-- PC, mobile and console
-- Roblox physics/networking
-- Server authority
-- Latency tolerance
-- Exploit resistance
-- Performance
-- Responsive controls
-- Tactical readability
-- Player agency
-- High skill expression
+## Ball And Player Coordination
 
-The target networking principle is:
+For dribbling and close control, Beyond 90 may actively coordinate the player
+and the football.
 
-    RESPONSIVE LOCALLY
-            +
-    AUTHORITATIVE GLOBALLY
+Do not assume good football control must be achieved solely by pushing the
+football and hoping the player's raw Roblox movement catches it.
 
-GameplayFootball-derived concepts must be redesigned where necessary for
-Roblox networking, physics, performance, security, character systems and
-cross-platform requirements.
+GameplayFootball-style concepts such as:
+
+- Predicting the next useful ball position
+- Guiding the footballer toward a valid contact position
+- Blending human movement with bounded ball-contact assistance
+- Planning the outgoing ball trajectory
+- Producing discrete meaningful touches
+- Recalculating control after the touch
+
+may be translated closely where appropriate.
+
+The player and ball may cooperate.
+
+The ball should still feel physically independent.
+
+Do not create fake possession by:
+
+- Welding the football to the character
+- Attaching the football rigidly to the character
+- CFrame-following the football every frame
+- Teleporting the football continuously
+- Treating the ball as a cosmetic object while controlled
+
+A deliberate football contact may authoritatively change the ball's outgoing
+velocity/momentum.
+
+That is compatible with a physically simulated football.
+
+---
+
+## Human-Controlled Movement Assistance
+
+GameplayFootball contains movement assistance that helps maintain useful
+football contact.
+
+Beyond 90 MAY use bounded movement assistance for human-controlled players.
+
+The purpose of such assistance is:
+
+    EXECUTION ASSISTANCE
+
+not:
+
+    TACTICAL DECISION-MAKING
+
+Allowed examples:
+
+- Slightly adjusting player movement toward the next intended ball contact
+- Helping align the avatar with a reachable control position
+- Blending manual direction with ball-contact direction
+- Adjusting movement near the ball so a planned touch can occur
+- Helping preserve a dribble while honoring the user's movement input
+
+Not allowed by default:
+
+- Choosing the player's attacking direction
+- Choosing who to pass to
+- Choosing when to pass
+- Choosing when to shoot
+- Choosing tactical positioning for the human player
+- Automatically dribbling around opponents without player intent
+
+When assistance and raw input conflict, the player's tactical intent must
+remain dominant.
+
+The strength of assistance should be configurable and determined through
+playtesting.
+
+---
+
+## Animation And Gameplay Logic
+
+GameplayFootball coordinates many football contacts with animation timing.
+
+Beyond 90 should study these relationships closely.
+
+However, GameplayFootball's custom animation architecture should not be
+recreated automatically.
+
+Separate:
+
+    FOOTBALL LOGIC
+    ANIMATION TIMING
+    ENGINE IMPLEMENTATION
+
+If Beyond 90 does not yet have the required football animations, temporary
+logical touch timing may be used.
+
+The gameplay system should be designed so that later animations can synchronize
+with already-defined logical football contacts rather than requiring the entire
+football mechanic to be rebuilt.
+
+Authoritative competitive ball outcomes must not depend solely on an
+unvalidated client animation marker.
+
+---
+
+## GameplayFootball Research Documentation
 
 Substantial GameplayFootball research should be documented under:
 
@@ -870,6 +1178,7 @@ Examples:
 
     player-movement.md
     ball-control.md
+    dribble-cycle.md
     dribbling.md
     passing.md
     shooting.md
@@ -879,26 +1188,31 @@ Examples:
     player-positioning.md
     animation-gameplay.md
 
-Research documents must distinguish:
+Research documents should distinguish:
 
 ## GameplayFootball Behavior
 
-Confirmed behavior from the inspected source.
+Confirmed behavior from inspected source.
 
 ## Interpretation
 
 Reasoning about why the reference behaves that way.
 
-If something is inferred rather than directly demonstrated by source, label it
-as inference.
+## Useful Concepts / Port Candidates
 
-## Useful Concepts
+Algorithms, relationships, formulas or behavior worth translating.
 
-Concepts potentially valuable to Beyond 90.
+## AI-Specific Logic
 
-## Problems / Limitations
+Behavior required because an AI footballer must make decisions.
 
-Things that should not be reproduced directly.
+## Animation-Specific Logic
+
+Behavior tied specifically to GameplayFootball's animation system.
+
+## Engine-Specific Logic
+
+Behavior tied to GameplayFootball's engine or technical architecture.
 
 ## Roblox Considerations
 
@@ -908,6 +1222,7 @@ Consider:
 - Replication
 - Server authority
 - Physics
+- Network ownership
 - Performance
 - Security
 - Input
@@ -917,11 +1232,31 @@ Consider:
 - Console
 - Latency
 
+## Beyond 90 Mapping
+
+For each major reference behavior, state whether Beyond 90 should:
+
+    KEEP EXISTING
+    PORT CLOSELY
+    ADAPT
+    REPLACE
+    OMIT
+    DEFER
+
 ## Beyond 90 Proposal
 
-Describe the original Roblox-native design recommended for Beyond 90.
+Describe the Roblox-native implementation recommended for Beyond 90.
 
-Important architectural conclusions about Beyond 90 should live separately
+Research documentation describes what was learned and how it may map to
+Beyond 90.
+
+It does NOT automatically define final Beyond 90 architecture.
+
+---
+
+## Architecture Documentation
+
+Important approved Beyond 90 architectural decisions should live separately
 under:
 
     docs/architecture/
@@ -930,65 +1265,84 @@ The distinction is:
 
     Research documentation
         =
-    What we learned
+    What GameplayFootball does and what we learned
 
     Architecture documentation
         =
     How Beyond 90 actually works
 
-Research findings do not automatically become Beyond 90 architecture.
+Architecture documentation may deliberately describe a close behavioral port
+of GameplayFootball while still using a Roblox-native architecture.
 
-Preserve the existing Beyond 90 architecture unless research demonstrates a
-clear reason to refactor it.
+Do not confuse behavioral similarity with architectural dependency.
+
+---
+
+## Existing Architecture Preservation Rule
+
+Preserve existing Beyond 90 architecture where it continues to serve the
+desired football behavior.
 
 Do not create duplicate movement, ball, control, possession, camera or match
-systems simply because GameplayFootball organizes them differently.
+systems merely because GameplayFootball organizes them differently.
 
-GameplayFootball research must still follow incremental milestone development.
+However:
+
+    EXISTING CODE IS NOT SACRED.
+
+If research and playtesting demonstrate that an existing Beyond 90 gameplay
+abstraction is fundamentally producing worse football behavior, replacing it is
+allowed.
+
+Prefer replacing the smallest responsible abstraction rather than layering
+increasing numbers of compensating thresholds, grace periods or patches onto a
+failed model.
+
+Do not preserve code purely because development time was already spent on it.
+
+---
+
+## Research Scope Rule
 
 Research only what is relevant to the current milestone.
 
 Do not reverse-engineer the entire repository before continuing development.
 
-GameplayFootball contains systems intended for AI-controlled footballers.
+However, when researching one football mechanic, trace the reference through
+enough callers/callees to understand the COMPLETE behavior.
 
-Because Beyond 90 expects human-controlled footballers, distinguish:
+Do not inspect one isolated function and treat it as the entire system.
 
-    Football intelligence useful to game systems
+For example, researching dribbling may require tracing:
 
-from:
+    human input
+        ↓
+    movement controller
+        ↓
+    possession logic
+        ↓
+    ball-control movement
+        ↓
+    action/animation selection
+        ↓
+    touch timing
+        ↓
+    ball-control vector
+        ↓
+    Ball::Touch
+        ↓
+    prediction/possession update
 
-    Decision-making needed only because an AI player must decide what to do
+This is still milestone-scoped research because the complete chain is required
+to understand the mechanic.
 
-Useful football intelligence may include:
+---
 
-- Ball reachability
-- Ball trajectories
-- Passing lanes
-- Open space
-- Pitch regions
-- Orientation
-- Pressure
-- Distances
-- Relative movement
-- Tactical geometry
-- Interception geometry
-
-Do not automatically adopt AI decision-making that would reduce human player
-agency.
-
-Do not automate away player skill.
-
-Any reference-inspired values should normally become configurable Beyond 90
-parameters rather than unexplained magic numbers.
-
-The principles behind reference values matter more than the exact numbers.
-
-Tune gameplay values specifically for Beyond 90 through playtesting.
+## Runtime Separation
 
 GameplayFootball must remain external to the Beyond 90 runtime source tree.
 
-Do not vendor, copy or clone GameplayFootball into:
+Do not vendor, copy or clone the GameplayFootball repository into:
 
     src/
 
@@ -999,18 +1353,36 @@ tree or in another clearly separated development location.
 
 GameplayFootball must never become a runtime dependency of Beyond 90.
 
-Respect GameplayFootball's license and maintain Beyond 90's own implementation,
-architecture and identity.
+Translated/adapted Beyond 90 implementation code should live normally within
+the Beyond 90 project.
 
-If substantial external code is ever intentionally reused:
+---
 
-1. Review its license first.
-2. Determine attribution or notice requirements.
-3. Document the decision.
-4. Keep reused code identifiable where appropriate.
+## Licensing And Originality
 
-Legal permission to copy something does not automatically mean copying it is
-the correct engineering decision.
+Respect the license and notice requirements of GameplayFootball and every
+external reference project.
+
+Conceptual extraction does not require copying source text.
+
+If algorithms or implementation are translated closely, or substantial code is
+intentionally reused:
+
+1. Review the applicable license.
+2. Determine attribution requirements.
+3. Determine notice requirements.
+4. Preserve required notices.
+5. Mark modifications where required.
+6. Document the decision.
+7. Keep copied/translated material identifiable where appropriate.
+
+Do not assume that rewriting C++ syntax into Luau automatically removes
+licensing obligations.
+
+Legal permission to reproduce behavior or code does not automatically mean that
+doing so is the best gameplay or engineering decision.
+
+Beyond 90 should maintain its own identity and Roblox-native architecture.
 
 ---
 
@@ -1030,14 +1402,26 @@ RECOMMENDATION
 
     Something proposed specifically for Beyond 90.
 
-Never claim GameplayFootball performs a behavior unless the relevant source has
-actually been inspected.
+Never claim:
+
+    "GameplayFootball does X"
+
+unless the relevant source has actually been inspected.
 
 If uncertain, inspect the source rather than guessing.
 
-Avoid large copied code blocks.
+Avoid unnecessarily copying large source blocks into research documentation.
 
-Focus primarily on understanding behavior, concepts and design reasoning.
+Focus on:
+
+- Behavior
+- Algorithms
+- Relationships
+- Formulas
+- State transitions
+- Call chains
+- Important constants
+- Design intent where inferable
 
 For substantial research, record the exact reference revision used.
 
@@ -1062,9 +1446,70 @@ If later research uses a different revision, do not silently treat behavior
 from the newer revision as though it existed in the previously researched
 version.
 
+If implementation work is based on a specific researched revision, preserve
+that revision in the relevant research documentation so later source changes do
+not silently alter the behavioral baseline.
+
 ---
 
-# 29. Broadcast Camera Reference Exception
+# 29. GameplayFootball Implementation Workflow
+
+When implementing a substantial GameplayFootball-relevant football mechanic,
+use this workflow unless explicitly instructed otherwise:
+
+    1. Inspect current Beyond 90 implementation.
+
+    2. Read existing research documentation.
+
+    3. Inspect the exact GameplayFootball source revision.
+
+    4. Trace the complete relevant behavior/call chain.
+
+    5. Identify football logic.
+
+    6. Separate AI-only decision-making.
+
+    7. Separate animation-specific behavior.
+
+    8. Separate engine-specific behavior.
+
+    9. Identify algorithms/state relationships to preserve.
+
+    10. Map reference behavior to existing Beyond 90 modules.
+
+    11. Decide what should:
+            KEEP
+            PORT CLOSELY
+            ADAPT
+            REPLACE
+            OMIT
+            DEFER
+
+    12. Determine Roblox networking/security implications.
+
+    13. Define the smallest playable implementation milestone.
+
+    14. Implement the Roblox-native equivalent.
+
+    15. Test in Roblox Studio.
+
+    16. Compare behavior with the reference where possible.
+
+    17. Tune Beyond 90-specific values.
+
+    18. Document approved architecture after behavior stabilizes.
+
+Do not default to inventing a different football model merely because a
+reference algorithm requires adaptation.
+
+Do not default to copying a reference algorithm merely because it exists.
+
+Use verified reference behavior as the baseline, then make deliberate changes
+for Beyond 90.
+
+---
+
+# 30. Broadcast Camera Reference Exception
 
 GameplayFootball may be researched for general camera concepts where useful,
 but it does NOT define Beyond 90's Broadcast Camera.
@@ -1089,11 +1534,14 @@ Its priorities remain:
 Modern football broadcasts and modern football games may also be used as
 references where useful.
 
-The final camera must be designed specifically for Beyond 90.
+GameplayFootball behavioral-fidelity rules for fundamental football mechanics
+do NOT require the Broadcast Camera to imitate GameplayFootball.
+
+The final Broadcast Camera must be designed specifically for Beyond 90.
 
 ---
 
-# 30. Reference Design Priority
+# 31. Reference Design Priority
 
 When reference-derived solutions conflict, prioritize:
 
@@ -1115,22 +1563,46 @@ When reference-derived solutions conflict, prioritize:
     ↓
     POLISH
 
+Behavioral fidelity to GameplayFootball is a STARTING POINT, not a higher
+priority than Beyond 90's gameplay goals.
+
+If a verified GameplayFootball behavior produces excellent football in
+Beyond 90, preserve it.
+
+If Roblox constraints require an implementation change, adapt the
+implementation while attempting to preserve the football behavior.
+
+If Beyond 90 playtesting demonstrates that changing the reference behavior
+creates a better experience, Beyond 90 takes priority.
+
 Technical similarity to GameplayFootball is NOT a goal.
 
-Creating excellent football gameplay for Beyond 90 is the goal.
+Football-behavior quality is.
 
 The governing principle is:
 
-> GameplayFootball teaches us how another developer solved the football problem.
+> GameplayFootball teaches us how a working football game solved the football
+> problem.
 >
-> Roblox determines the technical constraints we must solve within.
+> Preserve those proven football behaviors when they serve Beyond 90.
 >
-> Beyond 90 determines what the final experience should become.
+> Roblox determines how those behaviors must be implemented technically.
+>
+> Beyond 90 determines where the reference should ultimately be preserved,
+> adapted, improved or rejected.
 
 Study references aggressively.
 
-Extract concepts selectively.
+Trace complete behavior.
 
-Question assumptions.
+Port proven football logic closely where appropriate.
+
+Adapt engine implementation deliberately.
+
+Preserve human tactical agency.
+
+Playtest against the reference.
+
+Improve where Beyond 90 can do better.
 
 Build the final system specifically for Beyond 90.

@@ -1,8 +1,12 @@
 local ContextActionService = game:GetService("ContextActionService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
+local BallConfig = require(Shared.Config.BallConfig)
+local BallControlMath = require(Shared.Football.BallControlMath)
 local GameConfig = require(Shared.Config.GameConfig)
 local PlayerConfig = require(Shared.Config.PlayerConfig)
 
@@ -11,6 +15,8 @@ local MovementController = {}
 local localPlayer = Players.LocalPlayer
 local movementConfig = PlayerConfig.Movement
 local inputConfig = PlayerConfig.Input
+local controlConfig = BallConfig.Control
+local renderStepName = "Beyond90BallControlAssist"
 
 local initialized = false
 local currentHumanoid: Humanoid? = nil
@@ -18,9 +24,15 @@ local sprintRequested = false
 local sprintRemote: RemoteEvent? = nil
 local characterAddedConnection: RBXScriptConnection? = nil
 local humanoidDiedConnection: RBXScriptConnection? = nil
+local cachedBall: BasePart? = nil
+local lastLeadDiagnosticTime = 0
 
 local function warnLog(message: string)
 	warn(string.format("%s[Client][Movement] %s", GameConfig.LogPrefix, message))
+end
+
+local function log(message: string)
+	print(string.format("%s[Client][Movement] %s", GameConfig.LogPrefix, message))
 end
 
 local function getSprintSpeed(): number
@@ -42,6 +54,127 @@ local function applyMovementSettings(humanoid: Humanoid)
 	if not movementConfig.JumpEnabled then
 		humanoid.Jump = false
 	end
+end
+
+local function getRootPart(): BasePart?
+	local character = localPlayer.Character
+
+	if not character then
+		return nil
+	end
+
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+
+	if not rootPart or not rootPart:IsA("BasePart") then
+		return nil
+	end
+
+	return rootPart
+end
+
+local function getFootball(): BasePart?
+	if cachedBall and cachedBall.Parent then
+		return cachedBall
+	end
+
+	local rootFolder = Workspace:FindFirstChild(GameConfig.WorkspaceContainerName)
+	local ballFolder = rootFolder and rootFolder:FindFirstChild("Ball")
+	local ball = ballFolder and ballFolder:FindFirstChild(BallConfig.Name)
+
+	if ball and ball:IsA("BasePart") then
+		cachedBall = ball
+		return ball
+	end
+
+	cachedBall = nil
+	return nil
+end
+
+local function isLocalController(ball: BasePart): boolean
+	return ball:GetAttribute("State") == "Controlled"
+		and ball:GetAttribute("ControllerUserId") == localPlayer.UserId
+end
+
+local function getFacingDirection(rootPart: BasePart): Vector3
+	return BallControlMath.SafeUnit(
+		BallControlMath.GetHorizontal(rootPart.CFrame.LookVector),
+		Vector3.new(0, 0, -1)
+	)
+end
+
+local function updateClientLeadDiagnostic(ball: BasePart, rootPart: BasePart, controlDirection: Vector3, assistBias: number)
+	local lead = BallControlMath.GetHorizontal(ball.Position - rootPart.Position):Dot(controlDirection)
+	ball:SetAttribute("ClientBallLead", lead)
+
+	local now = os.clock()
+
+	if now - lastLeadDiagnosticTime < controlConfig.LeadDiagnosticInterval then
+		return
+	end
+
+	lastLeadDiagnosticTime = now
+	local serverLead = ball:GetAttribute("ServerBallLead")
+	log(string.format(
+		"Lead sample client=%.2f server=%s assistBias=%.2f",
+		lead,
+		if typeof(serverLead) == "number" then string.format("%.2f", serverLead) else "n/a",
+		assistBias
+	))
+end
+
+local function updateBallControlAssist()
+	local humanoid = currentHumanoid
+
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+
+	local ball = getFootball()
+
+	if not ball or not isLocalController(ball) then
+		return
+	end
+
+	local rootPart = getRootPart()
+
+	if not rootPart then
+		return
+	end
+
+	local manualMovement = BallControlMath.GetHorizontal(humanoid.MoveDirection)
+	local manualSpeed = manualMovement.Magnitude
+	local fallbackDirection = getFacingDirection(rootPart)
+	local diagnosticDirection = if manualSpeed > 0.05 then manualMovement.Unit else fallbackDirection
+
+	if manualSpeed <= 0.05 then
+		updateClientLeadDiagnostic(ball, rootPart, diagnosticDirection, 0)
+		return
+	end
+
+	local assistDirection, distanceToPredictedBall = BallControlMath.GetContactAssistDirection(
+		rootPart.Position,
+		ball.Position,
+		ball.AssemblyLinearVelocity,
+		fallbackDirection,
+		controlConfig
+	)
+
+	if assistDirection.Magnitude <= 0 then
+		updateClientLeadDiagnostic(ball, rootPart, diagnosticDirection, 0)
+		return
+	end
+
+	local manualDirection = manualMovement.Unit
+	local assistBias = BallControlMath.GetAssistBias(distanceToPredictedBall, manualDirection, assistDirection, controlConfig)
+	local assistedDirection = BallControlMath.BlendManualAndAssistDirection(manualDirection, assistDirection, assistBias)
+
+	if assistedDirection.Magnitude <= 0 then
+		updateClientLeadDiagnostic(ball, rootPart, manualDirection, 0)
+		return
+	end
+
+	humanoid:Move(assistedDirection, false)
+	updateClientLeadDiagnostic(ball, rootPart, assistedDirection, assistBias)
 end
 
 local function sendSprintRequest(requested: boolean)
@@ -141,6 +274,7 @@ function MovementController.Initialize()
 	initialized = true
 	resolveSprintRemote()
 	bindSprintInput()
+	RunService:BindToRenderStep(renderStepName, Enum.RenderPriority.Character.Value + 1, updateBallControlAssist)
 
 	characterAddedConnection = localPlayer.CharacterAdded:Connect(configureCharacter)
 
@@ -156,6 +290,7 @@ function MovementController.Destroy()
 
 	initialized = false
 	ContextActionService:UnbindAction(inputConfig.SprintActionName)
+	RunService:UnbindFromRenderStep(renderStepName)
 
 	if characterAddedConnection then
 		characterAddedConnection:Disconnect()

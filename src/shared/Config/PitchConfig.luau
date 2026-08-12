@@ -6,11 +6,15 @@ local lineHeight = 0.08
 local goalWidth = 28
 local goalDepth = 10
 local goalHeight = 8
-local spawnOffset = 35
+local developmentSpawnLengthOffset = -12
+local maxPitchBoundsReferenceThickness = 2
 
 local PitchConfig = {
 	Length = length,
 	Width = width,
+	UseWorkspacePitchBounds = true,
+	WorkspacePitchBoundsPath = { "StadiumDevelopment", "PitchBounds" },
+	MaxPitchBoundsReferenceThickness = maxPitchBoundsReferenceThickness,
 	SurfaceThickness = surfaceThickness,
 	SurfaceSize = Vector3.new(width, surfaceThickness, length),
 	SurfacePosition = Vector3.new(0, -surfaceThickness / 2, 0),
@@ -23,7 +27,7 @@ local PitchConfig = {
 	GoalDepth = goalDepth,
 	GoalHeight = goalHeight,
 
-	SpawnPosition = Vector3.new(0, 4, -length / 2 + spawnOffset),
+	DevelopmentSpawnLengthOffset = developmentSpawnLengthOffset,
 	BallCenterPosition = Vector3.new(0, 4, 0),
 }
 

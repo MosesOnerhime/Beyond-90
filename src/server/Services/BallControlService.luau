@@ -5,6 +5,7 @@ local Workspace = game:GetService("Workspace")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local BallConfig = require(Shared.Config.BallConfig)
 local GameConfig = require(Shared.Config.GameConfig)
+local BallControlMath = require(Shared.Football.BallControlMath)
 
 local BallControlService = {}
 
@@ -13,17 +14,15 @@ local CONTROL_STATE_CONTROLLED = "Controlled"
 
 local controlConfig = BallConfig.Control
 local activeController: Player? = nil
-local lastDribbleByPlayer: { [Player]: number } = {}
 local lastControlDirectionByPlayer: { [Player]: Vector3 } = {}
-local softInvalidStartedAt: number? = nil
-local softInvalidReason: string? = nil
+local lastLogicalTouchByPlayer: { [Player]: number } = {}
+local logicalTouchCountByPlayer: { [Player]: number } = {}
+local lastLeadDiagnosticByPlayer: { [Player]: number } = {}
+local controllerNoCollisionConstraints: { NoCollisionConstraint } = {}
+local controllerCharacterConnection: RBXScriptConnection? = nil
 
 local function log(message: string)
 	print(string.format("%s[Ball] %s", GameConfig.LogPrefix, message))
-end
-
-local function getHorizontal(vector: Vector3): Vector3
-	return Vector3.new(vector.X, 0, vector.Z)
 end
 
 local function isFiniteNumber(value: number): boolean
@@ -39,9 +38,52 @@ local function setBallState(ball: BasePart, state: string, controller: Player?)
 	ball:SetAttribute("ControllerUserId", if controller then controller.UserId else 0)
 end
 
-local function clearSoftInvalid()
-	softInvalidStartedAt = nil
-	softInvalidReason = nil
+local function clearLegacyDiagnostics(ball: BasePart)
+	ball:SetAttribute("Recoverable", nil)
+	ball:SetAttribute("EstimatedTimeToBall", nil)
+	ball:SetAttribute("LastRecoverabilityFailure", nil)
+end
+
+local function clearControllerNoCollision()
+	if controllerCharacterConnection then
+		controllerCharacterConnection:Disconnect()
+		controllerCharacterConnection = nil
+	end
+
+	for _, constraint in controllerNoCollisionConstraints do
+		constraint:Destroy()
+	end
+
+	table.clear(controllerNoCollisionConstraints)
+end
+
+local function addNoCollisionConstraint(ball: BasePart, part: BasePart)
+	if part == ball then
+		return
+	end
+
+	local constraint = Instance.new("NoCollisionConstraint")
+	constraint.Name = "Beyond90ControllerNoCollision"
+	constraint.Part0 = ball
+	constraint.Part1 = part
+	constraint.Parent = ball
+	table.insert(controllerNoCollisionConstraints, constraint)
+end
+
+local function setControllerNoCollision(ball: BasePart, character: Model)
+	clearControllerNoCollision()
+
+	for _, descendant in character:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			addNoCollisionConstraint(ball, descendant)
+		end
+	end
+
+	controllerCharacterConnection = character.DescendantAdded:Connect(function(descendant)
+		if descendant:IsA("BasePart") and activeController and ball.Parent then
+			addNoCollisionConstraint(ball, descendant)
+		end
+	end)
 end
 
 local function getCharacterParts(player: Player)
@@ -91,29 +133,8 @@ local function getHardControllerInvalidReason(player: Player?): string?
 	return nil
 end
 
-local function getBallHeightLimit(heightTolerance: number): number
-	return BallConfig.Radius + heightTolerance
-end
-
 local function isBallWithinHeight(ball: BasePart, heightTolerance: number): boolean
-	return ball.Position.Y <= getBallHeightLimit(heightTolerance)
-end
-
-local function getPlayerMovementDirection(player: Player, rootPart: BasePart): (Vector3?, number)
-	local velocity = getHorizontal(rootPart.AssemblyLinearVelocity)
-	local speed = velocity.Magnitude
-
-	if speed >= controlConfig.StationaryPlayerSpeed then
-		return velocity.Unit, speed
-	end
-
-	local lastDirection = lastControlDirectionByPlayer[player]
-
-	if lastDirection then
-		return lastDirection, speed
-	end
-
-	return nil, speed
+	return ball.Position.Y <= BallConfig.Radius + heightTolerance
 end
 
 local function hasClearContactPath(character: Model, ball: BasePart, rootPart: BasePart): boolean
@@ -124,6 +145,54 @@ local function hasClearContactPath(character: Model, ball: BasePart, rootPart: B
 	local result = Workspace:Raycast(rootPart.Position, ball.Position - rootPart.Position, raycastParams)
 
 	return result == nil or not result.Instance.CanCollide
+end
+
+local function getFacingDirection(rootPart: BasePart): Vector3
+	return BallControlMath.SafeUnit(
+		BallControlMath.GetHorizontal(rootPart.CFrame.LookVector),
+		Vector3.new(0, 0, -1)
+	)
+end
+
+local function getPlayerMovementDirection(player: Player, rootPart: BasePart, humanoid: Humanoid): (Vector3, number)
+	local fallback = lastControlDirectionByPlayer[player] or getFacingDirection(rootPart)
+	local moveDirection = BallControlMath.GetHorizontal(humanoid.MoveDirection)
+
+	if moveDirection.Magnitude >= controlConfig.StationaryPlayerSpeed / math.max(humanoid.WalkSpeed, 1) then
+		return moveDirection.Unit, BallControlMath.GetHorizontal(rootPart.AssemblyLinearVelocity).Magnitude
+	end
+
+	local direction, speed = BallControlMath.GetControlDirection(rootPart.AssemblyLinearVelocity, fallback)
+
+	return direction or fallback, speed
+end
+
+local function isSprinting(humanoid: Humanoid): boolean
+	return humanoid:GetAttribute("SprintRequested") == true
+end
+
+local function updateControlDirection(player: Player, rootPart: BasePart, movementDirection: Vector3, playerSpeed: number): Vector3
+	local lastDirection = lastControlDirectionByPlayer[player]
+	local desiredDirection = if playerSpeed >= controlConfig.StationaryPlayerSpeed
+		then movementDirection
+		else getFacingDirection(rootPart)
+
+	if not lastDirection then
+		lastControlDirectionByPlayer[player] = desiredDirection
+		return desiredDirection
+	end
+
+	local smoothing = controlConfig.DirectionSmoothing
+
+	if lastDirection:Dot(desiredDirection) < controlConfig.SharpTurnDirectionDot then
+		smoothing = 1
+	end
+
+	local smoothed = lastDirection:Lerp(desiredDirection, smoothing)
+	local direction = BallControlMath.SafeUnit(smoothed, desiredDirection)
+	lastControlDirectionByPlayer[player] = direction
+
+	return direction
 end
 
 local function getControlContext(
@@ -149,18 +218,14 @@ local function getControlContext(
 		return nil
 	end
 
-	local horizontalToBall = getHorizontal(ball.Position - rootPart.Position)
+	local horizontalToBall = BallControlMath.GetHorizontal(ball.Position - rootPart.Position)
 	local distance = horizontalToBall.Magnitude
 
 	if distance <= 0 or distance > distanceLimit then
 		return nil
 	end
 
-	local movementDirection, playerSpeed = getPlayerMovementDirection(player, rootPart)
-
-	if not movementDirection then
-		movementDirection = horizontalToBall.Unit
-	end
+	local movementDirection, playerSpeed = getPlayerMovementDirection(player, rootPart, humanoid)
 
 	if requireAcquireMovement and playerSpeed < controlConfig.AcquireMinPlayerSpeed then
 		return nil
@@ -213,7 +278,7 @@ local function getActiveControllerContext(player: Player, ball: BasePart)
 	return getControlContext(
 		player,
 		ball,
-		controlConfig.ReleaseDistance,
+		controlConfig.HardControlDistance,
 		controlConfig.ControlRetentionMaxSpeed,
 		controlConfig.ControlRetentionHeightTolerance,
 		false,
@@ -235,67 +300,25 @@ local function chooseBestCandidate(ball: BasePart)
 	return bestCandidate
 end
 
-local function getControllerInvalidReason(ball: BasePart): (string?, boolean)
-	local hardReason = getHardControllerInvalidReason(activeController)
-
-	if hardReason then
-		return hardReason, true
-	end
-
-	local controller = activeController :: Player
-	local character, rootPart = getCharacterParts(controller)
-
-	if not character or not rootPart then
-		return "character invalid", true
-	end
-
-	if not isBallWithinHeight(ball, controlConfig.ControlRetentionHeightTolerance) then
-		return "ball too high", false
-	end
-
-	if ball.AssemblyLinearVelocity.Magnitude > controlConfig.ControlRetentionMaxSpeed then
-		return "ball too fast", false
-	end
-
-	local horizontalToBall = getHorizontal(ball.Position - rootPart.Position)
-	local distance = horizontalToBall.Magnitude
-
-	if distance > controlConfig.ReleaseDistance then
-		return "distance exceeded", false
-	end
-
-	if distance > 0 then
-		local movementDirection = getPlayerMovementDirection(controller, rootPart)
-
-		if movementDirection then
-			local directionToBall = horizontalToBall.Unit
-
-			if movementDirection:Dot(directionToBall) < controlConfig.ControlReleaseBehindThreshold then
-				return "ball behind player", false
-			end
-		end
-	end
-
-	if not hasClearContactPath(character, ball, rootPart) then
-		return "contact path blocked", false
-	end
-
-	return nil, false
-end
-
 local function releaseControl(ball: BasePart, reason: string)
 	if not activeController then
 		setBallState(ball, CONTROL_STATE_FREE, nil)
 		ball:SetAttribute("LastReleaseReason", reason)
-		clearSoftInvalid()
+		clearControllerNoCollision()
 		return
 	end
 
+	local previousController = activeController :: Player
 	log(string.format("Control released: %s", reason))
+
 	activeController = nil
+	lastLogicalTouchByPlayer[previousController] = nil
+	logicalTouchCountByPlayer[previousController] = nil
+	lastControlDirectionByPlayer[previousController] = nil
+	lastLeadDiagnosticByPlayer[previousController] = nil
+	clearControllerNoCollision()
 	setBallState(ball, CONTROL_STATE_FREE, nil)
 	ball:SetAttribute("LastReleaseReason", reason)
-	clearSoftInvalid()
 end
 
 local function acquireControl(ball: BasePart, player: Player)
@@ -303,152 +326,295 @@ local function acquireControl(ball: BasePart, player: Player)
 		return
 	end
 
+	local previousController = activeController
+	local character = player.Character
+
+	if previousController then
+		lastLogicalTouchByPlayer[previousController] = nil
+		logicalTouchCountByPlayer[previousController] = nil
+		lastControlDirectionByPlayer[previousController] = nil
+		lastLeadDiagnosticByPlayer[previousController] = nil
+	end
+
 	activeController = player
+	lastLogicalTouchByPlayer[player] = nil
+	logicalTouchCountByPlayer[player] = 0
+	lastLeadDiagnosticByPlayer[player] = nil
 	setBallState(ball, CONTROL_STATE_CONTROLLED, player)
+	clearLegacyDiagnostics(ball)
 	ball:SetAttribute("LastReleaseReason", "")
-	clearSoftInvalid()
+	ball:SetAttribute("LastControlTouchTime", -1)
+	ball:SetAttribute("LastControlTouchCount", 0)
+	ball:SetAttribute("ServerBallLead", 0)
+	ball:SetAttribute("ClientBallLead", 0)
+
+	if character then
+		setControllerNoCollision(ball, character)
+	end
+
 	log(string.format("Control acquired by %s", player.Name))
 end
 
-local function shouldReleaseForSoftInvalid(reason: string): boolean
-	local now = os.clock()
-
-	if softInvalidReason ~= reason then
-		softInvalidReason = reason
-		softInvalidStartedAt = now
+local function applyVelocityDelta(ball: BasePart, deltaVelocity: Vector3): boolean
+	if not isFiniteVector(deltaVelocity) or deltaVelocity.Magnitude <= 0 then
 		return false
 	end
 
-	return softInvalidStartedAt ~= nil and now - softInvalidStartedAt >= controlConfig.ReleaseGracePeriod
+	ball:ApplyImpulse(deltaVelocity * ball.AssemblyMass)
+	return true
 end
 
-local function updateControlDirection(player: Player, movementDirection: Vector3, playerSpeed: number): Vector3
-	local lastDirection = lastControlDirectionByPlayer[player]
+local function getControllerInvalidReason(ball: BasePart): string?
+	local hardReason = getHardControllerInvalidReason(activeController)
 
-	if playerSpeed < controlConfig.StationaryPlayerSpeed then
-		return lastDirection or movementDirection
+	if hardReason then
+		return hardReason
 	end
 
-	if not lastDirection then
-		lastControlDirectionByPlayer[player] = movementDirection
-		return movementDirection
+	local controller = activeController :: Player
+	local _character, rootPart = getCharacterParts(controller)
+
+	if not rootPart then
+		return "character invalid"
 	end
 
-	if lastDirection:Dot(movementDirection) < controlConfig.SharpTurnDirectionDot then
-		return lastDirection
+	if not isBallWithinHeight(ball, controlConfig.ControlRetentionHeightTolerance) then
+		return "ball too high"
 	end
 
-	local smoothed = lastDirection:Lerp(movementDirection, controlConfig.DirectionSmoothing)
-
-	if smoothed.Magnitude <= 0 then
-		lastControlDirectionByPlayer[player] = movementDirection
-		return movementDirection
+	if ball.AssemblyLinearVelocity.Magnitude > controlConfig.ControlRetentionMaxSpeed then
+		return "ball too fast"
 	end
 
-	local direction = smoothed.Unit
-	lastControlDirectionByPlayer[player] = direction
+	local horizontalDistance = BallControlMath.GetHorizontal(ball.Position - rootPart.Position).Magnitude
 
-	return direction
+	if horizontalDistance > controlConfig.HardControlDistance then
+		return "hard distance exceeded"
+	end
+
+	return nil
 end
 
-local function getDribbleTargetDistance(humanoid: Humanoid): number
-	if humanoid:GetAttribute("SprintRequested") == true then
-		return controlConfig.ControlTargetDistanceSprint
-	end
-
-	return controlConfig.ControlTargetDistanceWalk
+local function getPerpendicular(direction: Vector3): Vector3
+	return Vector3.new(-direction.Z, 0, direction.X)
 end
 
-local function getDribbleStrength(humanoid: Humanoid): number
-	if humanoid:GetAttribute("SprintRequested") == true then
-		return controlConfig.DribbleTouchStrengthSprint
-	end
-
-	return controlConfig.DribbleTouchStrengthWalk
-end
-
-local function applyImpulseVelocity(ball: BasePart, impulseVelocity: Vector3)
-	if not isFiniteVector(impulseVelocity) or impulseVelocity.Magnitude <= 0 then
-		return
-	end
-
-	ball:ApplyImpulse(impulseVelocity * ball.AssemblyMass)
-end
-
-local function applyMinimumSeparation(ball: BasePart, rootPart: BasePart, controlDirection: Vector3)
-	local horizontalFromPlayer = getHorizontal(ball.Position - rootPart.Position)
+local function applyMinimumSeparation(ball: BasePart, rootPart: BasePart, controlDirection: Vector3): boolean
+	local horizontalFromPlayer = BallControlMath.GetHorizontal(ball.Position - rootPart.Position)
 	local distance = horizontalFromPlayer.Magnitude
 	local requiredCenterDistance = controlConfig.ControlOriginRadius + BallConfig.Radius + controlConfig.MinimumControlSeparation
 
 	if distance >= requiredCenterDistance then
-		return
+		return false
 	end
 
 	local radialDirection = if distance > 0 then horizontalFromPlayer.Unit else controlDirection
-	local correctionDirection = radialDirection * 0.25 + controlDirection * 0.75
-
-	if correctionDirection.Magnitude <= 0 then
-		correctionDirection = controlDirection
-	end
-
+	local correctionDirection = BallControlMath.SafeUnit(radialDirection * 0.95 + controlDirection * 0.05, radialDirection)
 	local separationError = requiredCenterDistance - distance
 	local deltaSpeed = math.min(
 		separationError * controlConfig.SeparationCorrectionStrength,
 		controlConfig.MaxSeparationImpulseDeltaSpeed
 	)
 
-	applyImpulseVelocity(ball, correctionDirection.Unit * deltaSpeed)
+	return applyVelocityDelta(ball, correctionDirection * deltaSpeed)
 end
 
-local function applyCloseControl(ball: BasePart, candidate)
-	local controlDirection = updateControlDirection(candidate.Player, candidate.MovementDirection, candidate.PlayerSpeed)
+local function isLogicalContactValid(ball: BasePart, candidate, controlDirection: Vector3): boolean
+	local horizontalFromPlayer = BallControlMath.GetHorizontal(ball.Position - candidate.RootPart.Position)
+	local distance = horizontalFromPlayer.Magnitude
 
-	applyMinimumSeparation(ball, candidate.RootPart, controlDirection)
-
-	if candidate.PlayerSpeed < controlConfig.StationaryPlayerSpeed then
-		return
+	if distance > controlConfig.ContactRegionRadius then
+		return false
 	end
 
+	local forwardDistance = horizontalFromPlayer:Dot(controlDirection)
+
+	if forwardDistance < -controlConfig.ContactBehindTolerance or forwardDistance > controlConfig.ContactAheadDistance then
+		return false
+	end
+
+	local lateralDistance = (horizontalFromPlayer - controlDirection * forwardDistance).Magnitude
+
+	if lateralDistance > controlConfig.ContactLateralTolerance then
+		return false
+	end
+
+	if candidate.PlayerSpeed >= controlConfig.StationaryPlayerSpeed
+		and candidate.MovementDirection:Dot(controlDirection) < controlConfig.ContactMinimumForwardIntentDot
+	then
+		return false
+	end
+
+	return isBallWithinHeight(ball, controlConfig.ControlHeightTolerance)
+end
+
+local function applyPlannedContact(ball: BasePart, candidate, controlDirection: Vector3): boolean
 	local now = os.clock()
-	local lastDribble = lastDribbleByPlayer[candidate.Player]
+	local lastLogicalTouch = lastLogicalTouchByPlayer[candidate.Player]
 
-	if lastDribble and now - lastDribble < controlConfig.DribbleTouchInterval then
-		return
+	if lastLogicalTouch and now - lastLogicalTouch < controlConfig.LogicalTouchInterval then
+		return false
 	end
 
-	lastDribbleByPlayer[candidate.Player] = now
-
-	local targetDistance = getDribbleTargetDistance(candidate.Humanoid)
-	local targetPosition = candidate.RootPart.Position + controlDirection * targetDistance
-	local toTarget = getHorizontal(targetPosition - ball.Position)
-	local targetError = toTarget.Magnitude
-
-	if targetError < controlConfig.TargetDeadzone then
-		return
+	if not isLogicalContactValid(ball, candidate, controlDirection) then
+		return false
 	end
 
-	local ballVelocity = getHorizontal(ball.AssemblyLinearVelocity)
-	local targetDirection = toTarget.Unit
-	local currentTargetSpeed = math.max(0, ballVelocity:Dot(targetDirection))
-	local desiredDeltaSpeed = math.min(
-		targetError * getDribbleStrength(candidate.Humanoid) - currentTargetSpeed,
-		controlConfig.MaxDribbleImpulseDeltaSpeed
+	local sprinting = isSprinting(candidate.Humanoid)
+	local plannedContact = BallControlMath.GetPlannedContact(
+		candidate.RootPart.Position,
+		candidate.RootPart.AssemblyLinearVelocity,
+		controlDirection,
+		candidate.PlayerSpeed,
+		sprinting,
+		controlConfig
+	)
+	local velocityPlan = BallControlMath.GetDesiredContactVelocity(
+		ball.Position,
+		ball.AssemblyLinearVelocity,
+		candidate.RootPart.AssemblyLinearVelocity,
+		controlDirection,
+		candidate.PlayerSpeed,
+		sprinting,
+		plannedContact,
+		controlConfig
+	)
+	local horizontalDelta = velocityPlan.DesiredHorizontalVelocity - velocityPlan.CurrentHorizontalVelocity
+	local verticalDelta = math.clamp(
+		-ball.AssemblyLinearVelocity.Y * 0.35,
+		-controlConfig.MaxContactVerticalDeltaSpeed,
+		controlConfig.MaxContactVerticalDeltaSpeed
 	)
 
-	if desiredDeltaSpeed <= 0 then
+	if not applyVelocityDelta(ball, Vector3.new(horizontalDelta.X, verticalDelta, horizontalDelta.Z)) then
+		return false
+	end
+
+	lastLogicalTouchByPlayer[candidate.Player] = now
+	local count = (logicalTouchCountByPlayer[candidate.Player] or 0) + 1
+	logicalTouchCountByPlayer[candidate.Player] = count
+	ball:SetAttribute("LastControlTouchTime", now)
+	ball:SetAttribute("LastControlTouchCount", count)
+	ball:SetAttribute("ControlTargetError", velocityPlan.ToPlannedBall.Magnitude)
+
+	log(string.format(
+		"Control touch #%d by %s plannedSpeed=%.2f playerSpeed=%.2f overdrive=%.2f",
+		count,
+		candidate.Player.Name,
+		velocityPlan.DesiredHorizontalVelocity.Magnitude,
+		candidate.PlayerSpeed,
+		velocityPlan.MaxOverdrive
+	))
+
+	return true
+end
+
+local function applyStationaryStabilization(ball: BasePart, candidate, controlDirection: Vector3, deltaTime: number)
+	local velocityPlan = BallControlMath.GetStationaryControlVelocity(
+		candidate.RootPart.Position,
+		ball.Position,
+		ball.AssemblyLinearVelocity,
+		controlDirection,
+		controlConfig
+	)
+
+	if velocityPlan.TargetError <= controlConfig.StabilizationDeadzone then
+		ball:SetAttribute("ControlTargetError", velocityPlan.TargetError)
 		return
 	end
 
-	applyImpulseVelocity(ball, targetDirection * desiredDeltaSpeed)
+	local horizontalDelta = velocityPlan.DesiredHorizontalVelocity - velocityPlan.CurrentHorizontalVelocity
+	local maxDelta = controlConfig.StationaryMaxDeltaSpeedPerSecond * deltaTime
+	horizontalDelta = BallControlMath.ClampMagnitude(horizontalDelta, maxDelta)
+
+	applyVelocityDelta(ball, Vector3.new(horizontalDelta.X, 0, horizontalDelta.Z))
+	ball:SetAttribute("ControlTargetError", velocityPlan.TargetError)
+end
+
+local function applyMovingLateralStabilization(ball: BasePart, candidate, controlDirection: Vector3, deltaTime: number)
+	local horizontalFromPlayer = BallControlMath.GetHorizontal(ball.Position - candidate.RootPart.Position)
+	local lateralDirection = getPerpendicular(controlDirection)
+	local lateralError = horizontalFromPlayer:Dot(lateralDirection)
+
+	if math.abs(lateralError) <= controlConfig.StabilizationDeadzone then
+		ball:SetAttribute("ControlTargetError", math.abs(lateralError))
+		return
+	end
+
+	local ballLateralSpeed = BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity):Dot(lateralDirection)
+	local desiredLateralSpeed = -lateralError * controlConfig.MovingLateralStabilizationGain
+	local lateralDeltaSpeed = desiredLateralSpeed - ballLateralSpeed
+	local maxDelta = controlConfig.MovingLateralMaxDeltaSpeedPerSecond * deltaTime
+	lateralDeltaSpeed = math.clamp(lateralDeltaSpeed, -maxDelta, maxDelta)
+
+	applyVelocityDelta(ball, lateralDirection * lateralDeltaSpeed)
+	ball:SetAttribute("ControlTargetError", math.abs(lateralError))
+end
+
+local function updateLeadDiagnostics(ball: BasePart, candidate, controlDirection: Vector3)
+	local now = os.clock()
+	local currentLead = BallControlMath.GetHorizontal(ball.Position - candidate.RootPart.Position):Dot(controlDirection)
+	ball:SetAttribute("CurrentBallLead", currentLead)
+	ball:SetAttribute("ServerBallLead", currentLead)
+
+	local lastLogTime = lastLeadDiagnosticByPlayer[candidate.Player]
+
+	if lastLogTime and now - lastLogTime < controlConfig.LeadDiagnosticInterval then
+		return
+	end
+
+	lastLeadDiagnosticByPlayer[candidate.Player] = now
+	log(string.format(
+		"Lead sample server=%.2f contacts=%d",
+		currentLead,
+		logicalTouchCountByPlayer[candidate.Player] or 0
+	))
+end
+
+local function applyCoupledPossessionControl(ball: BasePart, candidate, deltaTime: number)
+	local isStationary = candidate.PlayerSpeed < controlConfig.StationaryPlayerSpeed
+	local controlDirection = updateControlDirection(
+		candidate.Player,
+		candidate.RootPart,
+		candidate.MovementDirection,
+		candidate.PlayerSpeed
+	)
+
+	local touched = false
+
+	if not isStationary then
+		touched = applyPlannedContact(ball, candidate, controlDirection)
+	end
+
+	if isStationary then
+		applyStationaryStabilization(ball, candidate, controlDirection, deltaTime)
+	elseif not touched then
+		applyMovingLateralStabilization(ball, candidate, controlDirection, deltaTime)
+	end
+
+	if not touched then
+		applyMinimumSeparation(ball, candidate.RootPart, controlDirection)
+	end
+
+	updateLeadDiagnostics(ball, candidate, controlDirection)
 end
 
 function BallControlService.Initialize(ball: BasePart)
 	activeController = nil
-	table.clear(lastDribbleByPlayer)
+	table.clear(lastLogicalTouchByPlayer)
+	table.clear(logicalTouchCountByPlayer)
 	table.clear(lastControlDirectionByPlayer)
-	clearSoftInvalid()
+	table.clear(lastLeadDiagnosticByPlayer)
+	clearControllerNoCollision()
 	setBallState(ball, CONTROL_STATE_FREE, nil)
+	clearLegacyDiagnostics(ball)
 	ball:SetAttribute("LastReleaseReason", "")
+	ball:SetAttribute("LastControlTouchTime", -1)
+	ball:SetAttribute("LastControlTouchCount", 0)
+	ball:SetAttribute("ControlTargetError", -1)
+	ball:SetAttribute("CurrentBallLead", 0)
+	ball:SetAttribute("ServerBallLead", 0)
+	ball:SetAttribute("ClientBallLead", 0)
 end
 
 function BallControlService.Reset(ball: BasePart)
@@ -457,40 +623,46 @@ function BallControlService.Reset(ball: BasePart)
 	else
 		setBallState(ball, CONTROL_STATE_FREE, nil)
 		ball:SetAttribute("LastReleaseReason", "ball reset")
-		clearSoftInvalid()
+		clearControllerNoCollision()
 	end
 
-	table.clear(lastDribbleByPlayer)
+	table.clear(lastLogicalTouchByPlayer)
+	table.clear(logicalTouchCountByPlayer)
 	table.clear(lastControlDirectionByPlayer)
+	table.clear(lastLeadDiagnosticByPlayer)
+	ball:SetAttribute("LastControlTouchTime", -1)
+	ball:SetAttribute("LastControlTouchCount", 0)
+	ball:SetAttribute("ControlTargetError", -1)
+	ball:SetAttribute("CurrentBallLead", 0)
+	ball:SetAttribute("ServerBallLead", 0)
+	ball:SetAttribute("ClientBallLead", 0)
+	clearLegacyDiagnostics(ball)
 end
 
 function BallControlService.CleanupPlayer(player: Player, ball: BasePart?)
-	lastDribbleByPlayer[player] = nil
+	lastLogicalTouchByPlayer[player] = nil
+	logicalTouchCountByPlayer[player] = nil
 	lastControlDirectionByPlayer[player] = nil
+	lastLeadDiagnosticByPlayer[player] = nil
 
 	if activeController == player then
 		if ball then
 			releaseControl(ball, "controller left")
 		else
 			activeController = nil
-			clearSoftInvalid()
+			clearControllerNoCollision()
 		end
 	end
 end
 
-function BallControlService.Update(ball: BasePart): boolean
+function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
+	local stepDeltaTime = math.max(deltaTime or BallConfig.BasicTouch.CheckInterval, 1 / 240)
+
 	if activeController then
-		local invalidReason, releaseImmediately = getControllerInvalidReason(ball)
+		local invalidReason = getControllerInvalidReason(ball)
 
 		if invalidReason then
-			if releaseImmediately or shouldReleaseForSoftInvalid(invalidReason) then
-				releaseControl(ball, invalidReason)
-			else
-				setBallState(ball, CONTROL_STATE_CONTROLLED, activeController)
-				return true
-			end
-		else
-			clearSoftInvalid()
+			releaseControl(ball, invalidReason)
 		end
 	end
 
@@ -511,6 +683,9 @@ function BallControlService.Update(ball: BasePart): boolean
 
 	if not activeController then
 		setBallState(ball, CONTROL_STATE_FREE, nil)
+		ball:SetAttribute("ControlTargetError", -1)
+		ball:SetAttribute("CurrentBallLead", 0)
+		ball:SetAttribute("ServerBallLead", 0)
 		return false
 	end
 
@@ -521,7 +696,7 @@ function BallControlService.Update(ball: BasePart): boolean
 		return false
 	end
 
-	applyCloseControl(ball, activeCandidate)
+	applyCoupledPossessionControl(ball, activeCandidate, stepDeltaTime)
 	setBallState(ball, CONTROL_STATE_CONTROLLED, activeController)
 
 	return true
