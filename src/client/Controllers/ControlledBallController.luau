@@ -29,6 +29,12 @@ local lastTouchEventTime = 0
 local touchEventCount = 0
 local lastDiagnosticTime = 0
 local lastTouchSide = 1
+local touchAirborneUntil = 0
+local touchPulseCancelled = false
+local touchDirection: Vector3? = nil
+local cutbackSide = 0
+local cutbackUntil = 0
+local dribbleTouchEvent = Instance.new("BindableEvent")
 
 local function log(message: string)
 	print(string.format("%s[Client][ControlledBall] %s", GameConfig.LogPrefix, message))
@@ -172,50 +178,111 @@ local function getTargetPosition(rootPart: BasePart, direction: Vector3, leadDis
 end
 
 local function getTouchInterval(locomotionState): number
-	local speedAlpha = math.clamp(locomotionState.SmoothedSpeed / math.max(movementConfig.SprintSpeed, 1), 0, 1)
-
 	if locomotionState.IsSprinting then
 		return controlConfig.SprintTouchInterval
 	end
 
 	return controlConfig.WalkTouchInterval
-		+ (controlConfig.RunTouchInterval - controlConfig.WalkTouchInterval) * speedAlpha
 end
 
 local function getTouchSpeedPulse(locomotionState): number
-	local speedAlpha = math.clamp(locomotionState.SmoothedSpeed / math.max(movementConfig.SprintSpeed, 1), 0, 1)
-
 	if locomotionState.IsSprinting then
 		return controlConfig.SprintTouchSpeedPulse
 	end
 
 	return controlConfig.WalkTouchSpeedPulse
-		+ (controlConfig.RunTouchSpeedPulse - controlConfig.WalkTouchSpeedPulse) * speedAlpha
 end
 
-local function getTouchVerticalLift(locomotionState): number
-	local speedAlpha = math.clamp(locomotionState.SmoothedSpeed / math.max(movementConfig.SprintSpeed, 1), 0, 1)
-
+local function getTouchHopHeight(locomotionState): number
 	if locomotionState.IsSprinting then
-		return controlConfig.SprintTouchVerticalLift
+		return controlConfig.SprintTouchHopHeight
 	end
 
-	return controlConfig.WalkTouchVerticalLift
-		+ (controlConfig.RunTouchVerticalLift - controlConfig.WalkTouchVerticalLift) * speedAlpha
+	return controlConfig.WalkTouchHopHeight
 end
 
-local function getTouchPulse(locomotionState): number
-	if controlMode == "Capture" or locomotionState.RawMagnitude <= 0 or not locomotionState.IsMoving then
+local function getTouchUpwardVelocity(locomotionState): number
+	local hopHeight = getTouchHopHeight(locomotionState)
+
+	if hopHeight <= 0 then
 		return 0
 	end
 
-	local elapsed = os.clock() - lastTouchEventTime
+	return math.min(math.sqrt(2 * Workspace.Gravity * hopHeight), controlConfig.MaxTouchUpwardVelocity)
+end
+
+local function getTouchLeadPulse(locomotionState): number
+	if locomotionState.IsSprinting then
+		return controlConfig.SprintTouchLeadPulse
+	end
+
+	return controlConfig.WalkTouchLeadPulse
+end
+
+local function getTouchElapsed(): number
+	return os.clock() - lastTouchEventTime
+end
+
+local function getTouchPulse(locomotionState): number
+	if touchPulseCancelled or controlMode == "Capture" or locomotionState.RawMagnitude <= 0 or not locomotionState.IsMoving then
+		return 0
+	end
+
+	local elapsed = getTouchElapsed()
 
 	if elapsed < 0 or elapsed > controlConfig.TouchPulseDuration then
 		return 0
 	end
 
 	return 1 - elapsed / controlConfig.TouchPulseDuration
+end
+
+local function getDribblePhase(locomotionState): string
+	if controlMode == "Capture" then
+		return "Collect"
+	end
+
+	if locomotionState.RawMagnitude <= 0 or not locomotionState.IsMoving then
+		return "Settle"
+	end
+
+	if getTouchPulse(locomotionState) > 0 then
+		return "Push"
+	end
+
+	local elapsed = getTouchElapsed()
+
+	if elapsed > controlConfig.TouchPulseDuration
+		and elapsed <= controlConfig.TouchPulseDuration + controlConfig.TouchCoastDuration
+	then
+		return "Coast"
+	end
+
+	return "Collect"
+end
+
+local function updateTouchCancellation(locomotionState)
+	if lastTouchEventTime <= 0 or touchPulseCancelled then
+		return
+	end
+
+	if locomotionState.RawMagnitude <= 0 then
+		touchPulseCancelled = true
+		touchAirborneUntil = 0
+		return
+	end
+
+	if not touchDirection or locomotionState.RawDirection.Magnitude <= 0 then
+		return
+	end
+
+	local dot = math.clamp((touchDirection :: Vector3):Dot(locomotionState.RawDirection.Unit), -1, 1)
+	local turnAngle = math.deg(math.acos(dot))
+
+	if turnAngle >= controlConfig.CancelPushTurnAngleDegrees then
+		touchPulseCancelled = true
+		touchAirborneUntil = 0
+	end
 end
 
 local function beginTouchPulse(ball: BasePart, locomotionState, direction: Vector3)
@@ -230,15 +297,20 @@ local function beginTouchPulse(ball: BasePart, locomotionState, direction: Vecto
 	end
 
 	lastTouchEventTime = now
+	touchPulseCancelled = false
+	touchDirection = direction
+	touchAirborneUntil = now + controlConfig.TouchAirborneWindow
 	touchEventCount += 1
 	lastTouchSide *= -1
 	ball:SetAttribute("LastLocalControlTouchTime", now)
 	ball:SetAttribute("LastLocalControlTouchCount", touchEventCount)
+	ball:SetAttribute("LastLocalDribbleFootSide", if lastTouchSide > 0 then "Right" else "Left")
+	ball:SetAttribute("LastLocalDribbleTouchStrength", if locomotionState.IsSprinting then "Sprint" else "Walk")
 
-	local verticalLift = getTouchVerticalLift(locomotionState)
+	local upwardVelocity = getTouchUpwardVelocity(locomotionState)
 
-	if verticalLift > 0 then
-		local verticalDelta = math.max(verticalLift - ball.AssemblyLinearVelocity.Y, 0)
+	if upwardVelocity > 0 then
+		local verticalDelta = math.max(upwardVelocity - ball.AssemblyLinearVelocity.Y, 0)
 		applyVelocityDelta(ball, Vector3.new(0, verticalDelta, 0))
 	end
 
@@ -250,6 +322,12 @@ local function beginTouchPulse(ball: BasePart, locomotionState, direction: Vecto
 		controlConfig.MaxTouchAngularVelocity
 	)
 	ball.AssemblyAngularVelocity = Vector3.new(angularVelocity.X, ball.AssemblyAngularVelocity.Y, angularVelocity.Z)
+	dribbleTouchEvent:Fire({
+		FootSide = if lastTouchSide > 0 then "Right" else "Left",
+		TouchStrength = if locomotionState.IsSprinting then "Sprint" else "Walk",
+		TouchPhase = "Push",
+		IsSprinting = locomotionState.IsSprinting,
+	})
 end
 
 local function getModeTriggers(
@@ -265,6 +343,8 @@ local function getModeTriggers(
 	local ballHorizontalVelocity = BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity)
 	local playerDesiredVelocity = direction * locomotionState.SmoothedSpeed
 	local relativeSpeed = (ballHorizontalVelocity - playerDesiredVelocity).Magnitude
+	local lateralDirection = Vector3.new(-direction.Z, 0, direction.X)
+	local ballLateral = horizontalFromPlayer:Dot(lateralDirection)
 	local turnDot = if locomotionState.RawDirection.Magnitude > 0 and controlDirection
 		then math.clamp((controlDirection :: Vector3):Dot(locomotionState.RawDirection.Unit), -1, 1)
 		else 1
@@ -273,6 +353,7 @@ local function getModeTriggers(
 	local sharpTurn = turnAngleDegrees >= controlConfig.CaptureTurnAngleDegrees
 	local behind = ballLead < controlConfig.CaptureBehindLead
 	local bodyOverlap = distance < minDistance
+	local intentionalPush = getTouchPulse(locomotionState) > 0 or os.clock() < touchAirborneUntil
 
 	return {
 		BallLead = ballLead,
@@ -283,6 +364,8 @@ local function getModeTriggers(
 		SharpTurn = sharpTurn,
 		Behind = behind,
 		BodyOverlap = bodyOverlap,
+		IntentionalPush = intentionalPush,
+		BallLateral = ballLateral,
 	}
 end
 
@@ -290,7 +373,7 @@ local function updateControlMode(triggers, targetErrorMagnitude: number)
 	local now = os.clock()
 	local shouldCapture = triggers.ReleasedMovement
 		or triggers.SharpTurn
-		or triggers.Behind
+		or (triggers.Behind and not triggers.IntentionalPush)
 		or triggers.BodyOverlap
 
 	if shouldCapture
@@ -299,6 +382,17 @@ local function updateControlMode(triggers, targetErrorMagnitude: number)
 	then
 		controlMode = "Capture"
 		captureStartedAt = now
+		touchPulseCancelled = true
+
+		if triggers.TurnAngleDegrees >= controlConfig.CutbackTurnAngleDegrees then
+			if math.abs(triggers.BallLateral) > 0.05 then
+				cutbackSide = if triggers.BallLateral >= 0 then 1 else -1
+			else
+				cutbackSide = lastTouchSide
+			end
+
+			cutbackUntil = now + controlConfig.CutbackDuration
+		end
 	elseif controlMode == "Capture" then
 		local captureDuration = now - captureStartedAt
 		local canExit = captureDuration >= controlConfig.CaptureMinDuration
@@ -308,8 +402,42 @@ local function updateControlMode(triggers, targetErrorMagnitude: number)
 		if canExit or captureDuration >= controlConfig.CaptureMaxDuration then
 			controlMode = "Carry"
 			lastCaptureExitAt = now
+			cutbackSide = 0
+			cutbackUntil = 0
 		end
 	end
+end
+
+local function getPhaseServoScales(phase: string): (number, number)
+	if controlMode == "Capture" then
+		return 1, 1
+	end
+
+	if phase == "Push" then
+		return controlConfig.PushPositionGainScale, controlConfig.PushVelocityDampingScale
+	elseif phase == "Coast" then
+		return controlConfig.CoastPositionGainScale, controlConfig.CoastVelocityDampingScale
+	elseif phase == "Settle" then
+		return controlConfig.SettlePositionGainScale, controlConfig.SettleVelocityDampingScale
+	end
+
+	return controlConfig.CollectPositionGainScale, controlConfig.CollectVelocityDampingScale
+end
+
+local function getPhaseTargetPosition(rootPart: BasePart, direction: Vector3, locomotionState): Vector3
+	local phase = getDribblePhase(locomotionState)
+	local pulse = getTouchPulse(locomotionState)
+	local leadDistance = getLeadDistance(locomotionState)
+	local lateralDirection = Vector3.new(-direction.Z, 0, direction.X)
+	local lateralOffset = lateralDirection * controlConfig.TouchLateralOffset * lastTouchSide * pulse
+
+	if cutbackSide ~= 0 and os.clock() < cutbackUntil then
+		lateralOffset += lateralDirection * controlConfig.CutbackLateralOffset * cutbackSide
+	end
+
+	local phaseLeadPulse = if phase == "Push" then getTouchLeadPulse(locomotionState) * pulse else 0
+
+	return getTargetPosition(rootPart, direction, leadDistance + phaseLeadPulse) + lateralOffset
 end
 
 local function applyBodyExclusion(ball: BasePart, rootPart: BasePart, direction: Vector3): Vector3
@@ -347,7 +475,9 @@ local function sampleDiagnostics(ball: BasePart, rootPart: BasePart, direction: 
 	ball:SetAttribute("RawMoveMagnitude", locomotionState.RawMagnitude)
 	ball:SetAttribute("TurnAngle", locomotionState.TurnAngle or 0)
 	ball:SetAttribute("BallRelativeSpeed", relativeSpeed)
-	ball:SetAttribute("DribblePhase", if getTouchPulse(locomotionState) > 0 then "Push" elseif locomotionState.IsMoving then "Coast" else "Settle")
+	ball:SetAttribute("DribblePhase", getDribblePhase(locomotionState))
+	ball:SetAttribute("BallIntentAngleError", if locomotionState.RawDirection.Magnitude > 0 then math.deg(math.acos(math.clamp(direction:Dot(locomotionState.RawDirection.Unit), -1, 1))) else 0)
+	ball:SetAttribute("TurnCaptureActive", controlMode == "Capture")
 
 	local serverLead = ball:GetAttribute("ServerBallLead")
 	log(string.format(
@@ -355,7 +485,7 @@ local function sampleDiagnostics(ball: BasePart, rootPart: BasePart, direction: 
 		lead,
 		if typeof(serverLead) == "number" then string.format("%.2f", serverLead) else "n/a",
 		controlMode,
-		if getTouchPulse(locomotionState) > 0 then "Push" elseif locomotionState.IsMoving then "Coast" else "Settle",
+		getDribblePhase(locomotionState),
 		locomotionState.RawMagnitude,
 		locomotionState.SmoothedSpeed,
 		relativeSpeed,
@@ -365,20 +495,22 @@ end
 
 local function applyPossessionServo(ball: BasePart, rootPart: BasePart, locomotionState, deltaTime: number)
 	local direction = updateBallIntentDirection(rootPart, locomotionState, deltaTime)
+	updateTouchCancellation(locomotionState)
 	beginTouchPulse(ball, locomotionState, direction)
-	local pulse = getTouchPulse(locomotionState)
-	local leadDistance = getLeadDistance(locomotionState)
-	local lateralDirection = Vector3.new(-direction.Z, 0, direction.X)
-	local lateralOffset = lateralDirection * controlConfig.TouchLateralOffset * lastTouchSide * pulse
-	local targetPosition = getTargetPosition(rootPart, direction, leadDistance + controlConfig.TouchLeadPulse * pulse)
-		+ lateralOffset
+	local targetPosition = getPhaseTargetPosition(rootPart, direction, locomotionState)
 	local targetError = BallControlMath.GetHorizontal(targetPosition - ball.Position)
 	local triggers = getModeTriggers(ball, rootPart, locomotionState, direction)
 
 	updateControlMode(triggers, targetError.Magnitude)
+	targetPosition = getPhaseTargetPosition(rootPart, direction, locomotionState)
+	targetError = BallControlMath.GetHorizontal(targetPosition - ball.Position)
 
 	local positionGain = if controlMode == "Capture" then controlConfig.CapturePositionGain else controlConfig.CarryPositionGain
 	local velocityDamping = if controlMode == "Capture" then controlConfig.CaptureVelocityDamping else controlConfig.CarryVelocityDamping
+	local phase = getDribblePhase(locomotionState)
+	local positionScale, dampingScale = getPhaseServoScales(phase)
+	positionGain *= positionScale
+	velocityDamping *= dampingScale
 	local playerDesiredVelocity = if locomotionState.IsMoving
 		then direction * locomotionState.SmoothedSpeed
 		else Vector3.zero
@@ -386,6 +518,7 @@ local function applyPossessionServo(ball: BasePart, rootPart: BasePart, locomoti
 	local relativeVelocity = ballHorizontalVelocity - playerDesiredVelocity
 	local correctionVelocity = targetError * positionGain - relativeVelocity * velocityDamping
 	local exclusionVelocity = applyBodyExclusion(ball, rootPart, direction)
+	local pulse = getTouchPulse(locomotionState)
 	local touchPulseVelocity = direction * getTouchSpeedPulse(locomotionState) * pulse
 	local desiredHorizontalVelocity = playerDesiredVelocity + correctionVelocity + exclusionVelocity + touchPulseVelocity
 	desiredHorizontalVelocity = BallControlMath.ClampMagnitude(
@@ -414,6 +547,11 @@ local function resetLocalState()
 	lastTouchEventTime = 0
 	touchEventCount = 0
 	lastTouchSide = 1
+	touchAirborneUntil = 0
+	touchPulseCancelled = false
+	touchDirection = nil
+	cutbackSide = 0
+	cutbackUntil = 0
 end
 
 local function updateControlledBall(deltaTime: number)
@@ -474,6 +612,10 @@ function ControlledBallController.Destroy()
 	end
 
 	resetLocalState()
+end
+
+function ControlledBallController.GetDribbleTouchEvent(): BindableEvent
+	return dribbleTouchEvent
 end
 
 return ControlledBallController

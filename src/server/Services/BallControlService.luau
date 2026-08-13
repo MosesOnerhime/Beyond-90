@@ -440,6 +440,10 @@ local function acquireControl(ball: BasePart, player: Player)
 	ball:SetAttribute("RawMoveMagnitude", 0)
 	ball:SetAttribute("TurnAngle", 0)
 	ball:SetAttribute("DribblePhase", "")
+	ball:SetAttribute("BallIntentAngleError", 0)
+	ball:SetAttribute("TurnCaptureActive", false)
+	ball:SetAttribute("LastLocalDribbleFootSide", "")
+	ball:SetAttribute("LastLocalDribbleTouchStrength", "")
 
 	if character then
 		setControllerNoCollision(ball, character)
@@ -671,11 +675,15 @@ local function updateLeadDiagnostics(ball: BasePart, candidate, controlDirection
 	end
 
 	lastLeadDiagnosticByPlayer[candidate.Player] = now
-	log(string.format(
-		"Lead sample server=%.2f contacts=%d",
-		currentLead,
-		logicalTouchCountByPlayer[candidate.Player] or 0
-	))
+	if isPlayerOwnedMode() then
+		log(string.format("Lead sample server=%.2f mode=player-owned", currentLead))
+	else
+		log(string.format(
+			"Lead sample server=%.2f serverContacts=%d",
+			currentLead,
+			logicalTouchCountByPlayer[candidate.Player] or 0
+		))
+	end
 end
 
 local function restoreLastAcceptedBallState(ball: BasePart)
@@ -852,6 +860,10 @@ function BallControlService.Initialize(ball: BasePart)
 	ball:SetAttribute("RawMoveMagnitude", 0)
 	ball:SetAttribute("TurnAngle", 0)
 	ball:SetAttribute("DribblePhase", "")
+	ball:SetAttribute("BallIntentAngleError", 0)
+	ball:SetAttribute("TurnCaptureActive", false)
+	ball:SetAttribute("LastLocalDribbleFootSide", "")
+	ball:SetAttribute("LastLocalDribbleTouchStrength", "")
 end
 
 function BallControlService.Reset(ball: BasePart)
@@ -886,6 +898,10 @@ function BallControlService.Reset(ball: BasePart)
 	ball:SetAttribute("RawMoveMagnitude", 0)
 	ball:SetAttribute("TurnAngle", 0)
 	ball:SetAttribute("DribblePhase", "")
+	ball:SetAttribute("BallIntentAngleError", 0)
+	ball:SetAttribute("TurnCaptureActive", false)
+	ball:SetAttribute("LastLocalDribbleFootSide", "")
+	ball:SetAttribute("LastLocalDribbleTouchStrength", "")
 	clearLegacyDiagnostics(ball)
 end
 
@@ -954,6 +970,10 @@ function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
 		ball:SetAttribute("RawMoveMagnitude", 0)
 		ball:SetAttribute("TurnAngle", 0)
 		ball:SetAttribute("DribblePhase", "")
+		ball:SetAttribute("BallIntentAngleError", 0)
+		ball:SetAttribute("TurnCaptureActive", false)
+		ball:SetAttribute("LastLocalDribbleFootSide", "")
+		ball:SetAttribute("LastLocalDribbleTouchStrength", "")
 		return false
 	end
 

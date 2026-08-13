@@ -1,13 +1,12 @@
-local ContextActionService = game:GetService("ContextActionService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
-local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local BallControlMath = require(Shared.Football.BallControlMath)
 local GameConfig = require(Shared.Config.GameConfig)
 local PlayerConfig = require(Shared.Config.PlayerConfig)
+local InputController = require(script.Parent:WaitForChild("InputController"))
 
 local MovementController = {}
 
@@ -15,7 +14,6 @@ local localPlayer = Players.LocalPlayer
 local movementConfig = PlayerConfig.Movement
 local locomotionConfig = PlayerConfig.Locomotion
 local inputConfig = PlayerConfig.Input
-local captureStepName = "Beyond90RawInputCapture"
 local applyStepName = "Beyond90Locomotion"
 
 local initialized = false
@@ -24,9 +22,10 @@ local sprintRequested = false
 local sprintRemote: RemoteEvent? = nil
 local characterAddedConnection: RBXScriptConnection? = nil
 local humanoidDiedConnection: RBXScriptConnection? = nil
-local controls = nil
-local inputSource = "Humanoid"
+local inputSource = "InputAction"
 local locomotionBound = false
+local lastDiagnosticTime = 0
+local setSprintRequested: ((boolean) -> ())? = nil
 
 local locomotionState = {
 	RawDirection = Vector3.zero,
@@ -44,6 +43,10 @@ local locomotionState = {
 
 local function warnLog(message: string)
 	warn(string.format("%s[Client][Movement] %s", GameConfig.LogPrefix, message))
+end
+
+local function log(message: string)
+	print(string.format("%s[Client][Movement] %s", GameConfig.LogPrefix, message))
 end
 
 local function getTargetSpeed(): number
@@ -81,54 +84,6 @@ local function applyMovementSettings(humanoid: Humanoid)
 	end
 end
 
-local function getCameraRelativeMoveDirection(moveVector: Vector3): (Vector3, number)
-	local horizontalInput = Vector3.new(moveVector.X, 0, moveVector.Z)
-	local rawMagnitude = math.clamp(horizontalInput.Magnitude, 0, 1)
-
-	if rawMagnitude <= locomotionConfig.RawInputDeadzone then
-		return Vector3.zero, 0
-	end
-
-	local camera = Workspace.CurrentCamera
-
-	if not camera then
-		return Vector3.zero, 0
-	end
-
-	local cameraForward = BallControlMath.SafeUnit(BallControlMath.GetHorizontal(camera.CFrame.LookVector), getFacingDirection())
-	local cameraRight = BallControlMath.SafeUnit(BallControlMath.GetHorizontal(camera.CFrame.RightVector), Vector3.xAxis)
-	local worldDirection = cameraRight * moveVector.X + cameraForward * -moveVector.Z
-
-	return BallControlMath.SafeUnit(worldDirection, Vector3.zero), rawMagnitude
-end
-
-local function resolvePlayerControls()
-	local playerScripts = localPlayer:FindFirstChild("PlayerScripts")
-
-	if not playerScripts then
-		warnLog("PlayerScripts was not found; smoothing from captured Humanoid.MoveDirection")
-		return
-	end
-
-	local playerModule = playerScripts:FindFirstChild("PlayerModule")
-
-	if not playerModule or not playerModule:IsA("ModuleScript") then
-		warnLog("PlayerModule was not found; smoothing from captured Humanoid.MoveDirection")
-		return
-	end
-
-	local ok, playerModuleApi = pcall(require, playerModule)
-
-	if not ok or typeof(playerModuleApi) ~= "table" or typeof(playerModuleApi.GetControls) ~= "function" then
-		warnLog("PlayerModule controls could not be resolved; smoothing from captured Humanoid.MoveDirection")
-		return
-	end
-
-	controls = playerModuleApi:GetControls()
-	inputSource = "PlayerModule"
-	locomotionState.InputSource = inputSource
-end
-
 local function resetLocomotionState()
 	locomotionState.RawDirection = Vector3.zero
 	locomotionState.RawMagnitude = 0
@@ -140,54 +95,6 @@ local function resetLocomotionState()
 	locomotionState.IsSprinting = false
 	locomotionState.IsMoving = false
 	locomotionState.IsValid = currentHumanoid ~= nil
-	locomotionState.InputSource = inputSource
-end
-
-local function capturePlayerModuleInput(): (Vector3?, number?)
-	if not controls then
-		return nil
-	end
-
-	local ok, moveVector = pcall(function()
-		return controls:GetMoveVector()
-	end)
-
-	if not ok or typeof(moveVector) ~= "Vector3" then
-		return nil
-	end
-
-	local direction, magnitude = getCameraRelativeMoveDirection(moveVector)
-	return direction, magnitude
-end
-
-local function captureHumanoidInput(humanoid: Humanoid): (Vector3, number)
-	local moveDirection = BallControlMath.GetHorizontal(humanoid.MoveDirection)
-	local rawMagnitude = math.clamp(moveDirection.Magnitude, 0, 1)
-
-	if rawMagnitude <= locomotionConfig.RawInputDeadzone then
-		return Vector3.zero, 0
-	end
-
-	return moveDirection.Unit, rawMagnitude
-end
-
-local function captureRawInput()
-	local humanoid = currentHumanoid
-
-	if not humanoid or humanoid.Health <= 0 then
-		return
-	end
-
-	local direction, magnitude = capturePlayerModuleInput()
-
-	if not direction then
-		direction, magnitude = captureHumanoidInput(humanoid)
-		inputSource = "Humanoid"
-	end
-
-	locomotionState.RawDirection = direction
-	locomotionState.RawMagnitude = magnitude
-	locomotionState.IsValid = true
 	locomotionState.InputSource = inputSource
 end
 
@@ -250,6 +157,20 @@ local function moveTowardVector(current: Vector3, target: Vector3, maxDelta: num
 	return current + delta.Unit * maxDelta
 end
 
+local function sampleDiagnostics()
+	local now = os.clock()
+
+	if now - lastDiagnosticTime < locomotionConfig.DiagnosticInterval then
+		return
+	end
+
+	lastDiagnosticTime = now
+	localPlayer:SetAttribute("Beyond90RawMoveMagnitude", locomotionState.RawMagnitude)
+	localPlayer:SetAttribute("Beyond90SmoothedPlayerSpeed", locomotionState.SmoothedSpeed)
+	localPlayer:SetAttribute("Beyond90TurnAngle", locomotionState.TurnAngle)
+	localPlayer:SetAttribute("Beyond90InputSource", locomotionState.InputSource)
+end
+
 local function updateLocomotion(deltaTime: number)
 	local humanoid = currentHumanoid
 
@@ -257,8 +178,15 @@ local function updateLocomotion(deltaTime: number)
 		return
 	end
 
-	local rawDirection = locomotionState.RawDirection
-	local rawMagnitude = locomotionState.RawMagnitude
+	local rawInput = InputController.GetInputState()
+	inputSource = rawInput.Source
+
+	if rawInput.SprintRequested ~= sprintRequested then
+		setSprintRequested(rawInput.SprintRequested)
+	end
+
+	local rawDirection = rawInput.MoveDirection
+	local rawMagnitude = rawInput.MoveMagnitude
 	local targetSpeed = getTargetSpeed() * rawMagnitude
 	local turnFactor, turnAngle = getTurnSpeedFactor(locomotionState.SmoothedVelocity, rawDirection)
 	local targetVelocity = rawDirection * targetSpeed * turnFactor
@@ -274,6 +202,8 @@ local function updateLocomotion(deltaTime: number)
 
 	local shouldMove = nextSpeed > locomotionConfig.StopSpeed
 
+	locomotionState.RawDirection = rawDirection
+	locomotionState.RawMagnitude = rawMagnitude
 	locomotionState.SmoothedVelocity = nextVelocity
 	locomotionState.SmoothedDirection = if shouldMove then nextVelocity.Unit else Vector3.zero
 	locomotionState.SmoothedSpeed = if shouldMove then nextSpeed else 0
@@ -282,6 +212,7 @@ local function updateLocomotion(deltaTime: number)
 	locomotionState.IsSprinting = sprintRequested
 	locomotionState.IsMoving = shouldMove
 	locomotionState.IsValid = true
+	locomotionState.InputSource = inputSource
 
 	humanoid.WalkSpeed = locomotionState.SmoothedSpeed
 
@@ -290,6 +221,8 @@ local function updateLocomotion(deltaTime: number)
 	else
 		humanoid:Move(Vector3.zero, false)
 	end
+
+	sampleDiagnostics()
 end
 
 local function bindLocomotion()
@@ -298,7 +231,6 @@ local function bindLocomotion()
 	end
 
 	locomotionBound = true
-	RunService:BindToRenderStep(captureStepName, Enum.RenderPriority.Character.Value + 1, captureRawInput)
 	RunService:BindToRenderStep(applyStepName, Enum.RenderPriority.Character.Value + 2, updateLocomotion)
 end
 
@@ -311,7 +243,7 @@ local function sendSprintRequest(requested: boolean)
 	sprintRemote:FireServer(requested)
 end
 
-local function setSprintRequested(requested: boolean)
+setSprintRequested = function(requested: boolean)
 	if sprintRequested == requested then
 		return
 	end
@@ -323,16 +255,6 @@ local function setSprintRequested(requested: boolean)
 	end
 
 	sendSprintRequest(requested)
-end
-
-local function onSprintAction(_actionName: string, inputState: Enum.UserInputState): Enum.ContextActionResult
-	if inputState == Enum.UserInputState.Begin then
-		setSprintRequested(true)
-	elseif inputState == Enum.UserInputState.End or inputState == Enum.UserInputState.Cancel then
-		setSprintRequested(false)
-	end
-
-	return Enum.ContextActionResult.Sink
 end
 
 local function configureCharacter(character: Model)
@@ -361,19 +283,6 @@ local function configureCharacter(character: Model)
 		setSprintRequested(false)
 		resetLocomotionState()
 	end)
-end
-
-local function bindSprintInput()
-	ContextActionService:BindAction(
-		inputConfig.SprintActionName,
-		onSprintAction,
-		true,
-		Enum.KeyCode.LeftShift,
-		Enum.KeyCode.ButtonL3
-	)
-
-	ContextActionService:SetTitle(inputConfig.SprintActionName, "Sprint")
-	ContextActionService:SetPosition(inputConfig.SprintActionName, inputConfig.SprintTouchButtonPosition)
 end
 
 local function resolveSprintRemote()
@@ -417,10 +326,8 @@ function MovementController.Initialize()
 
 	initialized = true
 	resolveSprintRemote()
-	resolvePlayerControls()
-	bindSprintInput()
 	bindLocomotion()
-	warnLog(string.format("Locomotion smoothing input source: %s", inputSource))
+	log(string.format("Locomotion smoothing input source: %s", inputSource))
 
 	characterAddedConnection = localPlayer.CharacterAdded:Connect(configureCharacter)
 
@@ -435,10 +342,8 @@ function MovementController.Destroy()
 	end
 
 	initialized = false
-	ContextActionService:UnbindAction(inputConfig.SprintActionName)
 
 	if locomotionBound then
-		RunService:UnbindFromRenderStep(captureStepName)
 		RunService:UnbindFromRenderStep(applyStepName)
 		locomotionBound = false
 	end

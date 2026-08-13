@@ -887,7 +887,7 @@ GameplayFootball — specifically the vi3itor fork at:
 
     https://github.com/vi3itor/GameplayFootball.git
 
-is the primary external football-gameplay reference and behavioral baseline for
+is the primary external football-gameplay reference and a behavioral baseline for fundamental football mechanics for
 Beyond 90 unless explicitly instructed otherwise.
 
 GameplayFootball is used because it provides a working implementation of many
@@ -1606,3 +1606,391 @@ Playtest against the reference.
 Improve where Beyond 90 can do better.
 
 Build the final system specifically for Beyond 90.
+
+---
+
+# 32. Current Controlled-Ball Networking Model
+
+Beyond 90 currently uses a hybrid authority model for controlled football.
+
+The current prototype direction is:
+
+    FREE BALL
+        ↓
+    Server network ownership
+
+and:
+
+    CONTROLLED BALL
+        ↓
+    Possessing player's client may network-own
+    the real physical football
+        ↓
+    Server validates the resulting state
+
+This architecture exists to keep the football responsive to the human player
+controlling it.
+
+Client network ownership does NOT mean client authority over football rules.
+
+While a player controls the football, the client may be responsible for
+low-level physical simulation such as:
+
+- Close-control velocity correction
+- Dribble movement
+- Touch impulses
+- Ball rotation
+- Player-relative control positioning
+- Responsive direction changes
+
+The server remains authoritative over:
+
+- Whether possession exists
+- Which player is the controller
+- Possession acquisition
+- Possession release
+- Possession transfers
+- Ball resets
+- Competitive validation
+- Goals
+- Match state
+- Tackles
+- Pass/shot validation
+- Statistics
+- Rankings
+- Other competitive outcomes
+
+The principle is:
+
+    CLIENT MAY SIMULATE THE MOTION
+
+            ≠
+
+    CLIENT DECIDES WHAT THE MOTION MEANS
+
+While Controlled, the server should validate the football using plausible
+constraints such as:
+
+- Controller identity
+- Network ownership
+- Player-ball distance
+- Ball speed
+- Vertical velocity
+- Displacement
+- Pitch/world bounds
+- Other action-specific limits
+
+Validation should allow normal networking and physics variation.
+
+Do not require the client's exact physics trajectory to match a second
+server-side simulation frame-for-frame.
+
+When the football becomes Free, reset, invalid, or otherwise no longer belongs
+to that player:
+
+    server reclaims network ownership.
+
+The current player-owned model is a prototype architecture and may later be
+replaced by stronger client prediction / server reconciliation or Roblox
+server-authority systems if playtesting, security requirements or competitive
+integrity justify the change.
+
+Do not change this ownership strategy casually during unrelated milestones.
+
+---
+
+# 33. Controlled Possession Philosophy
+
+Beyond 90 is NOT intended to be a hardcore football physics simulator.
+
+During clear, uncontested possession:
+
+    PLAYER INTENT
+        >
+    PRESERVATION OF OLD BALL MOMENTUM
+
+The football should feel like it belongs to the player controlling it.
+
+Normal possession may use invisible assistance to maintain a satisfying
+player-ball relationship.
+
+Allowed controlled-ball assistance includes:
+
+- Position correction
+- Velocity matching
+- Relative-velocity damping
+- Direction correction
+- Front-of-foot targeting
+- Speed-dependent ball lead
+- Short recovery/capture assistance
+- Body-overlap avoidance
+- Input-responsive touch planning
+
+For example:
+
+If the player abruptly stops, the football does not need to continue rolling
+away merely because its previous velocity says it physically should.
+
+If the player changes direction sharply, previous ball momentum may be reduced
+or redirected so the football remains part of the player's intended football
+action.
+
+If the player clearly possesses the ball:
+
+    the player gets the benefit of the doubt.
+
+This does NOT mean possession should be a rigid weld.
+
+The ball should still:
+
+- Move visibly
+- Rotate
+- Travel between touches
+- React to player speed
+- React to direction changes
+- Have readable spacing
+- Become genuinely loose when possession is lost
+- Respond to future passes, shots, tackles and deflections
+
+Gameplay satisfaction is more important than preserving perfectly realistic
+inertia during ordinary close control.
+
+---
+
+# 34. Possession Stability Versus Dribble Presentation
+
+Beyond 90 separates:
+
+    POSSESSION STABILITY
+
+from:
+
+    DRIBBLE PRESENTATION
+
+These systems may cooperate but should not be confused.
+
+## Possession Stability
+
+A continuous low-level control system may invisibly maintain the physical
+football near the controlling player.
+
+Its responsibilities may include:
+
+- Player-relative control targeting
+- Relative-velocity damping
+- Preventing routine rear lag
+- Maintaining close control during stops
+- Responding to direction changes
+- Preventing body overlap
+- Short capture/recovery assistance
+
+This system exists so normal uncontested possession is reliable.
+
+## Dribble Presentation
+
+Visible touch behavior should make the football look like it is actually being
+played with the feet.
+
+Presentation may include:
+
+- Push
+- Coast
+- Collect / settle
+- Speed-dependent touch distance
+- Speed-dependent touch cadence
+- Small vertical motion
+- Ball rotation
+- Slight lateral variation
+- Future animation synchronization
+
+The intended relationship is:
+
+    continuous hidden assistance
+        ↓
+    keeps possession stable
+
+while:
+
+    discrete visible touch rhythm
+        ↓
+    makes possession look like football
+
+Do not make visible touch rhythm responsible for the entire stability of
+possession.
+
+Do not let the hidden possession controller make the football look permanently
+welded or slide along the grass at a constant offset.
+
+Walking should generally produce tighter touches.
+
+Faster movement should generally produce farther and more energetic touches.
+
+The exact values must be tuned for Beyond 90 rather than copied directly from
+GameplayFootball.
+
+---
+
+# 35. Player Input And Locomotion Principle
+
+Player input, locomotion and ball control should use clearly separated concepts.
+
+Prefer the pipeline:
+
+    RAW PLAYER INTENT
+            ↓
+    FOOTBALL LOCOMOTION
+            ↓
+    PLAYER MOVEMENT
+            ↓
+    BALL-CONTROL COORDINATION
+
+Do not use movement produced by Beyond 90 itself as though it were fresh raw
+player input.
+
+Avoid feedback loops such as:
+
+    smoothed movement
+        ↓
+    Humanoid.MoveDirection
+        ↓
+    interpreted as new raw intent
+        ↓
+    smoothed again
+
+Use a centralized, supported, cross-platform input abstraction where
+appropriate.
+
+The input architecture should remain suitable for:
+
+- Keyboard
+- Gamepad
+- Mobile
+
+It should expose concepts such as:
+
+    MoveDirection
+    MoveMagnitude
+    SprintRequested
+
+without requiring unrelated gameplay systems to independently inspect physical
+keyboard keys.
+
+Movement should have weight without feeling sluggish.
+
+Normal movement may include:
+
+- Acceleration
+- Deceleration
+- Turn-speed response
+- Direction-change speed loss
+- Short reversal braking
+
+However:
+
+    RESPONSIVENESS > REALISTIC LOCOMOTION DELAY
+
+A 180-degree reversal should not place the player into a long slow-motion state.
+
+Small direction changes should react quickly.
+
+Sharp direction changes may lose more speed.
+
+Stopping should produce visible but short deceleration rather than an
+instantaneous freeze or long skating motion.
+
+For the current control philosophy:
+
+    normal movement is non-sprint movement
+
+and:
+
+    explicit sprint input requests faster movement.
+
+Exact movement speeds are tuning values and should remain configurable.
+
+---
+
+# 36. Ball Direction-Change Principle
+
+The football should respond promptly to changes in human movement intent.
+
+For ordinary possession:
+
+45-degree turn:
+    Fast response with minimal disruption.
+
+90-degree turn:
+    Ball begins entering the new control lane immediately while player movement
+    turns smoothly.
+
+180-degree reversal:
+    Previous ball momentum may be cancelled aggressively, short capture
+    assistance may be used, and the football should remain within the player's
+    control area.
+
+Do not require the football to finish an obsolete touch or trajectory after the
+player has clearly changed direction.
+
+The ball-control target may respond somewhat faster to raw player intent than
+the avatar's full locomotion velocity.
+
+This allows the football to prepare for the intended turn while the player's
+body completes the movement transition.
+
+Custom animations should later improve the visual quality of these actions.
+
+However:
+
+    ANIMATION MUST NOT BE USED TO HIDE BROKEN GAMEPLAY MECHANICS.
+
+Direction changes should already function correctly before final animations are
+added.
+
+---
+
+# 37. Gameplay Satisfaction Versus Simulation
+
+When choosing between equally fair implementations, prioritize the one that
+produces the better football-game experience.
+
+Beyond 90 may deliberately exaggerate or assist:
+
+- Ball size
+- Touch spacing
+- Touch lift
+- Dribble responsiveness
+- Ball rotation
+- Movement responsiveness
+- Possession retention
+- Contact assistance
+
+when doing so improves:
+
+- Readability
+- Responsiveness
+- Satisfaction
+- Competitive control
+- Visual football feel
+
+Real-world proportional accuracy is not automatically the goal.
+
+The relevant question is:
+
+> Does this feel convincing and satisfying as a competitive football game?
+
+GameplayFootball, EA SPORTS FC / FIFA-style football games, real football and
+other references may help answer different parts of that question.
+
+GameplayFootball is especially useful for understanding football-system logic.
+
+Beyond 90 is free to make that behavior:
+
+- More responsive
+- More forgiving
+- More readable
+- More exaggerated
+- More arcade-oriented
+
+when playtesting demonstrates that the result is better.
+
+The hierarchy in the Golden Rule remains authoritative.

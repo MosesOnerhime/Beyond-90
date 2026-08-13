@@ -5,6 +5,7 @@ local GameConfig = require(Shared.Config.GameConfig)
 
 local Controllers = script.Parent:WaitForChild("Controllers")
 local BallPresentationController = require(Controllers:WaitForChild("BallPresentationController"))
+local InputController = require(Controllers:WaitForChild("InputController"))
 local MovementController = require(Controllers:WaitForChild("MovementController"))
 local ControlledBallController = require(Controllers:WaitForChild("ControlledBallController"))
 
@@ -13,6 +14,8 @@ local function log(message: string)
 end
 
 log("Initializing...")
+InputController.Initialize()
+log("Input initialized")
 MovementController.Initialize()
 log("Movement initialized")
 ControlledBallController.Initialize()
