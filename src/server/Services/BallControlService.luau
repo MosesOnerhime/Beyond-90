@@ -13,11 +13,15 @@ local CONTROL_STATE_FREE = "Free"
 local CONTROL_STATE_CONTROLLED = "Controlled"
 
 local controlConfig = BallConfig.Control
+local ownershipConfig = BallConfig.Ownership
 local activeController: Player? = nil
 local lastControlDirectionByPlayer: { [Player]: Vector3 } = {}
 local lastLogicalTouchByPlayer: { [Player]: number } = {}
 local logicalTouchCountByPlayer: { [Player]: number } = {}
 local lastLeadDiagnosticByPlayer: { [Player]: number } = {}
+local lastOwnershipValidationAt = 0
+local distanceViolationStartedAt: number? = nil
+local lastAcceptedBallState: { Position: Vector3, Velocity: Vector3, Timestamp: number }? = nil
 local controllerNoCollisionConstraints: { NoCollisionConstraint } = {}
 local controllerCharacterConnection: RBXScriptConnection? = nil
 
@@ -31,6 +35,75 @@ end
 
 local function isFiniteVector(vector: Vector3): boolean
 	return isFiniteNumber(vector.X) and isFiniteNumber(vector.Y) and isFiniteNumber(vector.Z)
+end
+
+local function isPlayerOwnedMode(): boolean
+	return ownershipConfig.ControlledBallOwnershipMode == "Player"
+end
+
+local function setServerNetworkOwner(ball: BasePart)
+	local ok, err = pcall(function()
+		ball:SetNetworkOwner(nil)
+	end)
+
+	if not ok then
+		warn(string.format("%s[Ball] Failed to assign ball network owner to server: %s", GameConfig.LogPrefix, tostring(err)))
+		return
+	end
+
+	ball:SetAttribute("NetworkOwnerUserId", 0)
+	log("Ball network owner -> server")
+end
+
+local function warnIfAssemblyBlocksOwnership(ball: BasePart)
+	if ball.Anchored then
+		warn(string.format("%s[Ball] Football collider is anchored; network ownership cannot be assigned", GameConfig.LogPrefix))
+	end
+
+	for _, descendant in ball:GetDescendants() do
+		if descendant:IsA("BasePart") and descendant.Anchored then
+			warn(string.format(
+				"%s[Ball] Football visual descendant is anchored and may block ownership: %s",
+				GameConfig.LogPrefix,
+				descendant:GetFullName()
+			))
+		end
+	end
+end
+
+local function setPlayerNetworkOwner(ball: BasePart, player: Player)
+	warnIfAssemblyBlocksOwnership(ball)
+
+	local canSet, reason = ball:CanSetNetworkOwnership()
+
+	if not canSet then
+		warn(string.format(
+			"%s[Ball] Ball network owner could not be assigned to %s: %s",
+			GameConfig.LogPrefix,
+			player.Name,
+			tostring(reason)
+		))
+		setServerNetworkOwner(ball)
+		return
+	end
+
+	local ok, err = pcall(function()
+		ball:SetNetworkOwner(player)
+	end)
+
+	if not ok then
+		warn(string.format(
+			"%s[Ball] Failed to assign ball network owner to %s: %s",
+			GameConfig.LogPrefix,
+			player.Name,
+			tostring(err)
+		))
+		setServerNetworkOwner(ball)
+		return
+	end
+
+	ball:SetAttribute("NetworkOwnerUserId", player.UserId)
+	log(string.format("Ball network owner -> %s", player.Name))
 end
 
 local function setBallState(ball: BasePart, state: string, controller: Player?)
@@ -275,10 +348,14 @@ local function getCandidateContext(player: Player, ball: BasePart)
 end
 
 local function getActiveControllerContext(player: Player, ball: BasePart)
+	local distanceLimit = if isPlayerOwnedMode()
+		then ownershipConfig.MaxControlledDistance
+		else controlConfig.HardControlDistance
+
 	return getControlContext(
 		player,
 		ball,
-		controlConfig.HardControlDistance,
+		distanceLimit,
 		controlConfig.ControlRetentionMaxSpeed,
 		controlConfig.ControlRetentionHeightTolerance,
 		false,
@@ -302,20 +379,27 @@ end
 
 local function releaseControl(ball: BasePart, reason: string)
 	if not activeController then
+		setServerNetworkOwner(ball)
 		setBallState(ball, CONTROL_STATE_FREE, nil)
 		ball:SetAttribute("LastReleaseReason", reason)
 		clearControllerNoCollision()
+		lastAcceptedBallState = nil
+		distanceViolationStartedAt = nil
 		return
 	end
 
 	local previousController = activeController :: Player
 	log(string.format("Control released: %s", reason))
+	setServerNetworkOwner(ball)
 
 	activeController = nil
 	lastLogicalTouchByPlayer[previousController] = nil
 	logicalTouchCountByPlayer[previousController] = nil
 	lastControlDirectionByPlayer[previousController] = nil
 	lastLeadDiagnosticByPlayer[previousController] = nil
+	lastAcceptedBallState = nil
+	lastOwnershipValidationAt = 0
+	distanceViolationStartedAt = nil
 	clearControllerNoCollision()
 	setBallState(ball, CONTROL_STATE_FREE, nil)
 	ball:SetAttribute("LastReleaseReason", reason)
@@ -345,14 +429,34 @@ local function acquireControl(ball: BasePart, player: Player)
 	ball:SetAttribute("LastReleaseReason", "")
 	ball:SetAttribute("LastControlTouchTime", -1)
 	ball:SetAttribute("LastControlTouchCount", 0)
+	ball:SetAttribute("LastLocalControlTouchTime", -1)
+	ball:SetAttribute("LastLocalControlTouchCount", 0)
 	ball:SetAttribute("ServerBallLead", 0)
 	ball:SetAttribute("ClientBallLead", 0)
+	ball:SetAttribute("NetworkOwnerUserId", 0)
+	ball:SetAttribute("ControlMode", "")
+	ball:SetAttribute("SmoothedPlayerSpeed", 0)
+	ball:SetAttribute("BallRelativeSpeed", 0)
 
 	if character then
 		setControllerNoCollision(ball, character)
 	end
 
+	lastAcceptedBallState = {
+		Position = ball.Position,
+		Velocity = ball.AssemblyLinearVelocity,
+		Timestamp = os.clock(),
+	}
+	lastOwnershipValidationAt = 0
+	distanceViolationStartedAt = nil
+
 	log(string.format("Control acquired by %s", player.Name))
+
+	if isPlayerOwnedMode() then
+		setPlayerNetworkOwner(ball, player)
+	else
+		setServerNetworkOwner(ball)
+	end
 end
 
 local function applyVelocityDelta(ball: BasePart, deltaVelocity: Vector3): boolean
@@ -571,6 +675,123 @@ local function updateLeadDiagnostics(ball: BasePart, candidate, controlDirection
 	))
 end
 
+local function restoreLastAcceptedBallState(ball: BasePart)
+	if not lastAcceptedBallState then
+		return
+	end
+
+	ball.AssemblyLinearVelocity = lastAcceptedBallState.Velocity
+	ball.AssemblyAngularVelocity = Vector3.zero
+	ball.CFrame = CFrame.new(lastAcceptedBallState.Position)
+end
+
+local function getNetworkOwnerMismatchReason(ball: BasePart, expectedPlayer: Player): string?
+	local ok, owner = pcall(function()
+		return ball:GetNetworkOwner()
+	end)
+
+	if not ok then
+		return "ownership unreadable"
+	end
+
+	if owner ~= expectedPlayer then
+		return "ownership mismatch"
+	end
+
+	return nil
+end
+
+local function validatePlayerOwnedControl(ball: BasePart, candidate): boolean
+	local now = os.clock()
+
+	if now - lastOwnershipValidationAt < ownershipConfig.ValidationInterval then
+		return true
+	end
+
+	lastOwnershipValidationAt = now
+
+	if ball:GetAttribute("State") ~= CONTROL_STATE_CONTROLLED
+		or ball:GetAttribute("ControllerUserId") ~= candidate.Player.UserId
+	then
+		log("Player-owned validation failed: possession mismatch")
+		setServerNetworkOwner(ball)
+		releaseControl(ball, "validation failed: possession mismatch")
+		return false
+	end
+
+	local ownershipMismatchReason = getNetworkOwnerMismatchReason(ball, candidate.Player)
+
+	if ownershipMismatchReason then
+		log(string.format("Player-owned validation failed: %s", ownershipMismatchReason))
+		setPlayerNetworkOwner(ball, candidate.Player)
+	end
+
+	local horizontalDistance = BallControlMath.GetHorizontal(ball.Position - candidate.RootPart.Position).Magnitude
+
+	if horizontalDistance > ownershipConfig.MaxControlledDistance then
+		log(string.format(
+			"Player-owned validation failed: impossible distance distance=%.2f max=%.2f",
+			horizontalDistance,
+			ownershipConfig.MaxControlledDistance
+		))
+		restoreLastAcceptedBallState(ball)
+		releaseControl(ball, "validation failed: impossible distance")
+		return false
+	end
+
+	local velocity = ball.AssemblyLinearVelocity
+	local speed = velocity.Magnitude
+
+	if speed > ownershipConfig.MaxControlledSpeed then
+		log(string.format(
+			"Player-owned validation failed: impossible speed speed=%.2f max=%.2f",
+			speed,
+			ownershipConfig.MaxControlledSpeed
+		))
+		restoreLastAcceptedBallState(ball)
+		releaseControl(ball, "validation failed: impossible speed")
+		return false
+	end
+
+	if math.abs(velocity.Y) > ownershipConfig.MaxControlledVerticalSpeed then
+		log(string.format(
+			"Player-owned validation failed: impossible vertical velocity velocityY=%.2f max=%.2f",
+			velocity.Y,
+			ownershipConfig.MaxControlledVerticalSpeed
+		))
+		restoreLastAcceptedBallState(ball)
+		releaseControl(ball, "validation failed: impossible vertical velocity")
+		return false
+	end
+
+	if lastAcceptedBallState then
+		local elapsed = math.max(now - lastAcceptedBallState.Timestamp, 1 / 240)
+		local displacement = (ball.Position - lastAcceptedBallState.Position).Magnitude
+		local allowedDisplacement = ownershipConfig.MaxControlledDisplacementPerSecond * elapsed
+			+ ownershipConfig.ValidationPositionTolerance
+
+		if displacement > allowedDisplacement then
+			log(string.format(
+				"Player-owned validation failed: impossible displacement displacement=%.2f allowed=%.2f elapsed=%.2f",
+				displacement,
+				allowedDisplacement,
+				elapsed
+			))
+			restoreLastAcceptedBallState(ball)
+			releaseControl(ball, "validation failed: impossible displacement")
+			return false
+		end
+	end
+
+	lastAcceptedBallState = {
+		Position = ball.Position,
+		Velocity = ball.AssemblyLinearVelocity,
+		Timestamp = now,
+	}
+
+	return true
+end
+
 local function applyCoupledPossessionControl(ball: BasePart, candidate, deltaTime: number)
 	local isStationary = candidate.PlayerSpeed < controlConfig.StationaryPlayerSpeed
 	local controlDirection = updateControlDirection(
@@ -605,22 +826,33 @@ function BallControlService.Initialize(ball: BasePart)
 	table.clear(logicalTouchCountByPlayer)
 	table.clear(lastControlDirectionByPlayer)
 	table.clear(lastLeadDiagnosticByPlayer)
+	lastOwnershipValidationAt = 0
+	distanceViolationStartedAt = nil
+	lastAcceptedBallState = nil
 	clearControllerNoCollision()
+	setServerNetworkOwner(ball)
 	setBallState(ball, CONTROL_STATE_FREE, nil)
 	clearLegacyDiagnostics(ball)
 	ball:SetAttribute("LastReleaseReason", "")
 	ball:SetAttribute("LastControlTouchTime", -1)
 	ball:SetAttribute("LastControlTouchCount", 0)
+	ball:SetAttribute("LastLocalControlTouchTime", -1)
+	ball:SetAttribute("LastLocalControlTouchCount", 0)
 	ball:SetAttribute("ControlTargetError", -1)
 	ball:SetAttribute("CurrentBallLead", 0)
 	ball:SetAttribute("ServerBallLead", 0)
 	ball:SetAttribute("ClientBallLead", 0)
+	ball:SetAttribute("NetworkOwnerUserId", 0)
+	ball:SetAttribute("ControlMode", "")
+	ball:SetAttribute("SmoothedPlayerSpeed", 0)
+	ball:SetAttribute("BallRelativeSpeed", 0)
 end
 
 function BallControlService.Reset(ball: BasePart)
 	if activeController then
 		releaseControl(ball, "ball reset")
 	else
+		setServerNetworkOwner(ball)
 		setBallState(ball, CONTROL_STATE_FREE, nil)
 		ball:SetAttribute("LastReleaseReason", "ball reset")
 		clearControllerNoCollision()
@@ -630,12 +862,21 @@ function BallControlService.Reset(ball: BasePart)
 	table.clear(logicalTouchCountByPlayer)
 	table.clear(lastControlDirectionByPlayer)
 	table.clear(lastLeadDiagnosticByPlayer)
+	lastOwnershipValidationAt = 0
+	distanceViolationStartedAt = nil
+	lastAcceptedBallState = nil
 	ball:SetAttribute("LastControlTouchTime", -1)
 	ball:SetAttribute("LastControlTouchCount", 0)
+	ball:SetAttribute("LastLocalControlTouchTime", -1)
+	ball:SetAttribute("LastLocalControlTouchCount", 0)
 	ball:SetAttribute("ControlTargetError", -1)
 	ball:SetAttribute("CurrentBallLead", 0)
 	ball:SetAttribute("ServerBallLead", 0)
 	ball:SetAttribute("ClientBallLead", 0)
+	ball:SetAttribute("NetworkOwnerUserId", 0)
+	ball:SetAttribute("ControlMode", "")
+	ball:SetAttribute("SmoothedPlayerSpeed", 0)
+	ball:SetAttribute("BallRelativeSpeed", 0)
 	clearLegacyDiagnostics(ball)
 end
 
@@ -662,7 +903,19 @@ function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
 		local invalidReason = getControllerInvalidReason(ball)
 
 		if invalidReason then
-			releaseControl(ball, invalidReason)
+			if isPlayerOwnedMode() and invalidReason == "hard distance exceeded" then
+				local now = os.clock()
+
+				if not distanceViolationStartedAt then
+					distanceViolationStartedAt = now
+				elseif now - distanceViolationStartedAt >= ownershipConfig.DistanceViolationGrace then
+					releaseControl(ball, invalidReason)
+				end
+			else
+				releaseControl(ball, invalidReason)
+			end
+		else
+			distanceViolationStartedAt = nil
 		end
 	end
 
@@ -686,6 +939,9 @@ function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
 		ball:SetAttribute("ControlTargetError", -1)
 		ball:SetAttribute("CurrentBallLead", 0)
 		ball:SetAttribute("ServerBallLead", 0)
+		ball:SetAttribute("ControlMode", "")
+		ball:SetAttribute("SmoothedPlayerSpeed", 0)
+		ball:SetAttribute("BallRelativeSpeed", 0)
 		return false
 	end
 
@@ -696,7 +952,22 @@ function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
 		return false
 	end
 
-	applyCoupledPossessionControl(ball, activeCandidate, stepDeltaTime)
+	if isPlayerOwnedMode() then
+		local controlDirection = updateControlDirection(
+			activeCandidate.Player,
+			activeCandidate.RootPart,
+			activeCandidate.MovementDirection,
+			activeCandidate.PlayerSpeed
+		)
+		updateLeadDiagnostics(ball, activeCandidate, controlDirection)
+
+		if not validatePlayerOwnedControl(ball, activeCandidate) then
+			return false
+		end
+	else
+		applyCoupledPossessionControl(ball, activeCandidate, stepDeltaTime)
+	end
+
 	setBallState(ball, CONTROL_STATE_CONTROLLED, activeController)
 
 	return true
