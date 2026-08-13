@@ -437,6 +437,9 @@ local function acquireControl(ball: BasePart, player: Player)
 	ball:SetAttribute("ControlMode", "")
 	ball:SetAttribute("SmoothedPlayerSpeed", 0)
 	ball:SetAttribute("BallRelativeSpeed", 0)
+	ball:SetAttribute("RawMoveMagnitude", 0)
+	ball:SetAttribute("TurnAngle", 0)
+	ball:SetAttribute("DribblePhase", "")
 
 	if character then
 		setControllerNoCollision(ball, character)
@@ -846,6 +849,9 @@ function BallControlService.Initialize(ball: BasePart)
 	ball:SetAttribute("ControlMode", "")
 	ball:SetAttribute("SmoothedPlayerSpeed", 0)
 	ball:SetAttribute("BallRelativeSpeed", 0)
+	ball:SetAttribute("RawMoveMagnitude", 0)
+	ball:SetAttribute("TurnAngle", 0)
+	ball:SetAttribute("DribblePhase", "")
 end
 
 function BallControlService.Reset(ball: BasePart)
@@ -877,6 +883,9 @@ function BallControlService.Reset(ball: BasePart)
 	ball:SetAttribute("ControlMode", "")
 	ball:SetAttribute("SmoothedPlayerSpeed", 0)
 	ball:SetAttribute("BallRelativeSpeed", 0)
+	ball:SetAttribute("RawMoveMagnitude", 0)
+	ball:SetAttribute("TurnAngle", 0)
+	ball:SetAttribute("DribblePhase", "")
 	clearLegacyDiagnostics(ball)
 end
 
@@ -942,6 +951,9 @@ function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
 		ball:SetAttribute("ControlMode", "")
 		ball:SetAttribute("SmoothedPlayerSpeed", 0)
 		ball:SetAttribute("BallRelativeSpeed", 0)
+		ball:SetAttribute("RawMoveMagnitude", 0)
+		ball:SetAttribute("TurnAngle", 0)
+		ball:SetAttribute("DribblePhase", "")
 		return false
 	end
 

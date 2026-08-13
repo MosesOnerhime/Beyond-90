@@ -15,7 +15,8 @@ local localPlayer = Players.LocalPlayer
 local movementConfig = PlayerConfig.Movement
 local locomotionConfig = PlayerConfig.Locomotion
 local inputConfig = PlayerConfig.Input
-local renderStepName = "Beyond90Locomotion"
+local captureStepName = "Beyond90RawInputCapture"
+local applyStepName = "Beyond90Locomotion"
 
 local initialized = false
 local currentHumanoid: Humanoid? = nil
@@ -32,10 +33,13 @@ local locomotionState = {
 	RawMagnitude = 0,
 	SmoothedDirection = Vector3.zero,
 	SmoothedSpeed = 0,
+	SmoothedVelocity = Vector3.zero,
 	TargetSpeed = 0,
+	TurnAngle = 0,
 	IsSprinting = false,
 	IsMoving = false,
 	IsValid = false,
+	InputSource = inputSource,
 }
 
 local function warnLog(message: string)
@@ -50,19 +54,6 @@ local function getTargetSpeed(): number
 	return movementConfig.BaseSpeed
 end
 
-local function applyMovementSettings(humanoid: Humanoid)
-	humanoid.WalkSpeed = if locomotionBound then math.max(locomotionState.SmoothedSpeed, 0) else getTargetSpeed()
-	humanoid.AutoRotate = movementConfig.AutoRotate
-	humanoid.UseJumpPower = true
-	humanoid.JumpPower = movementConfig.JumpPower
-	humanoid.JumpHeight = movementConfig.JumpHeight
-	humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, movementConfig.JumpEnabled)
-
-	if not movementConfig.JumpEnabled then
-		humanoid.Jump = false
-	end
-end
-
 local function getFacingDirection(): Vector3
 	local character = localPlayer.Character
 	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
@@ -75,6 +66,19 @@ local function getFacingDirection(): Vector3
 	end
 
 	return Vector3.new(0, 0, -1)
+end
+
+local function applyMovementSettings(humanoid: Humanoid)
+	humanoid.WalkSpeed = if locomotionBound then math.max(locomotionState.SmoothedSpeed, 0) else getTargetSpeed()
+	humanoid.AutoRotate = movementConfig.AutoRotate
+	humanoid.UseJumpPower = true
+	humanoid.JumpPower = movementConfig.JumpPower
+	humanoid.JumpHeight = movementConfig.JumpHeight
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, movementConfig.JumpEnabled)
+
+	if not movementConfig.JumpEnabled then
+		humanoid.Jump = false
+	end
 end
 
 local function getCameraRelativeMoveDirection(moveVector: Vector3): (Vector3, number)
@@ -99,29 +103,30 @@ local function getCameraRelativeMoveDirection(moveVector: Vector3): (Vector3, nu
 end
 
 local function resolvePlayerControls()
-	local playerScripts = localPlayer:WaitForChild("PlayerScripts", 10)
+	local playerScripts = localPlayer:FindFirstChild("PlayerScripts")
 
 	if not playerScripts then
-		warnLog("PlayerScripts was not found; smoothing from Humanoid.MoveDirection")
+		warnLog("PlayerScripts was not found; smoothing from captured Humanoid.MoveDirection")
 		return
 	end
 
-	local playerModule = playerScripts:WaitForChild("PlayerModule", 10)
+	local playerModule = playerScripts:FindFirstChild("PlayerModule")
 
 	if not playerModule or not playerModule:IsA("ModuleScript") then
-		warnLog("PlayerModule was not found; smoothing from Humanoid.MoveDirection")
+		warnLog("PlayerModule was not found; smoothing from captured Humanoid.MoveDirection")
 		return
 	end
 
 	local ok, playerModuleApi = pcall(require, playerModule)
 
 	if not ok or typeof(playerModuleApi) ~= "table" or typeof(playerModuleApi.GetControls) ~= "function" then
-		warnLog("PlayerModule controls could not be resolved; smoothing from Humanoid.MoveDirection")
+		warnLog("PlayerModule controls could not be resolved; smoothing from captured Humanoid.MoveDirection")
 		return
 	end
 
 	controls = playerModuleApi:GetControls()
 	inputSource = "PlayerModule"
+	locomotionState.InputSource = inputSource
 end
 
 local function resetLocomotionState()
@@ -129,91 +134,33 @@ local function resetLocomotionState()
 	locomotionState.RawMagnitude = 0
 	locomotionState.SmoothedDirection = Vector3.zero
 	locomotionState.SmoothedSpeed = 0
+	locomotionState.SmoothedVelocity = Vector3.zero
 	locomotionState.TargetSpeed = 0
+	locomotionState.TurnAngle = 0
 	locomotionState.IsSprinting = false
 	locomotionState.IsMoving = false
 	locomotionState.IsValid = currentHumanoid ~= nil
+	locomotionState.InputSource = inputSource
 end
 
-local function getAccelerationTime(targetSpeed: number): number
-	if targetSpeed > movementConfig.BaseSpeed then
-		return locomotionConfig.SprintAccelerationTime
+local function capturePlayerModuleInput(): (Vector3?, number?)
+	if not controls then
+		return nil
 	end
 
-	return locomotionConfig.AccelerationTime
+	local ok, moveVector = pcall(function()
+		return controls:GetMoveVector()
+	end)
+
+	if not ok or typeof(moveVector) ~= "Vector3" then
+		return nil
+	end
+
+	local direction, magnitude = getCameraRelativeMoveDirection(moveVector)
+	return direction, magnitude
 end
 
-local function getDecelerationTime(currentSpeed: number): number
-	if currentSpeed > movementConfig.BaseSpeed then
-		return locomotionConfig.SprintDecelerationTime
-	end
-
-	return locomotionConfig.DecelerationTime
-end
-
-local function updateDirection(rawDirection: Vector3, rawMagnitude: number, deltaTime: number): Vector3
-	local currentDirection = locomotionState.SmoothedDirection
-
-	if currentDirection.Magnitude <= 0.001 then
-		currentDirection = if rawMagnitude > 0 then rawDirection else getFacingDirection()
-	end
-
-	if rawMagnitude <= 0 then
-		return currentDirection
-	end
-
-	local dot = math.clamp(currentDirection:Dot(rawDirection), -1, 1)
-	local turnSeverity = math.acos(dot) / math.pi
-	local turnRate = if sprintRequested then locomotionConfig.SprintTurnRate else locomotionConfig.WalkTurnRate
-	local responsiveness = turnRate * (1 - turnSeverity * locomotionConfig.HighSpeedTurnSlowdown)
-	local alpha = math.clamp(responsiveness * deltaTime, 0, 1)
-	local blended = currentDirection:Lerp(rawDirection, alpha)
-
-	return BallControlMath.SafeUnit(blended, rawDirection)
-end
-
-local function updateSpeed(rawDirection: Vector3, rawMagnitude: number, nextDirection: Vector3, deltaTime: number): number
-	local targetSpeed = getTargetSpeed() * rawMagnitude
-
-	if rawMagnitude > 0 and locomotionState.SmoothedDirection.Magnitude > 0 then
-		local dot = math.clamp(locomotionState.SmoothedDirection:Dot(rawDirection), -1, 1)
-		local turnSeverity = math.acos(dot) / math.pi
-		local turnSpeedFactor = math.clamp(1 - turnSeverity * locomotionConfig.TurnSpeedLoss, 0.25, 1)
-
-		if dot < locomotionConfig.ReverseDot then
-			turnSpeedFactor = math.min(turnSpeedFactor, locomotionConfig.ReverseBrakeFactor)
-		end
-
-		targetSpeed *= turnSpeedFactor
-	end
-
-	local currentSpeed = locomotionState.SmoothedSpeed
-	local changeTime = if targetSpeed > currentSpeed
-		then getAccelerationTime(targetSpeed)
-		else getDecelerationTime(currentSpeed)
-	local maxDelta = getTargetSpeed() / math.max(changeTime, 1 / 240) * deltaTime
-	local speedDelta = math.clamp(targetSpeed - currentSpeed, -maxDelta, maxDelta)
-	local nextSpeed = currentSpeed + speedDelta
-
-	if nextSpeed <= locomotionConfig.StopSpeed and rawMagnitude <= 0 then
-		nextSpeed = 0
-	end
-
-	locomotionState.TargetSpeed = targetSpeed
-	return nextSpeed
-end
-
-local function getRawMovement(humanoid: Humanoid): (Vector3, number)
-	if controls then
-		local ok, moveVector = pcall(function()
-			return controls:GetMoveVector()
-		end)
-
-		if ok and typeof(moveVector) == "Vector3" then
-			return getCameraRelativeMoveDirection(moveVector)
-		end
-	end
-
+local function captureHumanoidInput(humanoid: Humanoid): (Vector3, number)
 	local moveDirection = BallControlMath.GetHorizontal(humanoid.MoveDirection)
 	local rawMagnitude = math.clamp(moveDirection.Magnitude, 0, 1)
 
@@ -224,6 +171,85 @@ local function getRawMovement(humanoid: Humanoid): (Vector3, number)
 	return moveDirection.Unit, rawMagnitude
 end
 
+local function captureRawInput()
+	local humanoid = currentHumanoid
+
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+
+	local direction, magnitude = capturePlayerModuleInput()
+
+	if not direction then
+		direction, magnitude = captureHumanoidInput(humanoid)
+		inputSource = "Humanoid"
+	end
+
+	locomotionState.RawDirection = direction
+	locomotionState.RawMagnitude = magnitude
+	locomotionState.IsValid = true
+	locomotionState.InputSource = inputSource
+end
+
+local function getTurnSpeedFactor(currentVelocity: Vector3, targetDirection: Vector3): (number, number)
+	if currentVelocity.Magnitude <= locomotionConfig.StopSpeed or targetDirection.Magnitude <= 0 then
+		return 1, 0
+	end
+
+	local currentDirection = currentVelocity.Unit
+	local dot = math.clamp(currentDirection:Dot(targetDirection), -1, 1)
+	local turnAngle = math.deg(math.acos(dot))
+	local severity = turnAngle / 180
+	local loss
+
+	if severity <= 0.5 then
+		loss = (severity / 0.5) * locomotionConfig.TurnSpeedLossAt90
+	else
+		local alpha = (severity - 0.5) / 0.5
+		loss = locomotionConfig.TurnSpeedLossAt90
+			+ (locomotionConfig.TurnSpeedLossAt180 - locomotionConfig.TurnSpeedLossAt90) * alpha
+	end
+
+	return math.clamp(1 - loss, 0.25, 1), turnAngle
+end
+
+local function getVelocityChangeTime(currentVelocity: Vector3, targetVelocity: Vector3, turnAngle: number): number
+	local currentSpeed = currentVelocity.Magnitude
+	local targetSpeed = targetVelocity.Magnitude
+
+	if targetSpeed <= locomotionConfig.StopSpeed then
+		return if currentSpeed > movementConfig.BaseSpeed then locomotionConfig.SprintDecelerationTime else locomotionConfig.DecelerationTime
+	end
+
+	if currentSpeed <= locomotionConfig.StopSpeed then
+		return if sprintRequested then locomotionConfig.SprintAccelerationTime else locomotionConfig.AccelerationTime
+	end
+
+	if turnAngle >= 135 then
+		return locomotionConfig.ReverseAccelerationTime
+	end
+
+	if turnAngle >= 35 then
+		return locomotionConfig.TurnAccelerationTime
+	end
+
+	if targetSpeed > currentSpeed then
+		return if sprintRequested then locomotionConfig.SprintAccelerationTime else locomotionConfig.AccelerationTime
+	end
+
+	return if currentSpeed > movementConfig.BaseSpeed then locomotionConfig.SprintDecelerationTime else locomotionConfig.DecelerationTime
+end
+
+local function moveTowardVector(current: Vector3, target: Vector3, maxDelta: number): Vector3
+	local delta = target - current
+
+	if delta.Magnitude <= maxDelta then
+		return target
+	end
+
+	return current + delta.Unit * maxDelta
+end
+
 local function updateLocomotion(deltaTime: number)
 	local humanoid = currentHumanoid
 
@@ -231,15 +257,28 @@ local function updateLocomotion(deltaTime: number)
 		return
 	end
 
-	local rawDirection, rawMagnitude = getRawMovement(humanoid)
-	local nextDirection = updateDirection(rawDirection, rawMagnitude, deltaTime)
-	local nextSpeed = updateSpeed(rawDirection, rawMagnitude, nextDirection, deltaTime)
-	local shouldMove = nextSpeed > locomotionConfig.StopSpeed and nextDirection.Magnitude > 0
+	local rawDirection = locomotionState.RawDirection
+	local rawMagnitude = locomotionState.RawMagnitude
+	local targetSpeed = getTargetSpeed() * rawMagnitude
+	local turnFactor, turnAngle = getTurnSpeedFactor(locomotionState.SmoothedVelocity, rawDirection)
+	local targetVelocity = rawDirection * targetSpeed * turnFactor
+	local changeTime = getVelocityChangeTime(locomotionState.SmoothedVelocity, targetVelocity, turnAngle)
+	local maxDelta = getTargetSpeed() / math.max(changeTime, 1 / 240) * deltaTime
+	local nextVelocity = moveTowardVector(locomotionState.SmoothedVelocity, targetVelocity, maxDelta)
+	local nextSpeed = nextVelocity.Magnitude
 
-	locomotionState.RawDirection = rawDirection
-	locomotionState.RawMagnitude = rawMagnitude
-	locomotionState.SmoothedDirection = if shouldMove then nextDirection else Vector3.zero
+	if nextSpeed <= locomotionConfig.StopSpeed and rawMagnitude <= 0 then
+		nextVelocity = Vector3.zero
+		nextSpeed = 0
+	end
+
+	local shouldMove = nextSpeed > locomotionConfig.StopSpeed
+
+	locomotionState.SmoothedVelocity = nextVelocity
+	locomotionState.SmoothedDirection = if shouldMove then nextVelocity.Unit else Vector3.zero
 	locomotionState.SmoothedSpeed = if shouldMove then nextSpeed else 0
+	locomotionState.TargetSpeed = targetSpeed
+	locomotionState.TurnAngle = turnAngle
 	locomotionState.IsSprinting = sprintRequested
 	locomotionState.IsMoving = shouldMove
 	locomotionState.IsValid = true
@@ -247,7 +286,7 @@ local function updateLocomotion(deltaTime: number)
 	humanoid.WalkSpeed = locomotionState.SmoothedSpeed
 
 	if shouldMove then
-		humanoid:Move(nextDirection, false)
+		humanoid:Move(locomotionState.SmoothedDirection, false)
 	else
 		humanoid:Move(Vector3.zero, false)
 	end
@@ -259,7 +298,8 @@ local function bindLocomotion()
 	end
 
 	locomotionBound = true
-	RunService:BindToRenderStep(renderStepName, Enum.RenderPriority.Character.Value + 2, updateLocomotion)
+	RunService:BindToRenderStep(captureStepName, Enum.RenderPriority.Character.Value + 1, captureRawInput)
+	RunService:BindToRenderStep(applyStepName, Enum.RenderPriority.Character.Value + 2, updateLocomotion)
 end
 
 local function sendSprintRequest(requested: boolean)
@@ -360,10 +400,13 @@ function MovementController.GetLocomotionState()
 		RawMagnitude = locomotionState.RawMagnitude,
 		SmoothedDirection = locomotionState.SmoothedDirection,
 		SmoothedSpeed = locomotionState.SmoothedSpeed,
+		SmoothedVelocity = locomotionState.SmoothedVelocity,
 		TargetSpeed = locomotionState.TargetSpeed,
+		TurnAngle = locomotionState.TurnAngle,
 		IsSprinting = locomotionState.IsSprinting,
 		IsMoving = locomotionState.IsMoving,
 		IsValid = locomotionState.IsValid,
+		InputSource = locomotionState.InputSource,
 	}
 end
 
@@ -395,7 +438,8 @@ function MovementController.Destroy()
 	ContextActionService:UnbindAction(inputConfig.SprintActionName)
 
 	if locomotionBound then
-		RunService:UnbindFromRenderStep(renderStepName)
+		RunService:UnbindFromRenderStep(captureStepName)
+		RunService:UnbindFromRenderStep(applyStepName)
 		locomotionBound = false
 	end
 
