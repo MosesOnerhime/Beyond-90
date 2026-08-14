@@ -221,6 +221,13 @@ local function createGameplayBounds(pitchFolder: Folder, pitchState)
 	bounds.CanQuery = false
 	bounds.CanTouch = false
 	bounds:SetAttribute("Beyond90GameplayBounds", true)
+	bounds:SetAttribute("PitchCenter", pitchState.Center)
+	bounds:SetAttribute("PitchLengthAxis", pitchState.LengthAxis)
+	bounds:SetAttribute("PitchWidthAxis", pitchState.WidthAxis)
+	bounds:SetAttribute("PitchLength", pitchState.Length)
+	bounds:SetAttribute("PitchWidth", pitchState.Width)
+	bounds:SetAttribute("PitchGroundY", pitchState.GroundY)
+	bounds:SetAttribute("PitchUsesWorkspaceBounds", pitchState.IsUsingWorkspaceBounds)
 	return bounds
 end
 
@@ -336,10 +343,12 @@ local function createSpawn(rootFolder: Folder, pitchState)
 		spawnSize,
 		getGameplayCFrame(pitchState, spawnPosition),
 		Color3.fromRGB(60, 165, 255),
-		0.25,
-		true
+		1,
+		false
 	)
 
+	spawn.CanQuery = false
+	spawn.CanTouch = false
 	spawn.Enabled = true
 	spawn.Neutral = true
 	spawn.Duration = 0

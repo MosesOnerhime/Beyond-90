@@ -17,6 +17,8 @@ local heartbeatConnection: RBXScriptConnection? = nil
 local playerRemovingConnection: RBXScriptConnection? = nil
 local accumulatedTime = 0
 local lastTouchByPlayer: { [Player]: number } = {}
+local warnedMissingFootballVisual = false
+local loggedFootballVisualLoaded = false
 
 local function getRootFolder(): Folder
 	local rootFolder = Workspace:FindFirstChild(GameConfig.WorkspaceContainerName)
@@ -63,38 +65,45 @@ local function clearBallVisuals(ball: BasePart)
 	end
 end
 
-local function configureVisualPart(part: BasePart, ball: BasePart)
+local function configureVisualPart(part: BasePart, preserveAppearance: boolean?)
 	part:SetAttribute("Beyond90BallVisual", true)
 	part.Anchored = false
 	part.CanCollide = false
 	part.CanTouch = false
 	part.CanQuery = false
 	part.Massless = true
-	part.Material = Enum.Material.SmoothPlastic
-	part.Parent = ball
+
+	if not preserveAppearance then
+		part.Material = Enum.Material.SmoothPlastic
+	end
+end
+
+local function weldVisualPart(part: BasePart, rootPart: BasePart, parent: Instance, preserveAppearance: boolean?)
+	configureVisualPart(part, preserveAppearance)
+	part.Parent = parent
 
 	local weld = Instance.new("WeldConstraint")
 	weld:SetAttribute("Beyond90BallVisual", true)
-	weld.Part0 = ball
+	weld.Part0 = rootPart
 	weld.Part1 = part
 	weld.Parent = part
 end
 
-local function createVisualBand(ball: BasePart, name: string, size: Vector3, color: Color3, orientation: Vector3)
+local function createVisualBand(visualRoot: BasePart, name: string, size: Vector3, color: Color3, orientation: Vector3)
 	local band = Instance.new("Part")
 	band.Name = name
 	band.Shape = Enum.PartType.Block
 	band.Size = size
 	band.Color = color
-	band.CFrame = ball.CFrame * CFrame.Angles(
+	band.CFrame = visualRoot.CFrame * CFrame.Angles(
 		math.rad(orientation.X),
 		math.rad(orientation.Y),
 		math.rad(orientation.Z)
 	)
-	configureVisualPart(band, ball)
+	weldVisualPart(band, visualRoot, visualRoot)
 end
 
-local function createBrandMark(ball: BasePart)
+local function createBrandMark(visualRoot: BasePart)
 	local surfaceGui = Instance.new("SurfaceGui")
 	surfaceGui.Name = "Beyond90BrandMark"
 	surfaceGui:SetAttribute("Beyond90BallVisual", true)
@@ -102,7 +111,7 @@ local function createBrandMark(ball: BasePart)
 	surfaceGui.LightInfluence = 0
 	surfaceGui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
 	surfaceGui.PixelsPerStud = 140
-	surfaceGui.Parent = ball
+	surfaceGui.Parent = visualRoot
 
 	local label = Instance.new("TextLabel")
 	label.Name = "BrandText"
@@ -116,37 +125,141 @@ local function createBrandMark(ball: BasePart)
 	label.Parent = surfaceGui
 end
 
-local function configureBallVisuals(ball: BasePart)
-	clearBallVisuals(ball)
+local function getFootballVisualAsset(): Instance?
+	local assetsFolder = ReplicatedStorage:FindFirstChild(BallConfig.Visual.AssetFolderName)
 
-	local radius = BallConfig.Radius
+	if not assetsFolder then
+		return nil
+	end
+
+	return assetsFolder:FindFirstChild(BallConfig.Visual.FootballVisualAssetName)
+end
+
+local function scaleVisualPart(part: BasePart, visualDiameter: number)
+	local maxDimension = math.max(part.Size.X, part.Size.Y, part.Size.Z)
+
+	if maxDimension <= 0 then
+		part.Size = Vector3.new(visualDiameter, visualDiameter, visualDiameter)
+		return
+	end
+
+	part.Size *= visualDiameter / maxDimension
+end
+
+local function configureImportedVisual(ball: BasePart, asset: Instance, visualDiameter: number): boolean
+	if asset:IsA("BasePart") then
+		local visual = asset:Clone()
+		visual.Name = "FootballVisual"
+		visual.CFrame = ball.CFrame
+		scaleVisualPart(visual, visualDiameter)
+		weldVisualPart(visual, ball, ball, true)
+		return true
+	end
+
+	if asset:IsA("Model") then
+		local visualModel = asset:Clone()
+		visualModel.Name = "FootballVisual"
+		visualModel:SetAttribute("Beyond90BallVisual", true)
+		visualModel.Parent = ball
+
+		local okScale = pcall(function()
+			local _, boundsSize = visualModel:GetBoundingBox()
+			local maxDimension = math.max(boundsSize.X, boundsSize.Y, boundsSize.Z)
+
+			if maxDimension > 0 then
+				visualModel:ScaleTo(visualModel:GetScale() * visualDiameter / maxDimension)
+			end
+		end)
+
+		if not okScale then
+			warn(string.format("%s[Ball] FootballVisual model could not be uniformly scaled; check imported asset dimensions", GameConfig.LogPrefix))
+		end
+
+		visualModel:PivotTo(ball.CFrame)
+
+		for _, descendant in visualModel:GetDescendants() do
+			if descendant:IsA("BasePart") then
+				weldVisualPart(descendant, ball, visualModel, true)
+			end
+		end
+
+		return true
+	end
+
+	return false
+end
+
+local function createFallbackVisual(ball: BasePart, visualDiameter: number)
 	local visualConfig = BallConfig.Visual
-	local bandThickness = radius * 0.16
-	local bandLength = radius * 1.9
+	local visualRadius = visualDiameter / 2
+	local visual = Instance.new("Part")
+	visual.Name = "FootballVisual"
+	visual.Shape = Enum.PartType.Ball
+	visual.Size = Vector3.new(visualDiameter, visualDiameter, visualDiameter)
+	visual.CFrame = ball.CFrame
+	visual.Color = visualConfig.BaseColor
+	configureVisualPart(visual)
+	visual.Parent = ball
 
-	ball.Color = visualConfig.BaseColor
+	local rootWeld = Instance.new("WeldConstraint")
+	rootWeld:SetAttribute("Beyond90BallVisual", true)
+	rootWeld.Part0 = ball
+	rootWeld.Part1 = visual
+	rootWeld.Parent = visual
+
+	local bandThickness = visualRadius * 0.16
+	local bandLength = visualRadius * 1.9
 	createVisualBand(
-		ball,
+		visual,
 		"CharcoalPanelBandA",
-		Vector3.new(bandLength, bandThickness, radius * 0.08),
+		Vector3.new(bandLength, bandThickness, visualRadius * 0.08),
 		visualConfig.PanelColor,
 		Vector3.new(0, 0, 0)
 	)
 	createVisualBand(
-		ball,
+		visual,
 		"CharcoalPanelBandB",
-		Vector3.new(bandThickness, bandLength, radius * 0.08),
+		Vector3.new(bandThickness, bandLength, visualRadius * 0.08),
 		visualConfig.PanelColor,
 		Vector3.new(0, 0, 35)
 	)
 	createVisualBand(
-		ball,
+		visual,
 		"PurpleAccentBand",
-		Vector3.new(bandLength * 0.72, bandThickness * 0.75, radius * 0.09),
+		Vector3.new(bandLength * 0.72, bandThickness * 0.75, visualRadius * 0.09),
 		visualConfig.AccentColor,
 		Vector3.new(0, 0, -35)
 	)
-	createBrandMark(ball)
+	createBrandMark(visual)
+end
+
+local function configureBallVisuals(ball: BasePart)
+	clearBallVisuals(ball)
+	ball.Transparency = 1
+
+	local visualDiameter = BallConfig.Visual.VisualDiameter
+	local visualAsset = getFootballVisualAsset()
+
+	if visualAsset and configureImportedVisual(ball, visualAsset, visualDiameter) then
+		if not loggedFootballVisualLoaded then
+			loggedFootballVisualLoaded = true
+			print(string.format("%s[Ball] Football visual asset loaded", GameConfig.LogPrefix))
+		end
+
+		return
+	end
+
+	if not warnedMissingFootballVisual then
+		warnedMissingFootballVisual = true
+		warn(string.format(
+			"%s[Ball] ReplicatedStorage.%s.%s was not found or was not a supported visual asset; using temporary fallback football visual",
+			GameConfig.LogPrefix,
+			BallConfig.Visual.AssetFolderName,
+			BallConfig.Visual.FootballVisualAssetName
+		))
+	end
+
+	createFallbackVisual(ball, visualDiameter)
 end
 
 local function isFiniteNumber(value: number): boolean

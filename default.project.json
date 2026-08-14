@@ -8,6 +8,10 @@
 
       "Shared": {
         "$path": "src/shared"
+      },
+
+      "Assets": {
+        "$path": "assets/football"
       }
     },
 

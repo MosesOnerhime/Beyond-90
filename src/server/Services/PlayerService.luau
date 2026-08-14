@@ -4,6 +4,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local GameConfig = require(Shared.Config.GameConfig)
 local PlayerConfig = require(Shared.Config.PlayerConfig)
+local CharacterAppearanceService = require(script.Parent.CharacterAppearanceService)
 
 local PlayerService = {}
 
@@ -102,7 +103,6 @@ end
 
 local function configureCharacter(player: Player, character: Model, spawnLocation: SpawnLocation)
 	sprintStateByPlayer[player] = false
-	placeCharacterAtDevelopmentSpawn(character, spawnLocation)
 
 	local humanoid = character:WaitForChild("Humanoid", 10)
 
@@ -111,6 +111,8 @@ local function configureCharacter(player: Player, character: Model, spawnLocatio
 		return
 	end
 
+	CharacterAppearanceService.StandardizeCharacter(player, character, humanoid)
+	placeCharacterAtDevelopmentSpawn(character, spawnLocation)
 	applyMovementSettings(player, humanoid)
 
 	if not configuredHumanoids[humanoid] then

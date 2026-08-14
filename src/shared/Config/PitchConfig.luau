@@ -1,11 +1,13 @@
-local length = 180
-local width = 110
+local WorldScaleConfig = require(script.Parent.WorldScaleConfig)
+
+local length = WorldScaleConfig.CanonicalPitchLengthStuds
+local width = WorldScaleConfig.CanonicalPitchWidthStuds
 local surfaceThickness = 1
 local lineThickness = 0.35
 local lineHeight = 0.08
-local goalWidth = 28
+local goalWidth = WorldScaleConfig.CanonicalGoalWidthStuds
 local goalDepth = 10
-local goalHeight = 8
+local goalHeight = WorldScaleConfig.CanonicalGoalHeightStuds
 local developmentSpawnLengthOffset = -12
 local maxPitchBoundsReferenceThickness = 2
 

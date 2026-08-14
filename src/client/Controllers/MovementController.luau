@@ -169,6 +169,7 @@ local function sampleDiagnostics()
 	localPlayer:SetAttribute("Beyond90SmoothedPlayerSpeed", locomotionState.SmoothedSpeed)
 	localPlayer:SetAttribute("Beyond90TurnAngle", locomotionState.TurnAngle)
 	localPlayer:SetAttribute("Beyond90InputSource", locomotionState.InputSource)
+	localPlayer:SetAttribute("Beyond90SprintRequested", sprintRequested)
 end
 
 local function updateLocomotion(deltaTime: number)

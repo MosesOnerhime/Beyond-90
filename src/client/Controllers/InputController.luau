@@ -19,16 +19,23 @@ local inputFolder: Folder? = nil
 local inputContext: Instance? = nil
 local movementAction: Instance? = nil
 local sprintAction: Instance? = nil
+local cameraToggleAction: Instance? = nil
 local sprintButtonGui: ScreenGui? = nil
 local connections: { RBXScriptConnection } = {}
 local pressedKeys: { [Enum.KeyCode]: boolean } = {}
 local fallbackThumbstick = Vector2.zero
+local cameraToggleEvent = Instance.new("BindableEvent")
+local autoSprintChangedEvent = Instance.new("BindableEvent")
+local manualSprintRequested = false
+local autoSprintEnabled = inputConfig.AutoSprintDefaultEnabled == true
 
 local inputState = {
 	MoveVector = Vector2.zero,
 	MoveDirection = Vector3.zero,
 	MoveMagnitude = 0,
 	SprintRequested = false,
+	ManualSprintRequested = false,
+	AutoSprintEnabled = autoSprintEnabled,
 	Source = "InputAction",
 }
 
@@ -94,10 +101,15 @@ local function setMoveVector(moveVector: Vector2, source: string)
 	inputState.MoveDirection = direction
 	inputState.MoveMagnitude = magnitude
 	inputState.Source = source
+	inputState.SprintRequested = manualSprintRequested
+		or (autoSprintEnabled and magnitude >= inputConfig.AutoSprintThreshold)
 end
 
-local function setSprintRequested(requested: boolean, source: string)
-	inputState.SprintRequested = requested
+local function setManualSprintRequested(requested: boolean, source: string)
+	manualSprintRequested = requested
+	inputState.ManualSprintRequested = requested
+	inputState.SprintRequested = manualSprintRequested
+		or (autoSprintEnabled and inputState.MoveMagnitude >= inputConfig.AutoSprintThreshold)
 	inputState.Source = source
 end
 
@@ -177,8 +189,11 @@ local function setupInputActions(): boolean
 	local okSprint, sprint = pcall(function()
 		return Instance.new("InputAction")
 	end)
+	local okCameraToggle, cameraToggle = pcall(function()
+		return Instance.new("InputAction")
+	end)
 
-	if not okContext or not okMove or not okSprint then
+	if not okContext or not okMove or not okSprint or not okCameraToggle then
 		return false
 	end
 
@@ -247,7 +262,22 @@ local function setupInputActions(): boolean
 
 	table.insert(connections, sprint.StateChanged:Connect(function(value)
 		if typeof(value) == "boolean" then
-			setSprintRequested(value, "InputAction")
+			setManualSprintRequested(value, "InputAction")
+		end
+	end))
+
+	cameraToggle.Name = inputConfig.CameraToggleActionName
+	setProperty(cameraToggle, "Type", Enum.InputActionType.Bool)
+	cameraToggle.Parent = context
+	cameraToggleAction = cameraToggle
+
+	addBinding(cameraToggle, "KeyboardC", {
+		KeyCode = inputConfig.CameraToggleKey,
+	})
+
+	table.insert(connections, cameraToggle.StateChanged:Connect(function(value)
+		if value == true then
+			cameraToggleEvent:Fire()
 		end
 	end))
 
@@ -264,7 +294,7 @@ local function setupInputActions(): boolean
 	end)
 
 	if sprintStateOk and typeof(sprintState) == "boolean" then
-		setSprintRequested(sprintState, "InputAction")
+		setManualSprintRequested(sprintState, "InputAction")
 	end
 
 	return true
@@ -327,7 +357,11 @@ local function setupUserInputFallback()
 			or inputObject.KeyCode == Enum.KeyCode.ButtonL3
 			or inputObject.KeyCode == Enum.KeyCode.ButtonY
 		then
-			setSprintRequested(true, "UserInputService")
+			setManualSprintRequested(true, "UserInputService")
+		end
+
+		if inputObject.KeyCode == inputConfig.CameraToggleKey then
+			cameraToggleEvent:Fire()
 		end
 
 		refreshFallbackMoveVector()
@@ -341,7 +375,7 @@ local function setupUserInputFallback()
 			or inputObject.KeyCode == Enum.KeyCode.ButtonL3
 			or inputObject.KeyCode == Enum.KeyCode.ButtonY
 		then
-			setSprintRequested(false, "UserInputService")
+			setManualSprintRequested(false, "UserInputService")
 		end
 
 		if inputObject.KeyCode == Enum.KeyCode.Thumbstick1 then
@@ -373,8 +407,38 @@ function InputController.GetInputState()
 		MoveDirection = inputState.MoveDirection,
 		MoveMagnitude = inputState.MoveMagnitude,
 		SprintRequested = inputState.SprintRequested,
+		ManualSprintRequested = inputState.ManualSprintRequested,
+		AutoSprintEnabled = inputState.AutoSprintEnabled,
 		Source = inputState.Source,
 	}
+end
+
+function InputController.GetCameraToggleEvent(): BindableEvent
+	return cameraToggleEvent
+end
+
+function InputController.GetAutoSprintChangedEvent(): BindableEvent
+	return autoSprintChangedEvent
+end
+
+function InputController.IsAutoSprintEnabled(): boolean
+	return autoSprintEnabled
+end
+
+function InputController.SetAutoSprintEnabled(enabled: boolean)
+	if autoSprintEnabled == enabled then
+		return
+	end
+
+	autoSprintEnabled = enabled
+	inputState.AutoSprintEnabled = enabled
+	inputState.SprintRequested = manualSprintRequested
+		or (autoSprintEnabled and inputState.MoveMagnitude >= inputConfig.AutoSprintThreshold)
+	autoSprintChangedEvent:Fire(enabled)
+end
+
+function InputController.ToggleAutoSprint()
+	InputController.SetAutoSprintEnabled(not autoSprintEnabled)
 end
 
 function InputController.Initialize()
@@ -407,7 +471,9 @@ function InputController.Destroy()
 	table.clear(pressedKeys)
 	fallbackThumbstick = Vector2.zero
 	setMoveVector(Vector2.zero, inputState.Source)
-	setSprintRequested(false, inputState.Source)
+	setManualSprintRequested(false, inputState.Source)
+	autoSprintEnabled = inputConfig.AutoSprintDefaultEnabled == true
+	inputState.AutoSprintEnabled = autoSprintEnabled
 
 	if inputContext then
 		inputContext:Destroy()
@@ -421,6 +487,7 @@ function InputController.Destroy()
 
 	movementAction = nil
 	sprintAction = nil
+	cameraToggleAction = nil
 	inputFolder = nil
 end
 

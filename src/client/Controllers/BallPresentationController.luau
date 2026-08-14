@@ -160,7 +160,7 @@ local function createBrandMark(proxy: BasePart)
 end
 
 local function createProxyBall(position: Vector3): Part
-	local radius = visualConfig.PresentationDiameter / 2
+	local radius = (visualConfig.VisualDiameter or visualConfig.PresentationDiameter) / 2
 	local proxy = Instance.new("Part")
 	proxy.Name = "Beyond90LocalVisualFootball"
 	proxy:SetAttribute("Beyond90LocalVisualBall", true)
@@ -276,7 +276,7 @@ end
 
 local function getDesiredVisualPosition(ball: BasePart, rootPart: BasePart, humanoid: Humanoid): (Vector3, Vector3, boolean)
 	local direction, speed, isMoving = getControlDirection(rootPart, humanoid)
-	local visualRadius = visualConfig.PresentationDiameter / 2
+	local visualRadius = (visualConfig.VisualDiameter or visualConfig.PresentationDiameter) / 2
 	local centerY = ball.Position.Y + visualRadius - BallConfig.Radius
 	local leadDistance
 
@@ -294,7 +294,7 @@ local function getDesiredVisualPosition(ball: BasePart, rootPart: BasePart, huma
 end
 
 local function updateRotation(previousPosition: Vector3, nextPosition: Vector3)
-	local visualRadius = visualConfig.PresentationDiameter / 2
+	local visualRadius = (visualConfig.VisualDiameter or visualConfig.PresentationDiameter) / 2
 	local displacement = BallControlMath.GetHorizontal(nextPosition - previousPosition)
 	local distance = displacement.Magnitude
 
@@ -362,7 +362,7 @@ local function updateReconciliation(ball: BasePart)
 		return
 	end
 
-	local visualRadius = visualConfig.PresentationDiameter / 2
+	local visualRadius = (visualConfig.VisualDiameter or visualConfig.PresentationDiameter) / 2
 	local targetPosition = ball.Position + Vector3.yAxis * (visualRadius - BallConfig.Radius)
 	local distance = (proxyPosition - targetPosition).Magnitude
 
