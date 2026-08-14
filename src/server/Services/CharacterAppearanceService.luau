@@ -111,30 +111,55 @@ local function measureBodyHeight(character: Model): number?
 	return maxY - minY
 end
 
-local function scaleCharacterToCanonicalHeight(character: Model): number?
-	if not appearanceConfig.ScaleToCanonicalHeight then
-		return measureBodyHeight(character)
-	end
-
+local function scaleCharacterToHeight(character: Model, targetHeight: number, label: string): (number?, number?)
 	local measuredHeight = measureBodyHeight(character)
 
 	if not measuredHeight or measuredHeight <= 0 then
-		return nil
+		return nil, nil
 	end
 
-	local targetHeight = appearanceConfig.TargetHeightStuds or WorldScaleConfig.CanonicalPlayerHeightStuds
 	local scaleFactor = targetHeight / measuredHeight
+
+	if math.abs(scaleFactor - 1) <= 0.005 then
+		return measuredHeight, 1
+	end
+
 	local ok, err = pcall(function()
 		character:ScaleTo(character:GetScale() * scaleFactor)
 	end)
 
 	if not ok then
-		warnLog(string.format("Could not scale character to canonical height: %s", tostring(err)))
-		return measuredHeight
+		warnLog(string.format("Could not scale character for %s: %s", label, tostring(err)))
+		return measuredHeight, nil
 	end
 
 	RunService.Heartbeat:Wait()
-	return measureBodyHeight(character) or targetHeight
+	return measureBodyHeight(character) or targetHeight, scaleFactor
+end
+
+local function scaleCharacterForCurrentSource(character: Model): (number?, number?, boolean)
+	if appearanceConfig.DevelopmentFootballerScaleEnabled then
+		local targetHeight = appearanceConfig.DevelopmentFootballerTargetHeightStuds
+			or appearanceConfig.IntendedHeightStuds
+			or WorldScaleConfig.CanonicalPlayerHeightStuds
+		local measuredHeight, scaleFactor = scaleCharacterToHeight(character, targetHeight, "development footballer")
+
+		if scaleFactor then
+			character:SetAttribute("Beyond90DevelopmentFootballerScaleFactor", scaleFactor)
+		end
+
+		return measuredHeight, scaleFactor, true
+	end
+
+	if appearanceConfig.ScaleToCanonicalHeight then
+		local targetHeight = appearanceConfig.TargetHeightStuds
+			or appearanceConfig.IntendedHeightStuds
+			or WorldScaleConfig.CanonicalPlayerHeightStuds
+		local measuredHeight, scaleFactor = scaleCharacterToHeight(character, targetHeight, "canonical height")
+		return measuredHeight, scaleFactor, false
+	end
+
+	return measureBodyHeight(character), 1, false
 end
 
 local function getR15StructureReport(character: Model): (boolean, string)
@@ -196,47 +221,61 @@ function CharacterAppearanceService.StandardizeCharacter(player: Player, charact
 		return false
 	end
 
-	local okDescription, description = pcall(function()
-		return humanoid:GetAppliedDescription()
-	end)
+	if appearanceConfig.ApplyDescriptionStandardization then
+		local okDescription, description = pcall(function()
+			return humanoid:GetAppliedDescription()
+		end)
 
-	if not okDescription or not description then
-		warnLog(string.format("Could not read applied HumanoidDescription for %s", player.Name))
-		return false
+		if not okDescription or not description then
+			warnLog(string.format("Could not read applied HumanoidDescription for %s", player.Name))
+			return false
+		end
+
+		normalizeDescription(description)
+
+		local okApply, err = pcall(function()
+			humanoid:ApplyDescription(description)
+		end)
+
+		description:Destroy()
+
+		if not okApply then
+			warnLog(string.format("Could not apply standardized HumanoidDescription for %s: %s", player.Name, tostring(err)))
+			return false
+		end
+
+		RunService.Heartbeat:Wait()
 	end
 
-	normalizeDescription(description)
-
-	local okApply, err = pcall(function()
-		humanoid:ApplyDescription(description)
-	end)
-
-	description:Destroy()
-
-	if not okApply then
-		warnLog(string.format("Could not apply standardized HumanoidDescription for %s: %s", player.Name, tostring(err)))
-		return false
-	end
-
-	RunService.Heartbeat:Wait()
-	local measuredHeight = scaleCharacterToCanonicalHeight(character)
+	local measuredHeight, scaleFactor, developmentFootballer = scaleCharacterForCurrentSource(character)
 	local hasR15Structure, structureReport = getR15StructureReport(character)
-	local targetHeight = appearanceConfig.TargetHeightStuds or WorldScaleConfig.CanonicalPlayerHeightStuds
+	local intendedHeight = if developmentFootballer
+		then appearanceConfig.DevelopmentFootballerTargetHeightStuds
+		else (appearanceConfig.IntendedHeightStuds or WorldScaleConfig.CanonicalPlayerHeightStuds)
 
 	character:SetAttribute("Beyond90StandardR15", true)
 	character:SetAttribute("Beyond90CanonicalHeightStuds", WorldScaleConfig.CanonicalPlayerHeightStuds)
-	character:SetAttribute("Beyond90TargetHeightStuds", targetHeight)
+	character:SetAttribute("Beyond90IntendedHeightStuds", intendedHeight)
 	character:SetAttribute("Beyond90MeasuredBodyHeightStuds", measuredHeight or -1)
+	character:SetAttribute("Beyond90DevelopmentFootballer", developmentFootballer)
 	character:SetAttribute("Beyond90BodyRadius", profileConfig.CanonicalBodyRadius)
 	character:SetAttribute("Beyond90FootContactHeight", profileConfig.CanonicalFootContactHeight)
 	character:SetAttribute("Beyond90FootForwardOffset", profileConfig.CanonicalFootForwardOffset)
 	character:SetAttribute("Beyond90R15StructureValid", hasR15Structure)
 	character:SetAttribute("Beyond90R15StructureReport", structureReport)
+	character:SetAttribute("Beyond90AvatarSettingsSourceOfTruth", not developmentFootballer and not appearanceConfig.ScaleToCanonicalHeight)
 	characterLog(string.format(
-		"RigType=R15 height=%.2f targetHeight=%.2f structure=%s appearance=standard-r15-blocky",
+		"RigType=R15 height=%.2f targetHeight=%.2f scaleFactor=%.3f developmentFootballer=%s structure=%s appearance=%s",
 		measuredHeight or -1,
-		targetHeight,
-		if hasR15Structure then "ok" else "missing " .. structureReport
+		intendedHeight,
+		scaleFactor or -1,
+		tostring(developmentFootballer),
+		if hasR15Structure then "ok" else "missing " .. structureReport,
+		if developmentFootballer
+			then "development-startercharacter-scale"
+			elseif appearanceConfig.ApplyDescriptionStandardization
+			then "runtime-standardized"
+			else "avatar-settings-source"
 	))
 
 	return true

@@ -1,7 +1,9 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
+local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local InputController = require(script.Parent:WaitForChild("InputController"))
 local CameraController = require(script.Parent.Parent.Camera:WaitForChild("CameraController"))
@@ -13,7 +15,10 @@ local initialized = false
 local gui: ScreenGui? = nil
 local autoSprintButton: TextButton? = nil
 local cameraButton: TextButton? = nil
+local cameraDistanceButton: TextButton? = nil
 local connections: { RBXScriptConnection } = {}
+local heldActions: { [string]: number } = {}
+local meters = {}
 
 local function createButton(parent: Instance, name: string, position: UDim2): TextButton
 	local button = Instance.new("TextButton")
@@ -29,6 +34,109 @@ local function createButton(parent: Instance, name: string, position: UDim2): Te
 	button.AutoButtonColor = true
 	button.Parent = parent
 	return button
+end
+
+local function getActionConfig(actionType: string)
+	if actionType == "ThroughPass" then
+		return FootballActionConfig.ThroughPass
+	elseif actionType == "KnockOn" then
+		return FootballActionConfig.KnockOn
+	end
+
+	return FootballActionConfig.Pass
+end
+
+local function getIntensity(actionType: string, holdDuration: number): (number, number)
+	local actionConfig = getActionConfig(actionType)
+	local minIntensity = actionConfig.MinIntensity or 1
+	local maxIntensity = actionConfig.MaxIntensity or minIntensity
+	local holdMaxTime = math.max(actionConfig.HoldMaxTime or 0.75, 0.05)
+	local alpha = math.clamp(holdDuration / holdMaxTime, 0, 1)
+	return minIntensity + (maxIntensity - minIntensity) * alpha, alpha
+end
+
+local function createIntensityMeter(parent: Instance, actionType: string, title: string, position: UDim2)
+	local container = Instance.new("Frame")
+	container.Name = actionType .. "ChargeMeter"
+	container.Position = position
+	container.Size = UDim2.fromOffset(260, 46)
+	container.BackgroundColor3 = Color3.fromRGB(24, 28, 34)
+	container.BackgroundTransparency = 0.12
+	container.BorderSizePixel = 0
+	container.Parent = parent
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.Position = UDim2.fromOffset(10, 4)
+	label.Size = UDim2.new(1, -20, 0, 18)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamSemibold
+	label.TextColor3 = Color3.fromRGB(245, 245, 245)
+	label.TextSize = 13
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Parent = container
+
+	local track = Instance.new("Frame")
+	track.Name = "Track"
+	track.Position = UDim2.fromOffset(10, 29)
+	track.Size = UDim2.new(1, -20, 0, 6)
+	track.BackgroundColor3 = Color3.fromRGB(58, 65, 74)
+	track.BorderSizePixel = 0
+	track.Parent = container
+
+	local fill = Instance.new("Frame")
+	fill.Name = "Fill"
+	fill.Size = UDim2.fromScale(0, 1)
+	fill.BackgroundColor3 = Color3.fromRGB(85, 170, 255)
+	fill.BorderSizePixel = 0
+	fill.Parent = track
+
+	meters[actionType] = {
+		Title = title,
+		Label = label,
+		Fill = fill,
+	}
+end
+
+local function setMeterValue(actionType: string, holdDuration: number)
+	local meter = meters[actionType]
+
+	if not meter then
+		return
+	end
+
+	if holdDuration <= 0 then
+		meter.Fill.Size = UDim2.fromScale(0, 1)
+		meter.Label.Text = string.format("%s --", meter.Title)
+		return
+	end
+
+	local intensity, alpha = getIntensity(actionType, holdDuration)
+	meter.Fill.Size = UDim2.fromScale(alpha, 1)
+	meter.Label.Text = string.format("%s %.2fx", meter.Title, intensity)
+end
+
+local function updateIntensityMeters()
+	local now = os.clock()
+
+	for actionType, startedAt in heldActions do
+		setMeterValue(actionType, now - startedAt)
+	end
+end
+
+local function onFootballAction(action)
+	local actionType = action.ActionType
+
+	if actionType ~= "GroundPass" and actionType ~= "ThroughPass" and actionType ~= "KnockOn" then
+		return
+	end
+
+	if action.Phase == "Pressed" then
+		heldActions[actionType] = os.clock()
+	elseif action.Phase == "Released" or action.Phase == "Cancelled" then
+		heldActions[actionType] = nil
+		setMeterValue(actionType, 0)
+	end
 end
 
 local function updateAutoSprintButton()
@@ -47,8 +155,18 @@ local function updateCameraButton()
 	end
 
 	local mode = CameraController.GetActiveMode()
-	local displayMode = if mode == "FirstPerson" then "FIRST PERSON" else string.upper(mode)
+	local displayMode = if mode == "ThirdPerson"
+		then "THIRD PERSON"
+		else string.upper(mode)
 	cameraButton.Text = string.format("CAMERA: %s", displayMode)
+end
+
+local function updateCameraDistanceButton()
+	if not cameraDistanceButton then
+		return
+	end
+
+	cameraDistanceButton.Text = string.format("CAM DIST: %s", CameraController.GetBroadcastDistancePresetLabel())
 end
 
 local function createGui()
@@ -69,6 +187,10 @@ local function createGui()
 
 	autoSprintButton = createButton(screenGui, "AutoSprintButton", UDim2.fromOffset(16, 16))
 	cameraButton = createButton(screenGui, "CameraModeButton", UDim2.fromOffset(16, 58))
+	cameraDistanceButton = createButton(screenGui, "CameraDistanceButton", UDim2.fromOffset(16, 100))
+	createIntensityMeter(screenGui, "GroundPass", "PASS INTENSITY", UDim2.fromOffset(16, 148))
+	createIntensityMeter(screenGui, "ThroughPass", "THROUGH INTENSITY", UDim2.fromOffset(16, 200))
+	createIntensityMeter(screenGui, "KnockOn", "KNOCK-ON INTENSITY", UDim2.fromOffset(16, 252))
 
 	table.insert(connections, autoSprintButton.Activated:Connect(function()
 		InputController.ToggleAutoSprint()
@@ -76,11 +198,21 @@ local function createGui()
 	table.insert(connections, cameraButton.Activated:Connect(function()
 		CameraController.TogglePrimaryMode()
 	end))
+	table.insert(connections, cameraDistanceButton.Activated:Connect(function()
+		CameraController.CycleBroadcastDistancePreset()
+		updateCameraDistanceButton()
+	end))
 	table.insert(connections, InputController.GetAutoSprintChangedEvent().Event:Connect(updateAutoSprintButton))
 	table.insert(connections, CameraController.GetModeChangedEvent().Event:Connect(updateCameraButton))
+	table.insert(connections, InputController.GetFootballActionEvent().Event:Connect(onFootballAction))
+	table.insert(connections, RunService.RenderStepped:Connect(updateIntensityMeters))
 
+	setMeterValue("GroundPass", 0)
+	setMeterValue("ThroughPass", 0)
+	setMeterValue("KnockOn", 0)
 	updateAutoSprintButton()
 	updateCameraButton()
+	updateCameraDistanceButton()
 end
 
 function DevelopmentHUDController.Initialize()
@@ -104,6 +236,7 @@ function DevelopmentHUDController.Destroy()
 	end
 
 	table.clear(connections)
+	table.clear(heldActions)
 
 	if gui then
 		gui:Destroy()
@@ -112,6 +245,8 @@ function DevelopmentHUDController.Destroy()
 
 	autoSprintButton = nil
 	cameraButton = nil
+	cameraDistanceButton = nil
+	table.clear(meters)
 end
 
 return DevelopmentHUDController

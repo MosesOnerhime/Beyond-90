@@ -7,6 +7,7 @@ local CameraConfig = require(Shared.Config.CameraConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local BroadcastCamera = require(script.Parent.BroadcastCamera)
 local FirstPersonCamera = require(script.Parent.FirstPersonCamera)
+local ThirdPersonCamera = require(script.Parent.ThirdPersonCamera)
 local InputController = require(script.Parent.Parent.Controllers:WaitForChild("InputController"))
 
 local CameraController = {}
@@ -18,6 +19,7 @@ local toggleConnection: RBXScriptConnection? = nil
 local characterAddedConnection: RBXScriptConnection? = nil
 local originalCameraType: Enum.CameraType? = nil
 local originalCameraSubject: Instance? = nil
+local modeTransitionId = 0
 local modeChangedEvent = Instance.new("BindableEvent")
 
 local function log(message: string)
@@ -48,10 +50,32 @@ local function restoreDefaultCamera()
 end
 
 local function setMode(mode: string)
+	if mode == "FirstPerson" and not CameraConfig.FirstPerson.Enabled then
+		mode = "ThirdPerson"
+	end
+
 	local camera = Workspace.CurrentCamera
 
 	if not camera then
 		return
+	end
+
+	modeTransitionId += 1
+	local transitionId = modeTransitionId
+	local wasFirstPerson = activeMode == "FirstPerson"
+	local firstPersonExitDelay = CameraConfig.FirstPerson.ExitRestoreDelay or 0
+
+	local function afterFirstPersonExit(callback)
+		if not wasFirstPerson or firstPersonExitDelay <= 0 then
+			callback()
+			return
+		end
+
+		task.delay(firstPersonExitDelay, function()
+			if transitionId == modeTransitionId then
+				callback()
+			end
+		end)
 	end
 
 	if mode == "Broadcast" then
@@ -61,9 +85,31 @@ local function setMode(mode: string)
 		end
 
 		activeMode = "Broadcast"
+		ThirdPersonCamera.Disable()
 		FirstPersonCamera.Disable()
-		BroadcastCamera.Enable()
+		FirstPersonCamera.RestoreLocalCharacterVisibility()
+		afterFirstPersonExit(function()
+			if activeMode == "Broadcast" then
+				BroadcastCamera.Enable()
+			end
+		end)
 		log("Mode -> Broadcast")
+	elseif mode == "ThirdPerson" then
+		if activeMode == "Default" then
+			originalCameraType = camera.CameraType
+			originalCameraSubject = camera.CameraSubject
+		end
+
+		activeMode = "ThirdPerson"
+		BroadcastCamera.Disable()
+		FirstPersonCamera.Disable()
+		FirstPersonCamera.RestoreLocalCharacterVisibility()
+		afterFirstPersonExit(function()
+			if activeMode == "ThirdPerson" then
+				ThirdPersonCamera.Enable()
+			end
+		end)
+		log("Mode -> ThirdPerson")
 	elseif mode == "FirstPerson" then
 		if activeMode == "Default" then
 			originalCameraType = camera.CameraType
@@ -72,11 +118,13 @@ local function setMode(mode: string)
 
 		activeMode = "FirstPerson"
 		BroadcastCamera.Disable()
+		ThirdPersonCamera.Disable()
 		FirstPersonCamera.Enable()
 		log("Mode -> FirstPerson")
 	else
 		activeMode = "Default"
 		BroadcastCamera.Disable()
+		ThirdPersonCamera.Disable()
 		FirstPersonCamera.Disable()
 		restoreDefaultCamera()
 		log("Mode -> Default")
@@ -86,10 +134,10 @@ local function setMode(mode: string)
 end
 
 local function togglePrimaryMode()
-	if activeMode == "FirstPerson" then
-		setMode("Broadcast")
+	if activeMode == "Broadcast" then
+		setMode("ThirdPerson")
 	else
-		setMode("FirstPerson")
+		setMode("Broadcast")
 	end
 end
 
@@ -105,6 +153,9 @@ function CameraController.Initialize()
 			task.defer(restoreDefaultCamera)
 		end
 	end)
+
+	FirstPersonCamera.Disable()
+	FirstPersonCamera.RestoreLocalCharacterVisibility()
 
 	if CameraConfig.DefaultMode == "Broadcast" then
 		setMode("Broadcast")
@@ -133,12 +184,21 @@ function CameraController.GetModeChangedEvent(): BindableEvent
 	return modeChangedEvent
 end
 
+function CameraController.CycleBroadcastDistancePreset(): string
+	return BroadcastCamera.CycleDistancePreset()
+end
+
+function CameraController.GetBroadcastDistancePresetLabel(): string
+	return BroadcastCamera.GetDistancePresetLabel()
+end
+
 function CameraController.Destroy()
 	if not initialized then
 		return
 	end
 
 	initialized = false
+	modeTransitionId += 1
 
 	if toggleConnection then
 		toggleConnection:Disconnect()
@@ -151,7 +211,9 @@ function CameraController.Destroy()
 	end
 
 	BroadcastCamera.Disable()
+	ThirdPersonCamera.Disable()
 	FirstPersonCamera.Disable()
+	FirstPersonCamera.RestoreLocalCharacterVisibility()
 	restoreDefaultCamera()
 	activeMode = "Default"
 	modeChangedEvent:Fire(activeMode)

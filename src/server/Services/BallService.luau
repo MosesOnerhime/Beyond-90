@@ -19,6 +19,7 @@ local accumulatedTime = 0
 local lastTouchByPlayer: { [Player]: number } = {}
 local warnedMissingFootballVisual = false
 local loggedFootballVisualLoaded = false
+local loggedBallScale = false
 
 local function getRootFolder(): Folder
 	local rootFolder = Workspace:FindFirstChild(GameConfig.WorkspaceContainerName)
@@ -452,7 +453,7 @@ local function updateBallInteractions(ball: Part, deltaTime: number, allowFreeTo
 		return
 	end
 
-	if allowFreeTouch then
+	if allowFreeTouch and BallConfig.BasicTouch.Enabled == true then
 		for _, player in Players:GetPlayers() do
 			local touchContext = getCharacterTouchContext(player, ball)
 
@@ -517,6 +518,18 @@ function BallService.Initialize()
 	ball:SetAttribute("ServerOwned", true)
 	ball:SetNetworkOwner(nil)
 	configureBallVisuals(ball)
+	if not loggedBallScale then
+		loggedBallScale = true
+		print(string.format(
+			"%s[Ball] Scale diameter=%.2f physics=%.2f visual=%.2f radius=%.3f restingCenterY=%.3f",
+			GameConfig.LogPrefix,
+			BallConfig.BallDiameter or radius * 2,
+			BallConfig.PhysicsDiameter or radius * 2,
+			BallConfig.Visual.VisualDiameter,
+			radius,
+			ball.Position.Y
+		))
+	end
 	activeBall = ball
 	BallControlService.Initialize(ball)
 	startInteractionLoop()

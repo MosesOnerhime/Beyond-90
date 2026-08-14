@@ -5,6 +5,7 @@ local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local BallControlMath = require(Shared.Football.BallControlMath)
+local CameraConfig = require(Shared.Config.CameraConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local PlayerConfig = require(Shared.Config.PlayerConfig)
 
@@ -20,11 +21,16 @@ local inputContext: Instance? = nil
 local movementAction: Instance? = nil
 local sprintAction: Instance? = nil
 local cameraToggleAction: Instance? = nil
+local passAction: Instance? = nil
+local throughPassAction: Instance? = nil
+local knockOnAction: Instance? = nil
 local sprintButtonGui: ScreenGui? = nil
 local connections: { RBXScriptConnection } = {}
 local pressedKeys: { [Enum.KeyCode]: boolean } = {}
+local actionStartedAt: { [string]: number } = {}
 local fallbackThumbstick = Vector2.zero
 local cameraToggleEvent = Instance.new("BindableEvent")
+local footballActionEvent = Instance.new("BindableEvent")
 local autoSprintChangedEvent = Instance.new("BindableEvent")
 local manualSprintRequested = false
 local autoSprintEnabled = inputConfig.AutoSprintDefaultEnabled == true
@@ -73,7 +79,52 @@ local function getFacingDirection(): Vector3
 	return Vector3.new(0, 0, -1)
 end
 
-local function getCameraRelativeDirection(moveVector: Vector2): (Vector3, number)
+local function getPitchMetadata()
+	local rootFolder = Workspace:FindFirstChild(GameConfig.WorkspaceContainerName)
+	local pitchFolder = rootFolder and rootFolder:FindFirstChild("Pitch")
+	local gameplayBounds = pitchFolder and pitchFolder:FindFirstChild("GameplayBounds")
+
+	if not gameplayBounds or not gameplayBounds:IsA("BasePart") then
+		return nil
+	end
+
+	local lengthAxis = gameplayBounds:GetAttribute("PitchLengthAxis")
+	local widthAxis = gameplayBounds:GetAttribute("PitchWidthAxis")
+
+	if typeof(lengthAxis) ~= "Vector3" or typeof(widthAxis) ~= "Vector3" then
+		return nil
+	end
+
+	return {
+		LengthAxis = BallControlMath.SafeUnit(BallControlMath.GetHorizontal(lengthAxis), Vector3.new(0, 0, 1)),
+		WidthAxis = BallControlMath.SafeUnit(BallControlMath.GetHorizontal(widthAxis), Vector3.new(1, 0, 0)),
+	}
+end
+
+local getCameraRelativeDirection
+
+local function getBroadcastDirection(moveVector: Vector2): (Vector3, number)
+	local magnitude = math.clamp(moveVector.Magnitude, 0, 1)
+
+	if magnitude <= locomotionConfig.RawInputDeadzone then
+		return Vector3.zero, 0
+	end
+
+	local pitchState = getPitchMetadata()
+
+	if not pitchState then
+		return getCameraRelativeDirection(moveVector)
+	end
+
+	local sideSign = if CameraConfig.Broadcast.BroadcastSide >= 0 then 1 else -1
+	local screenRight = -pitchState.LengthAxis
+	local screenForward = pitchState.WidthAxis * -sideSign
+	local worldDirection = screenRight * moveVector.X + screenForward * moveVector.Y
+
+	return BallControlMath.SafeUnit(worldDirection, Vector3.zero), magnitude
+end
+
+getCameraRelativeDirection = function(moveVector: Vector2): (Vector3, number)
 	local magnitude = math.clamp(moveVector.Magnitude, 0, 1)
 
 	if magnitude <= locomotionConfig.RawInputDeadzone then
@@ -93,9 +144,19 @@ local function getCameraRelativeDirection(moveVector: Vector2): (Vector3, number
 	return BallControlMath.SafeUnit(worldDirection, Vector3.zero), magnitude
 end
 
+local function getWorldMoveDirection(moveVector: Vector2): (Vector3, number)
+	local cameraMode = localPlayer:GetAttribute("Beyond90CameraMode")
+
+	if cameraMode == "ThirdPerson" or cameraMode == "FirstPerson" then
+		return getCameraRelativeDirection(moveVector)
+	end
+
+	return getBroadcastDirection(moveVector)
+end
+
 local function setMoveVector(moveVector: Vector2, source: string)
 	local clamped = if moveVector.Magnitude > 1 then moveVector.Unit else moveVector
-	local direction, magnitude = getCameraRelativeDirection(clamped)
+	local direction, magnitude = getWorldMoveDirection(clamped)
 
 	inputState.MoveVector = clamped
 	inputState.MoveDirection = direction
@@ -111,6 +172,42 @@ local function setManualSprintRequested(requested: boolean, source: string)
 	inputState.SprintRequested = manualSprintRequested
 		or (autoSprintEnabled and inputState.MoveMagnitude >= inputConfig.AutoSprintThreshold)
 	inputState.Source = source
+end
+
+local function fireFootballAction(actionType: string, phase: string, holdDuration: number?)
+	local state = InputController.GetInputState()
+
+	footballActionEvent:Fire({
+		ActionType = actionType,
+		Phase = phase,
+		HoldDuration = holdDuration or 0,
+		MoveVector = state.MoveVector,
+		AimDirection = state.MoveDirection,
+		MoveMagnitude = state.MoveMagnitude,
+		SprintRequested = state.SprintRequested,
+		Source = state.Source,
+		Timestamp = os.clock(),
+	})
+end
+
+local function handleBoolFootballAction(actionType: string, value: any)
+	if typeof(value) ~= "boolean" then
+		return
+	end
+
+	if value then
+		actionStartedAt[actionType] = os.clock()
+		fireFootballAction(actionType, "Pressed", 0)
+
+		return
+	end
+
+	local startedAt = actionStartedAt[actionType]
+	actionStartedAt[actionType] = nil
+
+	if startedAt then
+		fireFootballAction(actionType, "Released", os.clock() - startedAt)
+	end
 end
 
 local function createInputFolder(): Folder
@@ -192,8 +289,24 @@ local function setupInputActions(): boolean
 	local okCameraToggle, cameraToggle = pcall(function()
 		return Instance.new("InputAction")
 	end)
+	local okPass, pass = pcall(function()
+		return Instance.new("InputAction")
+	end)
+	local okThroughPass, throughPass = pcall(function()
+		return Instance.new("InputAction")
+	end)
+	local okKnockOn, knockOn = pcall(function()
+		return Instance.new("InputAction")
+	end)
 
-	if not okContext or not okMove or not okSprint or not okCameraToggle then
+	if not okContext
+		or not okMove
+		or not okSprint
+		or not okCameraToggle
+		or not okPass
+		or not okThroughPass
+		or not okKnockOn
+	then
 		return false
 	end
 
@@ -281,6 +394,45 @@ local function setupInputActions(): boolean
 		end
 	end))
 
+	pass.Name = inputConfig.PassActionName
+	setProperty(pass, "Type", Enum.InputActionType.Bool)
+	pass.Parent = context
+	passAction = pass
+
+	addBinding(pass, "KeyboardPass", {
+		KeyCode = inputConfig.PassKey,
+	})
+
+	table.insert(connections, pass.StateChanged:Connect(function(value)
+		handleBoolFootballAction("GroundPass", value)
+	end))
+
+	throughPass.Name = inputConfig.ThroughPassActionName
+	setProperty(throughPass, "Type", Enum.InputActionType.Bool)
+	throughPass.Parent = context
+	throughPassAction = throughPass
+
+	addBinding(throughPass, "KeyboardThroughPass", {
+		KeyCode = inputConfig.ThroughPassKey,
+	})
+
+	table.insert(connections, throughPass.StateChanged:Connect(function(value)
+		handleBoolFootballAction("ThroughPass", value)
+	end))
+
+	knockOn.Name = inputConfig.KnockOnActionName
+	setProperty(knockOn, "Type", Enum.InputActionType.Bool)
+	knockOn.Parent = context
+	knockOnAction = knockOn
+
+	addBinding(knockOn, "KeyboardKnockOn", {
+		KeyCode = inputConfig.KnockOnKey,
+	})
+
+	table.insert(connections, knockOn.StateChanged:Connect(function(value)
+		handleBoolFootballAction("KnockOn", value)
+	end))
+
 	local moveStateOk, moveState = pcall(function()
 		return moveAction:GetState()
 	end)
@@ -364,6 +516,17 @@ local function setupUserInputFallback()
 			cameraToggleEvent:Fire()
 		end
 
+		if inputObject.KeyCode == inputConfig.PassKey then
+			actionStartedAt.GroundPass = os.clock()
+			fireFootballAction("GroundPass", "Pressed", 0)
+		elseif inputObject.KeyCode == inputConfig.ThroughPassKey then
+			actionStartedAt.ThroughPass = os.clock()
+			fireFootballAction("ThroughPass", "Pressed", 0)
+		elseif inputObject.KeyCode == inputConfig.KnockOnKey then
+			actionStartedAt.KnockOn = os.clock()
+			fireFootballAction("KnockOn", "Pressed", 0)
+		end
+
 		refreshFallbackMoveVector()
 	end))
 
@@ -380,6 +543,29 @@ local function setupUserInputFallback()
 
 		if inputObject.KeyCode == Enum.KeyCode.Thumbstick1 then
 			fallbackThumbstick = Vector2.zero
+		end
+
+		if inputObject.KeyCode == inputConfig.PassKey then
+			local startedAt = actionStartedAt.GroundPass
+			actionStartedAt.GroundPass = nil
+
+			if startedAt then
+				fireFootballAction("GroundPass", "Released", os.clock() - startedAt)
+			end
+		elseif inputObject.KeyCode == inputConfig.ThroughPassKey then
+			local startedAt = actionStartedAt.ThroughPass
+			actionStartedAt.ThroughPass = nil
+
+			if startedAt then
+				fireFootballAction("ThroughPass", "Released", os.clock() - startedAt)
+			end
+		elseif inputObject.KeyCode == inputConfig.KnockOnKey then
+			local startedAt = actionStartedAt.KnockOn
+			actionStartedAt.KnockOn = nil
+
+			if startedAt then
+				fireFootballAction("KnockOn", "Released", os.clock() - startedAt)
+			end
 		end
 
 		refreshFallbackMoveVector()
@@ -402,6 +588,12 @@ local function setupUserInputFallback()
 end
 
 function InputController.GetInputState()
+	local direction, magnitude = getWorldMoveDirection(inputState.MoveVector)
+	inputState.MoveDirection = direction
+	inputState.MoveMagnitude = magnitude
+	inputState.SprintRequested = manualSprintRequested
+		or (autoSprintEnabled and magnitude >= inputConfig.AutoSprintThreshold)
+
 	return {
 		MoveVector = inputState.MoveVector,
 		MoveDirection = inputState.MoveDirection,
@@ -415,6 +607,10 @@ end
 
 function InputController.GetCameraToggleEvent(): BindableEvent
 	return cameraToggleEvent
+end
+
+function InputController.GetFootballActionEvent(): BindableEvent
+	return footballActionEvent
 end
 
 function InputController.GetAutoSprintChangedEvent(): BindableEvent
@@ -469,6 +665,7 @@ function InputController.Destroy()
 
 	table.clear(connections)
 	table.clear(pressedKeys)
+	table.clear(actionStartedAt)
 	fallbackThumbstick = Vector2.zero
 	setMoveVector(Vector2.zero, inputState.Source)
 	setManualSprintRequested(false, inputState.Source)
@@ -488,6 +685,9 @@ function InputController.Destroy()
 	movementAction = nil
 	sprintAction = nil
 	cameraToggleAction = nil
+	passAction = nil
+	throughPassAction = nil
+	knockOnAction = nil
 	inputFolder = nil
 end
 

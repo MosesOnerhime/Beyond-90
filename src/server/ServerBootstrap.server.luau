@@ -3,6 +3,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local GameConfig = require(Shared.Config.GameConfig)
 
 local BallService = require(script.Parent.Services.BallService)
+local FootballActionService = require(script.Parent.Services.FootballActionService)
 local PlayerService = require(script.Parent.Services.PlayerService)
 local PitchService = require(script.Parent.Services.PitchService)
 
@@ -20,5 +21,8 @@ log("Players initialized")
 
 BallService.Initialize()
 log("Ball initialized")
+
+FootballActionService.Initialize()
+log("Football actions initialized")
 
 log("Ready")
