@@ -5,6 +5,7 @@ local RunService = game:GetService("RunService")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local GameConfig = require(Shared.Config.GameConfig)
+local AnimationController = require(script.Parent:WaitForChild("AnimationController"))
 local InputController = require(script.Parent:WaitForChild("InputController"))
 local CameraController = require(script.Parent.Parent.Camera:WaitForChild("CameraController"))
 
@@ -16,6 +17,9 @@ local gui: ScreenGui? = nil
 local autoSprintButton: TextButton? = nil
 local cameraButton: TextButton? = nil
 local cameraDistanceButton: TextButton? = nil
+local jogRateLabel: TextLabel? = nil
+local jogRateMinusButton: TextButton? = nil
+local jogRatePlusButton: TextButton? = nil
 local connections: { RBXScriptConnection } = {}
 local heldActions: { [string]: number } = {}
 local meters = {}
@@ -98,6 +102,58 @@ local function createIntensityMeter(parent: Instance, actionType: string, title:
 	}
 end
 
+local function createJogRateControl(parent: Instance, position: UDim2)
+	local container = Instance.new("Frame")
+	container.Name = "JogRateControl"
+	container.Position = position
+	container.Size = UDim2.fromOffset(300, 54)
+	container.BackgroundColor3 = Color3.fromRGB(24, 28, 34)
+	container.BackgroundTransparency = 0.12
+	container.BorderSizePixel = 0
+	container.Parent = parent
+
+	local minusButton = Instance.new("TextButton")
+	minusButton.Name = "JogRateMinusButton"
+	minusButton.Position = UDim2.fromOffset(10, 10)
+	minusButton.Size = UDim2.fromOffset(34, 34)
+	minusButton.BackgroundColor3 = Color3.fromRGB(45, 52, 61)
+	minusButton.BorderSizePixel = 0
+	minusButton.Font = Enum.Font.GothamBold
+	minusButton.Text = "-"
+	minusButton.TextColor3 = Color3.fromRGB(245, 245, 245)
+	minusButton.TextSize = 20
+	minusButton.Parent = container
+
+	local label = Instance.new("TextLabel")
+	label.Name = "JogRateLabel"
+	label.Position = UDim2.fromOffset(52, 4)
+	label.Size = UDim2.new(1, -104, 1, -8)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamSemibold
+	label.TextColor3 = Color3.fromRGB(245, 245, 245)
+	label.TextSize = 12
+	label.TextWrapped = true
+	label.TextXAlignment = Enum.TextXAlignment.Center
+	label.TextYAlignment = Enum.TextYAlignment.Center
+	label.Parent = container
+
+	local plusButton = Instance.new("TextButton")
+	plusButton.Name = "JogRatePlusButton"
+	plusButton.Position = UDim2.new(1, -44, 0, 10)
+	plusButton.Size = UDim2.fromOffset(34, 34)
+	plusButton.BackgroundColor3 = Color3.fromRGB(45, 52, 61)
+	plusButton.BorderSizePixel = 0
+	plusButton.Font = Enum.Font.GothamBold
+	plusButton.Text = "+"
+	plusButton.TextColor3 = Color3.fromRGB(245, 245, 245)
+	plusButton.TextSize = 20
+	plusButton.Parent = container
+
+	jogRateLabel = label
+	jogRateMinusButton = minusButton
+	jogRatePlusButton = plusButton
+end
+
 local function setMeterValue(actionType: string, holdDuration: number)
 	local meter = meters[actionType]
 
@@ -122,6 +178,26 @@ local function updateIntensityMeters()
 	for actionType, startedAt in heldActions do
 		setMeterValue(actionType, now - startedAt)
 	end
+end
+
+local function updateJogRateControl()
+	if not jogRateLabel then
+		return
+	end
+
+	local diagnostics = AnimationController.GetDiagnostics()
+	jogRateLabel.Text = string.format(
+		"JOG RATE %.2fx\nSPD %.1f  BASE %.2f  PLAY %.2f",
+		AnimationController.GetJogPlaybackMultiplier(),
+		diagnostics.HorizontalSpeed or 0,
+		diagnostics.BasePlaybackRate or 0,
+		diagnostics.FinalPlaybackRate or 0
+	)
+end
+
+local function updateDevelopmentMeters()
+	updateIntensityMeters()
+	updateJogRateControl()
 end
 
 local function onFootballAction(action)
@@ -191,6 +267,7 @@ local function createGui()
 	createIntensityMeter(screenGui, "GroundPass", "PASS INTENSITY", UDim2.fromOffset(16, 148))
 	createIntensityMeter(screenGui, "ThroughPass", "THROUGH INTENSITY", UDim2.fromOffset(16, 200))
 	createIntensityMeter(screenGui, "KnockOn", "KNOCK-ON INTENSITY", UDim2.fromOffset(16, 252))
+	createJogRateControl(screenGui, UDim2.fromOffset(16, 304))
 
 	table.insert(connections, autoSprintButton.Activated:Connect(function()
 		InputController.ToggleAutoSprint()
@@ -202,10 +279,18 @@ local function createGui()
 		CameraController.CycleBroadcastDistancePreset()
 		updateCameraDistanceButton()
 	end))
+	table.insert(connections, jogRateMinusButton.Activated:Connect(function()
+		AnimationController.AdjustJogPlaybackMultiplier(-AnimationController.GetJogPlaybackMultiplierStep())
+		updateJogRateControl()
+	end))
+	table.insert(connections, jogRatePlusButton.Activated:Connect(function()
+		AnimationController.AdjustJogPlaybackMultiplier(AnimationController.GetJogPlaybackMultiplierStep())
+		updateJogRateControl()
+	end))
 	table.insert(connections, InputController.GetAutoSprintChangedEvent().Event:Connect(updateAutoSprintButton))
 	table.insert(connections, CameraController.GetModeChangedEvent().Event:Connect(updateCameraButton))
 	table.insert(connections, InputController.GetFootballActionEvent().Event:Connect(onFootballAction))
-	table.insert(connections, RunService.RenderStepped:Connect(updateIntensityMeters))
+	table.insert(connections, RunService.RenderStepped:Connect(updateDevelopmentMeters))
 
 	setMeterValue("GroundPass", 0)
 	setMeterValue("ThroughPass", 0)
@@ -213,6 +298,7 @@ local function createGui()
 	updateAutoSprintButton()
 	updateCameraButton()
 	updateCameraDistanceButton()
+	updateJogRateControl()
 end
 
 function DevelopmentHUDController.Initialize()
@@ -246,6 +332,9 @@ function DevelopmentHUDController.Destroy()
 	autoSprintButton = nil
 	cameraButton = nil
 	cameraDistanceButton = nil
+	jogRateLabel = nil
+	jogRateMinusButton = nil
+	jogRatePlusButton = nil
 	table.clear(meters)
 end
 
