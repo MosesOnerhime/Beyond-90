@@ -118,6 +118,7 @@ local function scaleCharacterToHeight(character: Model, targetHeight: number, la
 		return nil, nil
 	end
 
+	character:SetAttribute("Beyond90SourceBodyHeightStuds", measuredHeight)
 	local scaleFactor = targetHeight / measuredHeight
 
 	if math.abs(scaleFactor - 1) <= 0.005 then

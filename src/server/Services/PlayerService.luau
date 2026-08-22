@@ -1,5 +1,6 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local GameConfig = require(Shared.Config.GameConfig)
@@ -16,9 +17,14 @@ local sprintRemote: RemoteEvent? = nil
 local playerConnections: { [Player]: { RBXScriptConnection } } = {}
 local sprintStateByPlayer: { [Player]: boolean } = {}
 local configuredHumanoids: { [Humanoid]: boolean } = {}
+local developmentSpawnCharacterYOffset = 4
 
 local function warnLog(message: string)
 	warn(string.format("%s[Server][PlayerService] %s", GameConfig.LogPrefix, message))
+end
+
+local function log(message: string)
+	print(string.format("%s[Server][PlayerService] %s", GameConfig.LogPrefix, message))
 end
 
 local function getOrCreateFolder(parent: Instance, name: string): Folder
@@ -98,7 +104,270 @@ local function placeCharacterAtDevelopmentSpawn(character: Model, spawnLocation:
 		return
 	end
 
-	character:PivotTo(spawnLocation.CFrame + Vector3.new(0, 4, 0))
+	character:PivotTo(spawnLocation.CFrame + Vector3.new(0, developmentSpawnCharacterYOffset, 0))
+end
+
+local function normalizeCharacterPhysics(character: Model)
+	local unanchoredCount = 0
+	local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+
+	for _, descendant in character:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			if descendant.Anchored then
+				descendant.Anchored = false
+				unanchoredCount += 1
+			end
+		end
+	end
+
+	if humanoidRootPart and humanoidRootPart:IsA("BasePart") then
+		humanoidRootPart.CanCollide = false
+	end
+
+	if unanchoredCount > 0 then
+		warnLog(string.format(
+			"Unanchored %d StarterCharacter part(s) for Humanoid movement compatibility",
+			unanchoredCount
+		))
+	end
+end
+
+local function getPitchGroundY(spawnLocation: SpawnLocation): number
+	return spawnLocation.Position.Y - spawnLocation.Size.Y / 2
+end
+
+local function getPartBottomY(character: Model, partName: string): number?
+	local part = character:FindFirstChild(partName)
+
+	if not part or not part:IsA("BasePart") then
+		return nil
+	end
+
+	return part.Position.Y - part.Size.Y / 2
+end
+
+local function getLowestFootBottomY(character: Model): number?
+	local leftFootBottomY = getPartBottomY(character, "LeftFoot")
+	local rightFootBottomY = getPartBottomY(character, "RightFoot")
+
+	if leftFootBottomY and rightFootBottomY then
+		return math.min(leftFootBottomY, rightFootBottomY)
+	end
+
+	return leftFootBottomY or rightFootBottomY
+end
+
+local function getGroundingConfig()
+	return PlayerConfig.Appearance.Grounding or {}
+end
+
+local function updateGroundingAttributes(
+	character: Model,
+	humanoid: Humanoid,
+	spawnLocation: SpawnLocation,
+	phase: string,
+	hipAdjustment: number
+)
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+	local groundY = getPitchGroundY(spawnLocation)
+	local leftFootBottomY = getPartBottomY(character, "LeftFoot")
+	local rightFootBottomY = getPartBottomY(character, "RightFoot")
+	local lowestFootBottomY = getLowestFootBottomY(character)
+	local footGroundError = if lowestFootBottomY then lowestFootBottomY - groundY else nil
+	local groundingConfig = getGroundingConfig()
+	local targetClearance = groundingConfig.TargetFootClearanceStuds or 0
+	local clearanceError = if footGroundError then footGroundError - targetClearance else nil
+
+	character:SetAttribute("Beyond90CharacterHeight", character:GetAttribute("Beyond90MeasuredBodyHeightStuds"))
+	character:SetAttribute("Beyond90HipHeight", humanoid.HipHeight)
+	character:SetAttribute("Beyond90PitchGroundY", groundY)
+	character:SetAttribute("Beyond90RootY", if rootPart and rootPart:IsA("BasePart") then rootPart.Position.Y else -1)
+	character:SetAttribute("Beyond90LeftFootBottomY", leftFootBottomY or -1)
+	character:SetAttribute("Beyond90RightFootBottomY", rightFootBottomY or -1)
+	character:SetAttribute("Beyond90FootGroundError", footGroundError or 0)
+	character:SetAttribute("Beyond90HipHeightAdjustment", hipAdjustment)
+	character:SetAttribute("Beyond90TargetFootClearance", targetClearance)
+	character:SetAttribute("Beyond90FootClearanceError", clearanceError or 0)
+
+	if phase ~= "waiting-settle" then
+		log(string.format(
+			"Grounding phase=%s height=%.2f hipHeight=%.3f rootY=%.3f groundY=%.3f targetClearance=%.3f leftFootBottomY=%.3f rightFootBottomY=%.3f lowestClearance=%.3f clearanceError=%.3f hipAdjustment=%.3f",
+			phase,
+			character:GetAttribute("Beyond90MeasuredBodyHeightStuds") or -1,
+			humanoid.HipHeight,
+			if rootPart and rootPart:IsA("BasePart") then rootPart.Position.Y else -1,
+			groundY,
+			targetClearance,
+			leftFootBottomY or -1,
+			rightFootBottomY or -1,
+			footGroundError or 0,
+			clearanceError or 0,
+			hipAdjustment
+		))
+	end
+end
+
+local function isCharacterStillAtSpawnPivot(character: Model, spawnLocation: SpawnLocation): boolean
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+	local spawnPivotY = spawnLocation.Position.Y + developmentSpawnCharacterYOffset
+
+	return rootPart ~= nil
+		and rootPart:IsA("BasePart")
+		and math.abs(rootPart.Position.Y - spawnPivotY) <= 0.05
+end
+
+local function applyCharacterGroundingCalibration(
+	character: Model,
+	humanoid: Humanoid,
+	spawnLocation: SpawnLocation,
+	phase: string,
+	canAdjust: boolean,
+	maxCorrectionOverride: number?
+)
+	local groundY = getPitchGroundY(spawnLocation)
+	local lowestFootBottomY = getLowestFootBottomY(character)
+
+	if not lowestFootBottomY then
+		updateGroundingAttributes(character, humanoid, spawnLocation, "missing-foot", 0)
+		return
+	end
+
+	local groundingConfig = getGroundingConfig()
+	local targetClearance = groundingConfig.TargetFootClearanceStuds or 0
+	local desiredLowestFootBottomY = groundY + targetClearance
+	local correction = desiredLowestFootBottomY - lowestFootBottomY
+	local tolerance = groundingConfig.FootGroundToleranceStuds or 0.04
+	local maxCorrection = maxCorrectionOverride or groundingConfig.MaxHipHeightCorrectionStuds or 0.25
+	local hipAdjustment = 0
+
+	if canAdjust and math.abs(correction) > tolerance then
+		hipAdjustment = math.clamp(correction, -maxCorrection, maxCorrection)
+		humanoid.HipHeight = math.max(0, humanoid.HipHeight + hipAdjustment)
+		RunService.Heartbeat:Wait()
+	end
+
+	local resultPhase = phase
+
+	if canAdjust and math.abs(hipAdjustment) <= 0 then
+		resultPhase = "accepted"
+	end
+
+	updateGroundingAttributes(
+		character,
+		humanoid,
+		spawnLocation,
+		resultPhase,
+		hipAdjustment
+	)
+end
+
+local function scheduleGroundingCalibration(
+	character: Model,
+	humanoid: Humanoid,
+	spawnLocation: SpawnLocation,
+	delaySeconds: number,
+	attempt: number
+)
+	task.delay(delaySeconds, function()
+		if not character.Parent or not humanoid.Parent then
+			return
+		end
+
+		local groundingConfig = getGroundingConfig()
+		local maxSettleRetries = groundingConfig.MaxSettleRetries or 0
+
+		if isCharacterStillAtSpawnPivot(character, spawnLocation) and attempt <= maxSettleRetries then
+			updateGroundingAttributes(character, humanoid, spawnLocation, "waiting-settle", 0)
+			scheduleGroundingCalibration(
+				character,
+				humanoid,
+				spawnLocation,
+				groundingConfig.SettleRetryDelaySeconds or 1,
+				attempt + 1
+			)
+			return
+		end
+
+		if character:GetAttribute("Beyond90GroundingCalibrated") then
+			return
+		end
+
+		character:SetAttribute("Beyond90GroundingCalibrated", true)
+		applyCharacterGroundingCalibration(character, humanoid, spawnLocation, "calibrated", true)
+	end)
+end
+
+local function scheduleGroundingValidation(
+	character: Model,
+	humanoid: Humanoid,
+	spawnLocation: SpawnLocation,
+	delaySeconds: number,
+	phase: string,
+	canAdjust: boolean,
+	maxCorrectionOverride: number?
+)
+	task.delay(delaySeconds, function()
+		if character.Parent and humanoid.Parent then
+			applyCharacterGroundingCalibration(
+				character,
+				humanoid,
+				spawnLocation,
+				phase,
+				canAdjust,
+				maxCorrectionOverride
+			)
+		end
+	end)
+end
+
+local function scheduleSettledGrounding(character: Model, humanoid: Humanoid, spawnLocation: SpawnLocation)
+	local groundingConfig = getGroundingConfig()
+
+	scheduleGroundingCalibration(
+		character,
+		humanoid,
+		spawnLocation,
+		groundingConfig.CalibrationDelaySeconds or 2,
+		0
+	)
+
+	scheduleGroundingValidation(
+		character,
+		humanoid,
+		spawnLocation,
+		groundingConfig.ValidationDelaySeconds or 5,
+		"late-calibrated",
+		groundingConfig.ValidationCanAdjust == true,
+		groundingConfig.MaxLateHipHeightCorrectionStuds
+	)
+
+	scheduleGroundingValidation(
+		character,
+		humanoid,
+		spawnLocation,
+		groundingConfig.FinalValidationDelaySeconds or 7,
+		"final-validation",
+		false,
+		nil
+	)
+end
+
+local function removeBundledAnimateScripts(character: Model)
+	local removedCount = 0
+
+	for _, child in character:GetChildren() do
+		if child:IsA("LocalScript") and child.Name == "Animate" then
+			child:Destroy()
+			removedCount += 1
+		end
+	end
+
+	if removedCount > 0 then
+		warnLog(string.format(
+			"Removed %d bundled Animate script(s); Beyond90 AnimationController owns character animation",
+			removedCount
+		))
+	end
 end
 
 local function configureCharacter(player: Player, character: Model, spawnLocation: SpawnLocation)
@@ -111,9 +380,12 @@ local function configureCharacter(player: Player, character: Model, spawnLocatio
 		return
 	end
 
+	removeBundledAnimateScripts(character)
 	CharacterAppearanceService.StandardizeCharacter(player, character, humanoid)
+	normalizeCharacterPhysics(character)
 	placeCharacterAtDevelopmentSpawn(character, spawnLocation)
 	applyMovementSettings(player, humanoid)
+	scheduleSettledGrounding(character, humanoid, spawnLocation)
 
 	if not configuredHumanoids[humanoid] then
 		configuredHumanoids[humanoid] = true
