@@ -10,6 +10,8 @@ local GameConfig = require(Shared.Config.GameConfig)
 local PlayerConfig = require(Shared.Config.PlayerConfig)
 
 local Controllers = script.Parent
+local ControlledBallController = require(Controllers:WaitForChild("ControlledBallController"))
+local FootballActionController = require(Controllers:WaitForChild("FootballActionController"))
 local MovementController = require(Controllers:WaitForChild("MovementController"))
 
 local AnimationController = {}
@@ -17,9 +19,15 @@ local AnimationController = {}
 local localPlayer = Players.LocalPlayer
 local idleConfig = AnimationConfig.Locomotion.Idle
 local jogConfig = AnimationConfig.Locomotion.Jog
+local sprintConfig = AnimationConfig.Locomotion.Sprint
+local directionChangeConfig = AnimationConfig.Locomotion.DirectionChange
+local blendConfig = AnimationConfig.Blend
+local jumpConfig = AnimationConfig.Jump
+local passConfig = AnimationConfig.Pass
+local shootConfig = AnimationConfig.Shoot
+local receptionConfig = AnimationConfig.Reception
 local groundingConfig = PlayerConfig.Appearance.Grounding or {}
-local idleAnimationId = AnimationConfig.Assets.Locomotion.OffBall.Idle
-local offBallJogAnimationId = AnimationConfig.Assets.Locomotion.OffBall.JogForward
+local assets = AnimationConfig.Assets
 
 local initialized = false
 local currentCharacter: Model? = nil
@@ -30,32 +38,52 @@ local renderConnection: RBXScriptConnection? = nil
 local appConnections: { RBXScriptConnection } = {}
 local characterConnections: { RBXScriptConnection } = {}
 local cachedBall: BasePart? = nil
+local activeTracks = {}
+local disabledAnimateScripts = {}
 local currentState = "Default"
+local currentLocomotionFamily = "Default"
+local currentDirection = "Forward"
+local currentSprintTurn = "Forward"
 local currentPlaybackRate = 0
 local currentBasePlaybackRate = 0
 local jogPlaybackMultiplier = jogConfig.JogPlaybackMultiplier
-local sprintFallbackActive = false
+local sprintActive = false
+local previousDesiredDirection: Vector3? = nil
+local lastDirectionChangeAt = -math.huge
+local activeAction = ""
+local activeActionUntil = 0
+local activeActionExitAt = 0
+local activeActionExitStarted = false
+local desiredBaseState = "Idle"
+local locomotionVisualActive = false
+local jumpWasAirborne = false
+local lastObservedControlEpoch: number? = nil
+local directionChangeAudit = nil
 local warnedHighPlayback = false
-local activeTracks = {}
-local disabledAnimateScripts = {}
+local jogWeights = {}
+local sprintWeights = {}
 local groundingSamples = {}
 local previousFootSample = nil
 local diagnostics = {
 	State = "Default",
+	BaseState = "Default",
+	Action = "",
+	ActionExitTarget = "",
+	LocomotionFamily = "Default",
+	Direction = "Forward",
+	MovementAngle = 0,
 	HorizontalSpeed = 0,
 	BasePlaybackRate = 0,
 	JogPlaybackMultiplier = jogConfig.JogPlaybackMultiplier,
 	FinalPlaybackRate = 0,
 	HasBall = false,
 	SprintRequested = false,
+	SprintTurn = "Forward",
+	SprintTurnAngle = 0,
 	TrackPlaying = false,
 	TrackLoaded = false,
-	Asset = idleAnimationId,
 	IsPlaceholder = false,
-	IdleLength = 0,
-	IdleWeight = 0,
-	JogLength = 0,
-	JogWeight = 0,
+	JogWeights = {},
 }
 
 local function log(message: string)
@@ -74,213 +102,17 @@ local function groundingLog(message: string)
 	end
 end
 
-local function createGroundingBucket()
-	return {
-		StartedAt = 0,
-		Count = 0,
-		Min = math.huge,
-		Max = -math.huge,
-		Sum = 0,
-		Reported = false,
-	}
-end
-
-local function resetGroundingDiagnostics()
-	table.clear(groundingSamples)
-	groundingSamples.Idle = createGroundingBucket()
-	groundingSamples.Jog = createGroundingBucket()
-	previousFootSample = nil
-end
-
-local function getGroundingStateKey(state: string): string?
-	if state == "Idle" then
-		return "Idle"
-	end
-
-	if state == "OffBallJog" or state == "BallJog" or state == "BallJogPlaceholder" then
-		return "Jog"
-	end
-
-	return nil
-end
-
-local function getCharacterGroundY(character: Model): number?
-	local groundY = character:GetAttribute("Beyond90PitchGroundY")
-
-	if typeof(groundY) == "number" then
-		return groundY
-	end
-
-	return nil
-end
-
-local function getFootBottomY(character: Model, footName: string): number?
-	local foot = character:FindFirstChild(footName)
-
-	if not foot or not foot:IsA("BasePart") then
-		return nil
-	end
-
-	return foot.Position.Y - foot.Size.Y / 2
-end
-
-local function chooseContactClearance(
-	leftClearance: number?,
-	rightClearance: number?,
-	leftVelocityY: number,
-	rightVelocityY: number
-): number?
-	if leftClearance and not rightClearance then
-		return leftClearance
-	end
-
-	if rightClearance and not leftClearance then
-		return rightClearance
-	end
-
-	if not leftClearance or not rightClearance then
-		return nil
-	end
-
-	local velocityThreshold = groundingConfig.ContactFootVerticalVelocityThreshold or 1.5
-	local leftStable = math.abs(leftVelocityY) <= velocityThreshold
-	local rightStable = math.abs(rightVelocityY) <= velocityThreshold
-	local targetClearance = groundingConfig.TargetFootClearanceStuds or 0
-
-	if leftStable and not rightStable and leftClearance <= rightClearance + targetClearance then
-		return leftClearance
-	end
-
-	if rightStable and not leftStable and rightClearance <= leftClearance + targetClearance then
-		return rightClearance
-	end
-
-	if leftStable and rightStable then
-		if math.abs(leftClearance - targetClearance) <= math.abs(rightClearance - targetClearance) then
-			return leftClearance
-		end
-
-		return rightClearance
-	end
-
-	return math.min(leftClearance, rightClearance)
-end
-
-local function writeGroundingSummaryAttributes(stateKey: string, minClearance: number, averageClearance: number, maxClearance: number)
-	local prefix = if stateKey == "Idle" then "Beyond90GroundingIdle" else "Beyond90GroundingJog"
-
-	localPlayer:SetAttribute(prefix .. "MinContactClearance", minClearance)
-	localPlayer:SetAttribute(prefix .. "AverageContactClearance", averageClearance)
-	localPlayer:SetAttribute(prefix .. "MaxContactClearance", maxClearance)
-	localPlayer:SetAttribute("Beyond90GroundingTargetClearance", groundingConfig.TargetFootClearanceStuds or 0)
-end
-
-local function reportGroundingBucket(stateKey: string, bucket)
-	local character = currentCharacter
-	local humanoid = currentHumanoid
-
-	if not character or not humanoid or bucket.Count <= 0 then
-		return
-	end
-
-	local targetClearance = groundingConfig.TargetFootClearanceStuds or 0
-	local averageClearance = bucket.Sum / bucket.Count
-	local floatTolerance = groundingConfig.DiagnosticFloatToleranceStuds or 0.18
-	local result = "accepted"
-
-	if bucket.Min < -0.02 then
-		result = "penetrating"
-	elseif averageClearance > targetClearance + floatTolerance then
-		result = "floating"
-	end
-
-	writeGroundingSummaryAttributes(stateKey, bucket.Min, averageClearance, bucket.Max)
-
-	groundingLog(string.format(
-		"state=%s height=%.2f hipHeight=%.3f targetClearance=%.3f contactMin=%.3f contactAvg=%.3f contactMax=%.3f samples=%d result=%s",
-		string.lower(stateKey),
-		character:GetAttribute("Beyond90CharacterHeight") or character:GetAttribute("Beyond90MeasuredBodyHeightStuds") or -1,
-		humanoid.HipHeight,
-		targetClearance,
-		bucket.Min,
-		averageClearance,
-		bucket.Max,
-		bucket.Count,
-		result
-	))
-end
-
-local function sampleGrounding(state: string)
-	local stateKey = getGroundingStateKey(state)
-	local character = currentCharacter
-	local humanoid = currentHumanoid
-
-	if not stateKey or not character or not humanoid then
-		return
-	end
-
-	local groundY = getCharacterGroundY(character)
-
-	if not groundY then
-		return
-	end
-
-	local leftBottomY = getFootBottomY(character, "LeftFoot")
-	local rightBottomY = getFootBottomY(character, "RightFoot")
-
-	if not leftBottomY and not rightBottomY then
-		return
-	end
-
-	local now = os.clock()
-	local previous = previousFootSample
-	previousFootSample = {
-		Time = now,
-		LeftBottomY = leftBottomY,
-		RightBottomY = rightBottomY,
-	}
-
-	if not previous then
-		return
-	end
-
-	local dt = math.max(now - previous.Time, 1 / 240)
-	local leftVelocityY = if leftBottomY and previous.LeftBottomY then (leftBottomY - previous.LeftBottomY) / dt else math.huge
-	local rightVelocityY = if rightBottomY and previous.RightBottomY then (rightBottomY - previous.RightBottomY) / dt else math.huge
-	local leftClearance = if leftBottomY then leftBottomY - groundY else nil
-	local rightClearance = if rightBottomY then rightBottomY - groundY else nil
-	local contactClearance = chooseContactClearance(leftClearance, rightClearance, leftVelocityY, rightVelocityY)
-
-	if not contactClearance then
-		return
-	end
-
-	local bucket = groundingSamples[stateKey]
-
-	if not bucket or bucket.Reported then
-		return
-	end
-
-	if bucket.Count == 0 then
-		bucket.StartedAt = now
-	end
-
-	bucket.Count += 1
-	bucket.Sum += contactClearance
-	bucket.Min = math.min(bucket.Min, contactClearance)
-	bucket.Max = math.max(bucket.Max, contactClearance)
-
-	local sampleSeconds = groundingConfig.DiagnosticSampleSeconds or 2.5
-	local minSamples = groundingConfig.DiagnosticMinSamples or 30
-
-	if bucket.Count >= minSamples and now - bucket.StartedAt >= sampleSeconds then
-		bucket.Reported = true
-		reportGroundingBucket(stateKey, bucket)
-	end
-end
-
 local function getHorizontal(vector: Vector3): Vector3
 	return Vector3.new(vector.X, 0, vector.Z)
+end
+
+local function getYaw(cframe: CFrame): number
+	local look = cframe.LookVector
+	return math.deg(math.atan2(-look.X, -look.Z))
+end
+
+local function getWrappedAngleDelta(fromAngle: number, toAngle: number): number
+	return (toAngle - fromAngle + 180) % 360 - 180
 end
 
 local function getFootball(): BasePart?
@@ -303,304 +135,243 @@ end
 
 local function hasLocalPossession(): boolean
 	local ball = getFootball()
-
 	return ball ~= nil
 		and ball:GetAttribute("State") == "Controlled"
 		and ball:GetAttribute("ControllerUserId") == localPlayer.UserId
+end
+
+local function createGroundingBucket()
+	return { StartedAt = 0, Count = 0, Min = math.huge, Max = -math.huge, Sum = 0, Reported = false }
+end
+
+local function resetGroundingDiagnostics()
+	table.clear(groundingSamples)
+	groundingSamples.Idle = createGroundingBucket()
+	groundingSamples.Jog = createGroundingBucket()
+	previousFootSample = nil
+end
+
+local function getGroundingStateKey(state: string): string?
+	if state == "Idle" then
+		return "Idle"
+	end
+
+	if string.find(state, "Jog", 1, true) then
+		return "Jog"
+	end
+
+	return nil
+end
+
+local function getFootBottomY(character: Model, footName: string): number?
+	local foot = character:FindFirstChild(footName)
+	if not foot or not foot:IsA("BasePart") then
+		return nil
+	end
+	return foot.Position.Y - foot.Size.Y / 2
+end
+
+local function chooseContactClearance(left: number?, right: number?, leftVelocityY: number, rightVelocityY: number): number?
+	if left and not right then
+		return left
+	elseif right and not left then
+		return right
+	elseif not left or not right then
+		return nil
+	end
+
+	local threshold = groundingConfig.ContactFootVerticalVelocityThreshold or 1.5
+	local leftStable = math.abs(leftVelocityY) <= threshold
+	local rightStable = math.abs(rightVelocityY) <= threshold
+	local target = groundingConfig.TargetFootClearanceStuds or 0
+
+	if leftStable and not rightStable then
+		return left
+	elseif rightStable and not leftStable then
+		return right
+	elseif leftStable and rightStable then
+		return if math.abs(left - target) <= math.abs(right - target) then left else right
+	end
+
+	return math.min(left, right)
+end
+
+local function reportGroundingBucket(stateKey: string, bucket)
+	local character = currentCharacter
+	local humanoid = currentHumanoid
+	if not character or not humanoid or bucket.Count <= 0 then
+		return
+	end
+
+	local average = bucket.Sum / bucket.Count
+	local target = groundingConfig.TargetFootClearanceStuds or 0
+	local result = if bucket.Min < -0.02 then "penetrating" else "accepted"
+	local prefix = if stateKey == "Idle" then "Beyond90GroundingIdle" else "Beyond90GroundingJog"
+	localPlayer:SetAttribute(prefix .. "MinContactClearance", bucket.Min)
+	localPlayer:SetAttribute(prefix .. "AverageContactClearance", average)
+	localPlayer:SetAttribute(prefix .. "MaxContactClearance", bucket.Max)
+	groundingLog(string.format(
+		"state=%s height=%.2f hipHeight=%.3f groundY=%.3f floorDistance=%.3f targetClearance=%.3f contactMin=%.3f contactAvg=%.3f contactMax=%.3f samples=%d result=%s",
+		string.lower(stateKey),
+		character:GetAttribute("Beyond90CharacterHeight") or -1,
+		humanoid.HipHeight,
+		character:GetAttribute("Beyond90PitchGroundY") or -1,
+		character:GetAttribute("Beyond90FloorDistance") or -1,
+		target,
+		bucket.Min,
+		average,
+		bucket.Max,
+		bucket.Count,
+		result
+	))
+end
+
+local function sampleGrounding(state: string)
+	local stateKey = getGroundingStateKey(state)
+	local character = currentCharacter
+	if not stateKey or not character then
+		return
+	end
+
+	local groundY = character:GetAttribute("Beyond90PitchGroundY")
+	if typeof(groundY) ~= "number" then
+		return
+	end
+
+	local leftBottomY = getFootBottomY(character, "LeftFoot")
+	local rightBottomY = getFootBottomY(character, "RightFoot")
+	local now = os.clock()
+	local previous = previousFootSample
+	previousFootSample = { Time = now, Left = leftBottomY, Right = rightBottomY }
+	if not previous then
+		return
+	end
+
+	local dt = math.max(now - previous.Time, 1 / 240)
+	local leftVelocityY = if leftBottomY and previous.Left then (leftBottomY - previous.Left) / dt else math.huge
+	local rightVelocityY = if rightBottomY and previous.Right then (rightBottomY - previous.Right) / dt else math.huge
+	local clearance = chooseContactClearance(
+		if leftBottomY then leftBottomY - groundY else nil,
+		if rightBottomY then rightBottomY - groundY else nil,
+		leftVelocityY,
+		rightVelocityY
+	)
+	local bucket = groundingSamples[stateKey]
+	if not clearance or not bucket or bucket.Reported then
+		return
+	end
+
+	if bucket.Count == 0 then
+		bucket.StartedAt = now
+	end
+	bucket.Count += 1
+	bucket.Sum += clearance
+	bucket.Min = math.min(bucket.Min, clearance)
+	bucket.Max = math.max(bucket.Max, clearance)
+
+	if bucket.Count >= (groundingConfig.DiagnosticMinSamples or 30)
+		and now - bucket.StartedAt >= (groundingConfig.DiagnosticSampleSeconds or 2.5)
+	then
+		bucket.Reported = true
+		reportGroundingBucket(stateKey, bucket)
+	end
 end
 
 local function disconnectCharacterConnections()
 	for _, connection in characterConnections do
 		connection:Disconnect()
 	end
-
 	table.clear(characterConnections)
-end
-
-local function stopTrack(slot: string, fadeTime: number?)
-	local record = activeTracks[slot]
-	local track = record and record.Track
-
-	if track and track.IsPlaying then
-		track:Stop(fadeTime or jogConfig.FadeOutTime)
-	end
-end
-
-local function stopAllCustomTracks(fadeTime: number?)
-	stopTrack("Idle", fadeTime or idleConfig.FadeOutTime)
-	stopTrack("Jog", fadeTime or jogConfig.FadeOutTime)
-end
-
-local function destroyTracks()
-	stopAllCustomTracks(0)
-
-	for _, record in activeTracks do
-		if record.Track then
-			record.Track:Destroy()
-		end
-
-		if record.Animation then
-			record.Animation:Destroy()
-		end
-	end
-
-	table.clear(activeTracks)
-end
-
-local function disableBundledAnimateScripts(character: Model)
-	if not AnimationConfig.Authority.DisableDefaultAnimate then
-		return
-	end
-
-	table.clear(disabledAnimateScripts)
-
-	for _, descendant in character:GetDescendants() do
-		if descendant:IsA("LocalScript") and descendant.Name == "Animate" then
-			descendant.Enabled = false
-			table.insert(disabledAnimateScripts, descendant)
-		end
-	end
-
-	if #disabledAnimateScripts > 0 then
-		log(string.format("Disabled %d bundled Animate script(s); Beyond90 AnimationController is animation authority.", #disabledAnimateScripts))
-	end
-end
-
-local function getBallJogAnimationId(): string?
-	local ballJog = AnimationConfig.Assets.Locomotion.Ball.JogForward
-
-	if typeof(ballJog) == "string" and ballJog ~= "" then
-		return ballJog
-	end
-
-	return nil
-end
-
-local function getDesiredJogPresentation(hasBall: boolean): (string, string, string, boolean)
-	if hasBall then
-		local ballJogAnimationId = getBallJogAnimationId()
-
-		if ballJogAnimationId then
-			return "BallJog", ballJogAnimationId, "B90_LOC_Ball_Jog_F", false
-		end
-
-		return "BallJogPlaceholder", offBallJogAnimationId, "B90_LOC_OffBall_Jog_F", true
-	end
-
-	return "OffBallJog", offBallJogAnimationId, "B90_LOC_OffBall_Jog_F", false
-end
-
-local function setPlayerDiagnostics(
-	state: string,
-	speed: number,
-	basePlaybackRate: number,
-	finalPlaybackRate: number,
-	hasBall: boolean,
-	sprintRequested: boolean,
-	localForward: number,
-	localRight: number,
-	assetId: string,
-	isPlaceholder: boolean
-)
-	local idleRecord = activeTracks.Idle
-	local jogRecord = activeTracks.Jog
-	local idlePlaying = idleRecord and idleRecord.Track and idleRecord.Track.IsPlaying
-	local jogPlaying = jogRecord and jogRecord.Track and jogRecord.Track.IsPlaying
-	local idleLoaded = idleRecord and idleRecord.Track and idleRecord.Track.Length > 0
-	local jogLoaded = jogRecord and jogRecord.Track and jogRecord.Track.Length > 0
-	local idleLength = if idleRecord and idleRecord.Track then idleRecord.Track.Length else 0
-	local jogLength = if jogRecord and jogRecord.Track then jogRecord.Track.Length else 0
-	local idleWeight = if idleRecord and idleRecord.Track then idleRecord.Track.WeightCurrent else 0
-	local jogWeight = if jogRecord and jogRecord.Track then jogRecord.Track.WeightCurrent else 0
-
-	diagnostics.State = state
-	diagnostics.HorizontalSpeed = speed
-	diagnostics.BasePlaybackRate = basePlaybackRate
-	diagnostics.JogPlaybackMultiplier = jogPlaybackMultiplier
-	diagnostics.FinalPlaybackRate = finalPlaybackRate
-	diagnostics.HasBall = hasBall
-	diagnostics.SprintRequested = sprintRequested
-	diagnostics.TrackPlaying = idlePlaying or jogPlaying or false
-	diagnostics.TrackLoaded = idleLoaded or jogLoaded or false
-	diagnostics.Asset = assetId
-	diagnostics.IsPlaceholder = isPlaceholder
-	diagnostics.IdleLength = idleLength
-	diagnostics.IdleWeight = idleWeight
-	diagnostics.JogLength = jogLength
-	diagnostics.JogWeight = jogWeight
-
-	localPlayer:SetAttribute("Beyond90AnimationState", state)
-	localPlayer:SetAttribute("Beyond90AnimationSpeed", speed)
-	localPlayer:SetAttribute("Beyond90AnimationPlaybackRate", finalPlaybackRate)
-	localPlayer:SetAttribute("Beyond90AnimationBasePlaybackRate", basePlaybackRate)
-	localPlayer:SetAttribute("Beyond90JogPlaybackMultiplier", jogPlaybackMultiplier)
-	localPlayer:SetAttribute("Beyond90AnimationAsset", assetId)
-	localPlayer:SetAttribute("Beyond90AnimationTrackPlaying", diagnostics.TrackPlaying)
-	localPlayer:SetAttribute("Beyond90AnimationTrackLoaded", diagnostics.TrackLoaded)
-	localPlayer:SetAttribute("Beyond90AnimationIdleLength", idleLength)
-	localPlayer:SetAttribute("Beyond90AnimationIdleWeight", idleWeight)
-	localPlayer:SetAttribute("Beyond90AnimationJogLength", jogLength)
-	localPlayer:SetAttribute("Beyond90AnimationJogWeight", jogWeight)
-	localPlayer:SetAttribute("Beyond90AnimationHasBall", hasBall)
-	localPlayer:SetAttribute("Beyond90AnimationSprintRequested", sprintRequested)
-	localPlayer:SetAttribute("Beyond90AnimationIsPlaceholder", isPlaceholder)
-	localPlayer:SetAttribute("Beyond90AnimationLocalForward", localForward)
-	localPlayer:SetAttribute("Beyond90AnimationLocalRight", localRight)
-	localPlayer:SetAttribute("Beyond90AnimationAuthority", "Beyond90")
-	localPlayer:SetAttribute(
-		"Beyond90DefaultAnimateDisabled",
-		AnimationConfig.Authority.DisableDefaultAnimate
-			and (#disabledAnimateScripts > 0 or (currentCharacter ~= nil and currentCharacter:FindFirstChild("Animate") == nil))
-	)
-end
-
-local function setState(
-	state: string,
-	speed: number,
-	basePlaybackRate: number,
-	finalPlaybackRate: number,
-	hasBall: boolean,
-	sprintRequested: boolean,
-	localForward: number,
-	localRight: number,
-	assetId: string,
-	isPlaceholder: boolean
-)
-	if state == currentState then
-		setPlayerDiagnostics(
-			state,
-			speed,
-			basePlaybackRate,
-			finalPlaybackRate,
-			hasBall,
-			sprintRequested,
-			localForward,
-			localRight,
-			assetId,
-			isPlaceholder
-		)
-		sampleGrounding(state)
-		return
-	end
-
-	currentState = state
-	setPlayerDiagnostics(
-		state,
-		speed,
-		basePlaybackRate,
-		finalPlaybackRate,
-		hasBall,
-		sprintRequested,
-		localForward,
-		localRight,
-		assetId,
-		isPlaceholder
-	)
-	sampleGrounding(state)
-
-	if state == "Idle" then
-		log(string.format("State -> Idle speed=%.1f hasBall=%s", speed, tostring(hasBall)))
-	elseif state == "OffBallJog" or state == "BallJog" or state == "BallJogPlaceholder" then
-		log(string.format(
-			"State -> %s speed=%.1f basePlayback=%.2f multiplier=%.2f finalPlayback=%.2f hasBall=%s placeholder=%s forward=%.2f right=%.2f",
-			state,
-			speed,
-			basePlaybackRate,
-			jogPlaybackMultiplier,
-			finalPlaybackRate,
-			tostring(hasBall),
-			tostring(isPlaceholder),
-			localForward,
-			localRight
-		))
-	elseif state == "SprintFallback" then
-		log(string.format("State -> SprintFallback speed=%.1f sprintRequested=%s", speed, tostring(sprintRequested)))
-	elseif state == "AirborneFallback" then
-		log("State -> AirborneFallback")
-	else
-		log("State -> Default")
-	end
 end
 
 local function ensureAnimator(humanoid: Humanoid): Animator
 	local animator = humanoid:FindFirstChildOfClass("Animator")
-
 	if animator then
 		return animator
 	end
-
 	animator = Instance.new("Animator")
 	animator.Parent = humanoid
 	return animator
 end
 
-local function loadTrack(slot: string, animator: Animator, animationId: string, trackName: string, priority: Enum.AnimationPriority)
-	local record = activeTracks[slot]
-
-	if record and record.AnimationId == animationId and record.Track then
+local function loadTrack(slot: string, animationId: string, trackName: string, priority: Enum.AnimationPriority, looped: boolean)
+	local animator = currentAnimator
+	if not animator then
 		return
-	end
-
-	stopTrack(slot, 0)
-
-	if record then
-		if record.Track then
-			record.Track:Destroy()
-		end
-
-		if record.Animation then
-			record.Animation:Destroy()
-		end
 	end
 
 	local animation = Instance.new("Animation")
 	animation.Name = trackName
 	animation.AnimationId = animationId
-
 	local ok, result = pcall(function()
 		return animator:LoadAnimation(animation)
 	end)
-
 	if not ok or not result then
+		animation:Destroy()
 		warnLog(string.format("Could not load %s %s: %s", trackName, animationId, tostring(result)))
 		return
 	end
 
 	local track = result :: AnimationTrack
 	track.Name = trackName
-	track.Looped = true
+	track.Looped = looped
 	track.Priority = priority
-
-	activeTracks[slot] = {
-		Animation = animation,
-		AnimationId = animationId,
-		Track = track,
-	}
-
-	log(string.format("Loaded %s asset=%s priority=%s", trackName, animationId, track.Priority.Name))
-
+	activeTracks[slot] = { Animation = animation, AnimationId = animationId, Track = track }
+	log(string.format("Loaded %s asset=%s priority=%s looped=%s", trackName, animationId, priority.Name, tostring(looped)))
 	task.delay(2, function()
-		local latestRecord = activeTracks[slot]
+		local record = activeTracks[slot]
+		if record and record.Track == track then
+			localPlayer:SetAttribute("Beyond90AnimationLength" .. slot, track.Length)
 
-		if latestRecord and latestRecord.Track == track and track.Length <= 0 then
-			warnLog(string.format(
-				"%s asset=%s still reports length=0 after load; verify animation ownership, permissions, and uploaded rig compatibility.",
-				trackName,
-				animationId
-			))
+			if track.Length <= 0 then
+				warnLog(string.format("%s asset=%s still reports length=0", trackName, animationId))
+			end
 		end
 	end)
 end
 
-local function isAirborne(humanoid: Humanoid): boolean
-	local state = humanoid:GetState()
+local function stopTrack(slot: string, fadeTime: number?)
+	local record = activeTracks[slot]
+	local track = record and record.Track
+	if track and track.IsPlaying then
+		track:Stop(fadeTime or jogConfig.FadeOutTime)
+	end
+end
 
-	return state == Enum.HumanoidStateType.Freefall
-		or state == Enum.HumanoidStateType.FallingDown
-		or state == Enum.HumanoidStateType.Jumping
-		or state == Enum.HumanoidStateType.Ragdoll
-		or state == Enum.HumanoidStateType.Swimming
-		or state == Enum.HumanoidStateType.Climbing
+local function stopFamily(prefix: string, fadeTime: number)
+	for slot in activeTracks do
+		if string.sub(slot, 1, #prefix) == prefix then
+			stopTrack(slot, fadeTime)
+		end
+	end
+end
+
+local function stopLocomotion(fadeTime: number)
+	stopTrack("Idle", fadeTime)
+	stopFamily("Jog", fadeTime)
+	stopFamily("Sprint", fadeTime)
+end
+
+local function destroyTracks()
+	for slot, record in activeTracks do
+		stopTrack(slot, 0)
+		record.Track:Destroy()
+		record.Animation:Destroy()
+	end
+	table.clear(activeTracks)
+end
+
+local function disableBundledAnimateScripts(character: Model)
+	table.clear(disabledAnimateScripts)
+	if not AnimationConfig.Authority.DisableDefaultAnimate then
+		return
+	end
+	for _, descendant in character:GetDescendants() do
+		if descendant:IsA("LocalScript") and descendant.Name == "Animate" then
+			descendant.Enabled = false
+			table.insert(disabledAnimateScripts, descendant)
+		end
+	end
 end
 
 local function isCustomTrack(track: AnimationTrack): boolean
@@ -609,220 +380,624 @@ local function isCustomTrack(track: AnimationTrack): boolean
 			return true
 		end
 	end
-
 	return false
-end
-
-local function shouldSuppressPriority(priority: Enum.AnimationPriority): boolean
-	return priority == Enum.AnimationPriority.Core
-		or priority == Enum.AnimationPriority.Idle
-		or priority == Enum.AnimationPriority.Movement
 end
 
 local function suppressDefaultLocomotionTracks()
 	if not AnimationConfig.Authority.StopNonBeyond90LocomotionTracks or not currentAnimator then
 		return
 	end
-
 	for _, track in currentAnimator:GetPlayingAnimationTracks() do
-		if not isCustomTrack(track) and shouldSuppressPriority(track.Priority) then
+		if not isCustomTrack(track)
+			and (track.Priority == Enum.AnimationPriority.Core or track.Priority == Enum.AnimationPriority.Idle or track.Priority == Enum.AnimationPriority.Movement)
+		then
 			track:Stop(jogConfig.DefaultTrackFadeTime)
 		end
 	end
 end
 
-local function playTrack(slot: string, playbackRate: number, fadeTime: number)
+local function playTrack(slot: string, fadeTime: number, weight: number, speed: number)
 	local record = activeTracks[slot]
 	local track = record and record.Track
-
 	if not track then
 		return
 	end
-
-	track.Looped = true
-
 	if not track.IsPlaying then
-		track:Play(fadeTime, 1, playbackRate)
+		track:Play(fadeTime, weight, speed)
 	else
-		track:AdjustSpeed(playbackRate)
+		track:AdjustSpeed(speed)
+		track:AdjustWeight(weight, fadeTime)
 	end
+end
+
+local function isAirborne(humanoid: Humanoid): boolean
+	local state = humanoid:GetState()
+	return state == Enum.HumanoidStateType.Freefall
+		or state == Enum.HumanoidStateType.FallingDown
+		or state == Enum.HumanoidStateType.Jumping
+		or state == Enum.HumanoidStateType.Ragdoll
+		or state == Enum.HumanoidStateType.Swimming
+		or state == Enum.HumanoidStateType.Climbing
+end
+
+local function isJumpAirborne(humanoid: Humanoid): boolean
+	local state = humanoid:GetState()
+	return state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall
+end
+
+local function getLocalMovement(rootPart: BasePart, horizontalVelocity: Vector3): (number, number, number)
+	if horizontalVelocity.Magnitude <= 0.001 then
+		return 0, 0, 0
+	end
+	local direction = horizontalVelocity.Unit
+	local forward = getHorizontal(rootPart.CFrame.LookVector).Unit
+	local right = getHorizontal(rootPart.CFrame.RightVector).Unit
+	local localForward = direction:Dot(forward)
+	local localRight = direction:Dot(right)
+	return localForward, localRight, math.deg(math.atan2(localRight, localForward))
+end
+
+local function getDirectionalTargets(angle: number): { [string]: number }
+	local normalized = (angle % 360 + 360) % 360
+	local segment = normalized / 45
+	local lowerIndex = math.floor(segment) % 8 + 1
+	local upperIndex = lowerIndex % 8 + 1
+	local alpha = segment - math.floor(segment)
+	return {
+		[jogConfig.DirectionOrder[lowerIndex]] = 1 - alpha,
+		[jogConfig.DirectionOrder[upperIndex]] = alpha,
+	}
+end
+
+local function smoothWeights(current, target, responsiveness: number, deltaTime: number)
+	local alpha = 1 - math.exp(-responsiveness * deltaTime)
+	for _, direction in jogConfig.DirectionOrder do
+		current[direction] = (current[direction] or 0) + ((target[direction] or 0) - (current[direction] or 0)) * alpha
+	end
+end
+
+local function selectDominantDirection(weights): string
+	local bestDirection = currentDirection
+	local bestWeight = weights[bestDirection] or 0
+	for direction, weight in weights do
+		if weight > bestWeight + jogConfig.DominantWeightHysteresis then
+			bestDirection = direction
+			bestWeight = weight
+		end
+	end
+	currentDirection = bestDirection
+	return bestDirection
+end
+
+local function getJogPlaybackRates(speed: number): (number, number)
+	local base = speed / math.max(jogConfig.JogReferenceSpeed, 0.01)
+	local raw = base * jogPlaybackMultiplier
+	if raw >= 2 and not warnedHighPlayback then
+		warnedHighPlayback = true
+		warnLog(string.format("Jog would need %.2fx playback at speed %.1f", raw, speed))
+	end
+	return base, math.clamp(raw, jogConfig.JogMinPlaybackRate, jogConfig.JogMaxPlaybackRate)
 end
 
 local function playIdle()
-	stopTrack("Jog", jogConfig.FadeOutTime)
-	playTrack("Idle", 1, idleConfig.FadeInTime)
-	currentPlaybackRate = 1
+	stopFamily("Jog", blendConfig.LocomotionToIdle)
+	stopFamily("Sprint", blendConfig.LocomotionToIdle)
+	playTrack("Idle", blendConfig.LocomotionToIdle, 1, 1)
 	currentBasePlaybackRate = 1
-	suppressDefaultLocomotionTracks()
+	currentPlaybackRate = 1
 end
 
-local function playJog(playbackRate: number)
-	stopTrack("Idle", idleConfig.FadeOutTime)
-	playTrack("Jog", playbackRate, jogConfig.FadeInTime)
-	currentPlaybackRate = playbackRate
-	suppressDefaultLocomotionTracks()
+local function playJog(angle: number, speed: number, deltaTime: number)
+	stopTrack("Idle", blendConfig.IdleToLocomotion)
+	stopFamily("Sprint", blendConfig.SprintToJog)
+	local targets = getDirectionalTargets(angle)
+	smoothWeights(jogWeights, targets, jogConfig.WeightResponsiveness, deltaTime)
+	local baseRate, finalRate = getJogPlaybackRates(speed)
+	for _, direction in jogConfig.DirectionOrder do
+		local multiplier = jogConfig.PerDirectionPlaybackMultiplier[direction] or 1
+		playTrack("Jog" .. direction, blendConfig.JogDirectional, jogWeights[direction] or 0, finalRate * multiplier)
+	end
+	currentBasePlaybackRate = baseRate
+	currentPlaybackRate = finalRate
+	return selectDominantDirection(jogWeights)
 end
 
-local function getPlaybackRates(speed: number): (number, number)
-	local referenceSpeed = math.max(jogConfig.JogReferenceSpeed, 0.01)
-	local basePlaybackRate = speed / referenceSpeed
-	local finalPlaybackRate = math.clamp(
-		basePlaybackRate * jogPlaybackMultiplier,
-		jogConfig.JogMinPlaybackRate,
-		jogConfig.JogMaxPlaybackRate
-	)
+local function updateSprintActive(speed: number, requested: boolean, rawMagnitude: number): boolean
+	local wasActive = sprintActive
+	local hasIntent = rawMagnitude > sprintConfig.IntentThreshold
 
-	if basePlaybackRate * jogPlaybackMultiplier >= 2 and not warnedHighPlayback then
-		warnedHighPlayback = true
-		warnLog(string.format(
-			"Jog animation would need %.2fx playback at speed %.1f; check authored stride/cadence before hiding mismatch.",
-			basePlaybackRate * jogPlaybackMultiplier,
-			speed
+	if requested and hasIntent then
+		sprintActive = true
+	elseif sprintActive and not requested and speed > sprintConfig.ExitSpeed then
+		-- Preserve the sprint presentation while physical sprint momentum decays.
+		sprintActive = true
+	else
+		sprintActive = false
+	end
+
+	if sprintActive ~= wasActive then
+		log(string.format(
+			"[SprintState] requested=%s visual=%s speed=%.1f latched=%s",
+			tostring(requested),
+			if sprintActive then "Sprint" else "Jog",
+			speed,
+			tostring(sprintActive)
 		))
 	end
 
-	return basePlaybackRate, finalPlaybackRate
+	return sprintActive
 end
 
-local function getLocalMovementComponents(rootPart: BasePart, horizontalVelocity: Vector3): (number, number)
-	if horizontalVelocity.Magnitude <= 0.001 then
-		return 0, 0
+local function getSignedTurn(locomotionState): (number, string)
+	local current = locomotionState.SmoothedDirection
+	local desired = locomotionState.RawDirection
+	if current.Magnitude <= 0.05 or desired.Magnitude <= 0.05 then
+		return 0, "Forward"
 	end
-
-	local direction = horizontalVelocity.Unit
-	local forward = getHorizontal(rootPart.CFrame.LookVector)
-	local right = getHorizontal(rootPart.CFrame.RightVector)
-
-	if forward.Magnitude > 0.001 then
-		forward = forward.Unit
-	end
-
-	if right.Magnitude > 0.001 then
-		right = right.Unit
-	end
-
-	return direction:Dot(forward), direction:Dot(right)
+	local angle = math.deg(math.acos(math.clamp(current.Unit:Dot(desired.Unit), -1, 1)))
+	local crossY = current.Unit:Cross(desired.Unit).Y
+	local side = if crossY < 0 then "TurnRight" else "TurnLeft"
+	return angle, side
 end
 
-local function updateSprintFallback(speed: number, sprintRequested: boolean): boolean
-	if sprintFallbackActive then
-		if not sprintRequested and speed <= jogConfig.SprintExitSpeed then
-			sprintFallbackActive = false
+local function playSprint(speed: number, locomotionState, deltaTime: number): (string, number)
+	stopTrack("Idle", blendConfig.IdleToLocomotion)
+	stopFamily("Jog", blendConfig.JogToSprint)
+	local turnAngle, proposedTurn = getSignedTurn(locomotionState)
+	if currentSprintTurn == "Forward" then
+		if turnAngle >= sprintConfig.TurnEnterAngle then
+			currentSprintTurn = proposedTurn
 		end
+	elseif turnAngle <= sprintConfig.TurnExitAngle then
+		currentSprintTurn = "Forward"
+	elseif proposedTurn ~= currentSprintTurn and turnAngle >= sprintConfig.TurnEnterAngle then
+		currentSprintTurn = proposedTurn
+	end
+
+	local turnWeight = if currentSprintTurn == "Forward" then 0 else math.clamp(
+		(turnAngle - sprintConfig.TurnExitAngle) / math.max(sprintConfig.TurnFullWeightAngle - sprintConfig.TurnExitAngle, 1),
+		0,
+		1
+	)
+	local targets = {
+		Forward = 1 - turnWeight,
+		TurnLeft = if currentSprintTurn == "TurnLeft" then turnWeight else 0,
+		TurnRight = if currentSprintTurn == "TurnRight" then turnWeight else 0,
+	}
+	local alpha = 1 - math.exp(-sprintConfig.WeightResponsiveness * deltaTime)
+	for _, direction in { "Forward", "TurnLeft", "TurnRight" } do
+		sprintWeights[direction] = (sprintWeights[direction] or 0) + (targets[direction] - (sprintWeights[direction] or 0)) * alpha
+	end
+	local baseRate = speed / math.max(sprintConfig.ReferenceSpeed, 0.01)
+	local finalRate = math.clamp(baseRate * sprintConfig.PlaybackMultiplier, sprintConfig.MinPlaybackRate, sprintConfig.MaxPlaybackRate)
+	for _, direction in { "Forward", "TurnLeft", "TurnRight" } do
+		playTrack("Sprint" .. direction, blendConfig.JogToSprint, sprintWeights[direction] or 0, finalRate)
+	end
+	currentBasePlaybackRate = baseRate
+	currentPlaybackRate = finalRate
+	return currentSprintTurn, turnAngle
+end
+
+local function getActionConfig(slot: string)
+	if slot == "DirectionChange180" then
+		return directionChangeConfig
+	elseif slot == "ReceivePass" then
+		return receptionConfig
+	elseif slot == "Pass" then
+		return passConfig
+	elseif slot == "Jump" then
+		return jumpConfig
+	end
+
+	return nil
+end
+
+local function startAction(slot: string)
+	local record = activeTracks[slot]
+	local track = record and record.Track
+	local config = getActionConfig(slot)
+
+	if not track or not config then
+		return
+	end
+
+	if activeAction ~= "" and activeAction ~= slot then
+		local previousConfig = getActionConfig(activeAction)
+		stopTrack(activeAction, if previousConfig then previousConfig.FadeOutTime else blendConfig.ActionExit)
+		if activeAction == "DirectionChange180" then
+			directionChangeAudit = nil
+		end
+	end
+
+	local playbackRate = config.PlaybackRate or 1
+	local fallbackDuration = config.FallbackDuration or 0.6
+	local exitBlend = config.ExitBlendTime or config.FadeOutTime or blendConfig.ActionExit
+	track:Stop(0)
+	track.TimePosition = 0
+	track:Play(config.FadeInTime or blendConfig.ActionEnter, 1, playbackRate)
+	activeAction = slot
+	local duration = math.max(track.Length / math.max(playbackRate, 0.01), fallbackDuration)
+	activeActionUntil = os.clock() + duration
+	activeActionExitAt = math.max(os.clock(), activeActionUntil - exitBlend)
+	activeActionExitStarted = false
+
+	if slot == "DirectionChange180" and directionChangeConfig.RootAuditEnabled and currentRootPart then
+		local rootJoint = currentRootPart:FindFirstChild("RootJoint")
+		directionChangeAudit = {
+			EntryFamily = currentLocomotionFamily,
+			RootYaw = getYaw(currentRootPart.CFrame),
+			RootJoint = if rootJoint and rootJoint:IsA("Motor6D") then rootJoint else nil,
+			MotorYaw = if rootJoint and rootJoint:IsA("Motor6D") then getYaw(rootJoint.Transform) else 0,
+			MaxRootYawDelta = 0,
+			MaxAnimationYawDelta = 0,
+		}
+	end
+
+	log(string.format("Action -> %s length=%.2f", slot, track.Length))
+end
+
+local function sampleDirectionChangeAudit()
+	local audit = directionChangeAudit
+	local rootPart = currentRootPart
+
+	if activeAction ~= "DirectionChange180" or not audit or not rootPart then
+		return
+	end
+
+	audit.MaxRootYawDelta = math.max(
+		audit.MaxRootYawDelta,
+		math.abs(getWrappedAngleDelta(audit.RootYaw, getYaw(rootPart.CFrame)))
+	)
+	local rootJoint = audit.RootJoint
+	if rootJoint and rootJoint.Parent then
+		audit.MaxAnimationYawDelta = math.max(
+			audit.MaxAnimationYawDelta,
+			math.abs(getWrappedAngleDelta(audit.MotorYaw, getYaw(rootJoint.Transform)))
+		)
+	end
+end
+
+local function beginActionExit(reason: string, fadeOverride: number?, speed: number?, sprintRequested: boolean?)
+	if activeAction == "" or activeActionExitStarted then
+		return
+	end
+
+	local config = getActionConfig(activeAction)
+	local fadeTime = fadeOverride or (config and config.FadeOutTime) or blendConfig.ActionExit
+	local record = activeTracks[activeAction]
+	local track = record and record.Track
+	activeActionExitStarted = true
+	activeActionUntil = math.min(activeActionUntil, os.clock() + fadeTime)
+
+	if track and track.IsPlaying then
+		track:AdjustWeight(0, fadeTime)
+	end
+
+	if activeAction == "DirectionChange180" and directionChangeAudit then
+		log(string.format(
+			"[Turn180] entryFamily=%s rootYawDelta=%.1f animationRootYawDelta=%.1f exitFamily=%s fade=%.2f",
+			directionChangeAudit.EntryFamily,
+			directionChangeAudit.MaxRootYawDelta,
+			directionChangeAudit.MaxAnimationYawDelta,
+			desiredBaseState,
+			fadeTime
+		))
+	end
+
+	log(string.format(
+		"[Transition] from=%s to=%s speed=%.1f sprintRequested=%s fade=%.2f reason=%s",
+		activeAction,
+		desiredBaseState,
+		speed or 0,
+		tostring(sprintRequested == true),
+		fadeTime,
+		reason
+	))
+end
+
+local function updateReceptionAction(ball: BasePart?)
+	if not ball then
+		return
+	end
+	local epoch = ball:GetAttribute("ControlEpoch")
+	if typeof(epoch) ~= "number" then
+		return
+	end
+	if lastObservedControlEpoch == nil then
+		lastObservedControlEpoch = epoch
+		return
+	end
+	if epoch == lastObservedControlEpoch then
+		return
+	end
+	lastObservedControlEpoch = epoch
+	local actionType = ball:GetAttribute("LastReceptionActionType")
+	local receiverUserId = ball:GetAttribute("LastReceptionPlayerUserId")
+	if receptionConfig.Enabled
+		and receiverUserId == localPlayer.UserId
+		and typeof(actionType) == "string"
+		and receptionConfig.PassActionTypes[actionType] == true
+	then
+		MovementController.BeginActionMovement("ReceivePass")
+		startAction("ReceivePass")
+	end
+end
+
+local function onFootballActionPresentation(payload)
+	if typeof(payload) ~= "table" then
+		return
+	end
+
+	local actionType = payload.ActionType
+
+	if typeof(actionType) ~= "string" or passConfig.ActionTypes[actionType] ~= true then
+		return
+	end
+
+	if payload.Stage == "Predicted" then
+		startAction("Pass")
+	elseif payload.Stage == "Rejected" and activeAction == "Pass" then
+		beginActionExit("rejected", passConfig.FadeOutTime)
+	end
+end
+
+local function updateJumpAction(humanoid: Humanoid, speed: number, sprintRequested: boolean)
+	local airborne = isJumpAirborne(humanoid)
+
+	if airborne and not jumpWasAirborne and jumpConfig.Enabled then
+		startAction("Jump")
+	elseif not airborne and jumpWasAirborne and activeAction == "Jump" then
+		beginActionExit("landed", jumpConfig.FadeOutTime, speed, sprintRequested)
+	end
+
+	jumpWasAirborne = airborne
+end
+
+local function maybeTriggerDirectionChange(locomotionState, speed: number)
+	local desired = locomotionState.RawDirection
+
+	if not directionChangeConfig.Enabled or desired.Magnitude <= 0.05 then
+		return
+	end
+
+	if activeAction ~= "" then
+		previousDesiredDirection = desired.Unit
+		return
+	end
+	if previousDesiredDirection and speed >= directionChangeConfig.MinimumSpeed and os.clock() - lastDirectionChangeAt >= directionChangeConfig.Cooldown then
+		local angle = math.deg(math.acos(math.clamp(previousDesiredDirection:Dot(desired.Unit), -1, 1)))
+		if angle >= directionChangeConfig.TriggerAngle then
+			lastDirectionChangeAt = os.clock()
+			startAction("DirectionChange180")
+		end
+	end
+	previousDesiredDirection = desired.Unit
+end
+
+local function updateActionLifecycle(speed: number, sprintRequested: boolean): boolean
+	if activeAction == "" then
+		return false
+	end
+
+	local record = activeTracks[activeAction]
+	local track = record and record.Track
+	local now = os.clock()
+
+	if not activeActionExitStarted and now >= activeActionExitAt then
+		local config = getActionConfig(activeAction)
+		beginActionExit(
+			"natural",
+			if config then config.ExitBlendTime or config.FadeOutTime else blendConfig.ActionExit,
+			speed,
+			sprintRequested
+		)
+	end
+
+	if now <= activeActionUntil and track and track.IsPlaying then
+		return true
+	end
+
+	if track and track.IsPlaying then
+		track:Stop(0)
+	end
+
+	activeAction = ""
+	activeActionUntil = 0
+	activeActionExitAt = 0
+	activeActionExitStarted = false
+	directionChangeAudit = nil
+	return false
+end
+
+local function updateDiagnostics(state: string, family: string, direction: string, angle: number, speed: number, hasBall: boolean, sprintRequested: boolean, sprintTurn: string, sprintTurnAngle: number, localForward: number, localRight: number, isPlaceholder: boolean)
+	local ball = getFootball()
+	local lead = if ball then ball:GetAttribute("ClientBallLead") or 0 else 0
+	local phase = if ball then ball:GetAttribute("DribblePhase") or "" else ""
+	local expectedRecontact = if ball then ball:GetAttribute("LastLocalTouchPredictedRecontactTime") or 0 else 0
+	diagnostics.State = state
+	diagnostics.BaseState = desiredBaseState
+	diagnostics.Action = activeAction
+	diagnostics.ActionExitTarget = if activeAction ~= "" then desiredBaseState else ""
+	diagnostics.LocomotionFamily = family
+	diagnostics.Direction = direction
+	diagnostics.MovementAngle = angle
+	diagnostics.HorizontalSpeed = speed
+	diagnostics.BasePlaybackRate = currentBasePlaybackRate
+	diagnostics.FinalPlaybackRate = currentPlaybackRate
+	diagnostics.HasBall = hasBall
+	diagnostics.SprintRequested = sprintRequested
+	diagnostics.SprintTurn = sprintTurn
+	diagnostics.SprintTurnAngle = sprintTurnAngle
+	diagnostics.IsPlaceholder = isPlaceholder
+	diagnostics.JogWeights = table.clone(jogWeights)
+	diagnostics.TrackPlaying = false
+	diagnostics.TrackLoaded = false
+	for _, record in activeTracks do
+		diagnostics.TrackLoaded = diagnostics.TrackLoaded or record.Track.Length > 0
+		diagnostics.TrackPlaying = diagnostics.TrackPlaying or record.Track.IsPlaying
+	end
+
+	localPlayer:SetAttribute("Beyond90AnimationState", state)
+	localPlayer:SetAttribute("Beyond90AnimationBaseState", desiredBaseState)
+	localPlayer:SetAttribute("Beyond90AnimationAction", activeAction)
+	localPlayer:SetAttribute("Beyond90AnimationActionExitTarget", if activeAction ~= "" then desiredBaseState else "")
+	localPlayer:SetAttribute("Beyond90AnimationLocomotionFamily", family)
+	localPlayer:SetAttribute("Beyond90AnimationDirection", direction)
+	localPlayer:SetAttribute("Beyond90AnimationMovementAngle", angle)
+	localPlayer:SetAttribute("Beyond90AnimationSpeed", speed)
+	localPlayer:SetAttribute("Beyond90AnimationPlaybackRate", currentPlaybackRate)
+	localPlayer:SetAttribute("Beyond90AnimationBasePlaybackRate", currentBasePlaybackRate)
+	localPlayer:SetAttribute("Beyond90JogPlaybackMultiplier", jogPlaybackMultiplier)
+	localPlayer:SetAttribute("Beyond90AnimationHasBall", hasBall)
+	localPlayer:SetAttribute("Beyond90AnimationSprintRequested", sprintRequested)
+	localPlayer:SetAttribute("Beyond90AnimationSprintTurn", sprintTurn)
+	localPlayer:SetAttribute("Beyond90AnimationSprintTurnAngle", sprintTurnAngle)
+	localPlayer:SetAttribute("Beyond90AnimationLocalForward", localForward)
+	localPlayer:SetAttribute("Beyond90AnimationLocalRight", localRight)
+	localPlayer:SetAttribute("Beyond90AnimationIsPlaceholder", isPlaceholder)
+	localPlayer:SetAttribute("Beyond90AnimationBallLead", lead)
+	localPlayer:SetAttribute("Beyond90AnimationDribblePhase", phase)
+	localPlayer:SetAttribute("Beyond90AnimationExpectedRecontactTime", expectedRecontact)
+	localPlayer:SetAttribute("Beyond90AnimationTrackPlaying", diagnostics.TrackPlaying)
+	localPlayer:SetAttribute("Beyond90AnimationTrackLoaded", diagnostics.TrackLoaded)
+	localPlayer:SetAttribute("Beyond90AnimationAuthority", "Beyond90")
+	localPlayer:SetAttribute(
+		"Beyond90DefaultAnimateDisabled",
+		AnimationConfig.Authority.DisableDefaultAnimate
+			and (#disabledAnimateScripts > 0 or (currentCharacter ~= nil and currentCharacter:FindFirstChild("Animate") == nil))
+	)
+	for key, weight in jogWeights do
+		localPlayer:SetAttribute("Beyond90AnimationJogWeight" .. key, weight)
+	end
+
+	if state ~= currentState then
+		currentState = state
+		log(string.format(
+			"State -> %s family=%s direction=%s angle=%.1f speed=%.1f playback=%.2f hasBall=%s placeholder=%s forward=%.2f right=%.2f sprintTurn=%s turnAngle=%.1f",
+			state, family, direction, angle, speed, currentPlaybackRate, tostring(hasBall), tostring(isPlaceholder), localForward, localRight, sprintTurn, sprintTurnAngle
+		))
+	end
+	sampleGrounding(desiredBaseState)
+end
+
+local function updateLocomotionVisualActive(rawMagnitude: number, speed: number): boolean
+	if locomotionVisualActive then
+		if rawMagnitude <= jogConfig.MovementIntentThreshold and speed <= jogConfig.JogExitSpeed then
+			locomotionVisualActive = false
+		end
+	elseif rawMagnitude > jogConfig.MovementIntentThreshold or speed >= jogConfig.JogEnterSpeed then
+		locomotionVisualActive = true
+	end
+
+	return locomotionVisualActive
+end
+
+local function resolveBaseLocomotion(
+	humanoid: Humanoid,
+	locomotionState,
+	movementAngle: number,
+	speed: number,
+	hasBall: boolean,
+	deltaTime: number
+): (string, string, string, string, number)
+	local sprintTurn = currentSprintTurn
+	local sprintTurnAngle = 0
+	local direction = currentDirection
+	local rawMagnitude = locomotionState.RawMagnitude or 0
+	local visualMovement = updateLocomotionVisualActive(rawMagnitude, speed)
+	local unsupportedAirborne = isAirborne(humanoid) and activeAction ~= "Jump"
+
+	if unsupportedAirborne then
+		stopLocomotion(blendConfig.JumpEnter)
+		currentLocomotionFamily = "AirborneFallback"
+		currentPlaybackRate = 0
+		currentBasePlaybackRate = 0
+		return "AirborneFallback", currentLocomotionFamily, direction, sprintTurn, sprintTurnAngle
+	end
+
+	if sprintActive then
+		direction, sprintTurnAngle = playSprint(speed, locomotionState, deltaTime)
+		sprintTurn = direction
+		currentLocomotionFamily = "Sprint"
+	elseif jogConfig.Enabled and visualMovement then
+		direction = playJog(movementAngle, speed, deltaTime)
+		currentLocomotionFamily = if hasBall then "BallJogPlaceholder" else "Jog"
 	else
-		if sprintRequested and speed >= jogConfig.SprintEnterSpeed then
-			sprintFallbackActive = true
-		end
+		playIdle()
+		currentLocomotionFamily = "Idle"
+		direction = "Idle"
 	end
 
-	return sprintFallbackActive
+	local state = if currentLocomotionFamily == "Jog" then "Jog" .. direction else currentLocomotionFamily
+
+	if currentLocomotionFamily == "BallJogPlaceholder" then
+		state = "BallJogPlaceholder" .. direction
+	elseif currentLocomotionFamily == "Sprint" then
+		state = "Sprint" .. direction
+	end
+
+	return state, currentLocomotionFamily, direction, sprintTurn, sprintTurnAngle
 end
 
-local function isJogState(state: string): boolean
-	return state == "OffBallJog" or state == "BallJog" or state == "BallJogPlaceholder"
-end
-
-local function shouldJog(speed: number, wantsMovement: boolean): boolean
-	if not jogConfig.Enabled or not wantsMovement or sprintFallbackActive then
-		return false
-	end
-
-	if isJogState(currentState) then
-		return speed > jogConfig.JogExitSpeed
-	end
-
-	return speed >= jogConfig.JogEnterSpeed
-end
-
-local function shouldIdle(speed: number, wantsMovement: boolean): boolean
-	if not idleConfig.Enabled or sprintFallbackActive then
-		return false
-	end
-
-	if currentState == "Idle" then
-		return speed < jogConfig.JogEnterSpeed
-	end
-
-	if isJogState(currentState) and not wantsMovement then
-		return speed <= jogConfig.JogExitSpeed
-	end
-
-	if wantsMovement then
-		return speed < jogConfig.JogEnterSpeed
-	end
-
-	return speed <= jogConfig.JogExitSpeed
-end
-
-local function updateAnimation()
+local function updateAnimation(deltaTime: number)
 	local humanoid = currentHumanoid
 	local rootPart = currentRootPart
 
 	if not humanoid or not rootPart or humanoid.Health <= 0 then
-		stopAllCustomTracks(jogConfig.FadeOutTime)
-		suppressDefaultLocomotionTracks()
-		sprintFallbackActive = false
-		setState("Default", 0, 0, 0, false, false, 0, 0, idleAnimationId, false)
+		stopLocomotion(blendConfig.LocomotionToIdle)
 		return
 	end
 
+	suppressDefaultLocomotionTracks()
 	local horizontalVelocity = getHorizontal(rootPart.AssemblyLinearVelocity)
 	local speed = horizontalVelocity.Magnitude
 	local locomotionState = MovementController.GetLocomotionState()
 	local sprintRequested = locomotionState.IsSprinting == true
-	local wantsMovement = (locomotionState.RawMagnitude or 0) > 0.05 or locomotionState.IsMoving == true
-	local velocityImpliesMovement = speed >= jogConfig.JogEnterSpeed
 	local hasBall = hasLocalPossession()
-	local localForward, localRight = getLocalMovementComponents(rootPart, horizontalVelocity)
-	local desiredJogState, jogAnimationId, jogTrackName, isPlaceholder = getDesiredJogPresentation(hasBall)
+	local presentationDirection = horizontalVelocity
 
-	updateSprintFallback(speed, sprintRequested)
-
-	if isAirborne(humanoid) then
-		stopAllCustomTracks(jogConfig.FadeOutTime)
-		suppressDefaultLocomotionTracks()
-		setState("AirborneFallback", speed, 0, 0, hasBall, sprintRequested, localForward, localRight, idleAnimationId, false)
-		return
+	if presentationDirection.Magnitude <= 0.1 and locomotionState.RawDirection.Magnitude > 0.05 then
+		presentationDirection = locomotionState.RawDirection
 	end
 
-	if sprintFallbackActive then
-		stopAllCustomTracks(jogConfig.FadeOutTime)
-		suppressDefaultLocomotionTracks()
-		setState("SprintFallback", speed, 0, 0, hasBall, sprintRequested, localForward, localRight, jogAnimationId, isPlaceholder)
-		return
+	local localForward, localRight, movementAngle = getLocalMovement(rootPart, presentationDirection)
+	local isPlaceholder = hasBall
+	local ball = getFootball()
+	updateReceptionAction(ball)
+	updateJumpAction(humanoid, speed, sprintRequested)
+	updateSprintActive(speed, sprintRequested, locomotionState.RawMagnitude or 0)
+
+	if not isAirborne(humanoid) then
+		maybeTriggerDirectionChange(locomotionState, speed)
 	end
 
-	if shouldJog(speed, wantsMovement or velocityImpliesMovement) then
-		loadTrack("Jog", currentAnimator :: Animator, jogAnimationId, jogTrackName, jogConfig.Priority)
-		local basePlaybackRate, finalPlaybackRate = getPlaybackRates(speed)
-		playJog(finalPlaybackRate)
-		currentBasePlaybackRate = basePlaybackRate
-		setState(
-			desiredJogState,
-			speed,
-			basePlaybackRate,
-			finalPlaybackRate,
-			hasBall,
-			sprintRequested,
-			localForward,
-			localRight,
-			jogAnimationId,
-			isPlaceholder
-		)
-		return
-	end
+	local baseState, family, direction, sprintTurn, sprintTurnAngle = resolveBaseLocomotion(
+		humanoid,
+		locomotionState,
+		movementAngle,
+		speed,
+		hasBall,
+		deltaTime
+	)
+	desiredBaseState = baseState
+	sampleDirectionChangeAudit()
+	local actionActive = updateActionLifecycle(speed, sprintRequested)
+	local displayState = if actionActive then activeAction else baseState
 
-	if shouldIdle(speed, wantsMovement) then
-		playIdle()
-		setState("Idle", speed, 1, 1, hasBall, sprintRequested, localForward, localRight, idleAnimationId, false)
-		return
-	end
-
-	stopAllCustomTracks(jogConfig.FadeOutTime)
-	suppressDefaultLocomotionTracks()
-	currentPlaybackRate = 0
-	currentBasePlaybackRate = 0
-	setState("Default", speed, 0, 0, hasBall, sprintRequested, localForward, localRight, idleAnimationId, false)
+	updateDiagnostics(
+		displayState,
+		family,
+		direction,
+		movementAngle,
+		speed,
+		hasBall,
+		sprintRequested,
+		sprintTurn,
+		sprintTurnAngle,
+		localForward,
+		localRight,
+		isPlaceholder
+	)
 end
 
 local function cleanupCharacter()
@@ -834,69 +1009,79 @@ local function cleanupCharacter()
 	currentAnimator = nil
 	currentRootPart = nil
 	currentState = "Default"
+	currentLocomotionFamily = "Default"
+	currentDirection = "Forward"
+	currentSprintTurn = "Forward"
 	currentPlaybackRate = 0
 	currentBasePlaybackRate = 0
-	sprintFallbackActive = false
+	sprintActive = false
+	previousDesiredDirection = nil
+	activeAction = ""
+	activeActionUntil = 0
+	activeActionExitAt = 0
+	activeActionExitStarted = false
+	desiredBaseState = "Idle"
+	locomotionVisualActive = false
+	jumpWasAirborne = false
+	lastObservedControlEpoch = nil
+	directionChangeAudit = nil
+	table.clear(jogWeights)
+	table.clear(sprintWeights)
 end
 
 local function configureCharacter(character: Model)
 	cleanupCharacter()
-
 	currentCharacter = character
 	local humanoid = character:WaitForChild("Humanoid", 10)
 	local rootPart = character:WaitForChild("HumanoidRootPart", 10)
-
-	if not humanoid or not humanoid:IsA("Humanoid") then
-		warnLog("Character has no Humanoid; animation controller disabled for this spawn.")
+	if not humanoid or not humanoid:IsA("Humanoid") or not rootPart or not rootPart:IsA("BasePart") then
+		warnLog("Character missing Humanoid or HumanoidRootPart")
 		return
 	end
-
-	if not rootPart or not rootPart:IsA("BasePart") then
-		warnLog("Character has no HumanoidRootPart; animation controller disabled for this spawn.")
-		return
-	end
-
 	currentHumanoid = humanoid
 	currentRootPart = rootPart
 	currentAnimator = ensureAnimator(humanoid)
 	warnedHighPlayback = false
 	disableBundledAnimateScripts(character)
-	loadTrack("Idle", currentAnimator, idleAnimationId, "B90_LOC_OffBall_Idle", idleConfig.Priority)
-	loadTrack("Jog", currentAnimator, offBallJogAnimationId, "B90_LOC_OffBall_Jog_F", jogConfig.Priority)
-
-	table.insert(characterConnections, character:GetAttributeChangedSignal("Beyond90HipHeight"):Connect(function()
-		resetGroundingDiagnostics()
-	end))
-
+	loadTrack("Idle", assets.Locomotion.OffBall.Idle, "B90_LOC_OffBall_Idle", idleConfig.Priority, true)
+	for direction, animationId in assets.Locomotion.OffBall.Jog do
+		loadTrack("Jog" .. direction, animationId, "B90_LOC_OffBall_Jog_" .. direction, jogConfig.Priority, true)
+		jogWeights[direction] = 0
+	end
+	for direction, animationId in assets.Locomotion.OffBall.Sprint do
+		loadTrack("Sprint" .. direction, animationId, "B90_LOC_OffBall_Sprint_" .. direction, sprintConfig.Priority, true)
+		sprintWeights[direction] = 0
+	end
+	loadTrack("DirectionChange180", assets.Actions.DirectionChange180, "B90_LOC_DirectionChange_180", directionChangeConfig.Priority, false)
+	loadTrack("ReceivePass", assets.Actions.ReceivePass, "B90_ACT_ReceivePass", receptionConfig.Priority, false)
+	loadTrack("Jump", assets.Locomotion.Jump, "B90_LOC_Jump", jumpConfig.Priority, false)
+	loadTrack("Pass", assets.Actions.Pass, "B90_ACT_Pass", passConfig.Priority, false)
+	loadTrack("Shoot", assets.Actions.Shoot, "B90_ACT_Shoot", shootConfig.Priority, false)
+	local ball = getFootball()
+	lastObservedControlEpoch = if ball then ball:GetAttribute("ControlEpoch") else nil
+	table.insert(characterConnections, character:GetAttributeChangedSignal("Beyond90HipHeight"):Connect(resetGroundingDiagnostics))
 	table.insert(characterConnections, humanoid.Died:Connect(function()
-		stopAllCustomTracks(jogConfig.FadeOutTime)
-		setState("Default", 0, 0, 0, false, false, 0, 0, idleAnimationId, false)
+		stopLocomotion(blendConfig.LocomotionToIdle)
 	end))
-
-	log(string.format(
-		"Character ready rig=%s animator=%s defaultAnimate=%s",
-		humanoid.RigType.Name,
-		tostring(currentAnimator ~= nil),
-		if character:FindFirstChild("Animate") then "present" else "absent"
-	))
+	log(string.format("Character ready rig=%s animator=true tracks=%d defaultAnimate=%s", humanoid.RigType.Name, 17, if character:FindFirstChild("Animate") then "disabled" else "absent"))
 end
 
 function AnimationController.Initialize()
 	if initialized then
 		return
 	end
-
 	initialized = true
-
 	if localPlayer.Character then
 		task.defer(configureCharacter, localPlayer.Character)
 	end
-
 	table.insert(appConnections, localPlayer.CharacterAdded:Connect(configureCharacter))
-	table.insert(appConnections, localPlayer.CharacterRemoving:Connect(function()
-		cleanupCharacter()
+	table.insert(appConnections, localPlayer.CharacterRemoving:Connect(cleanupCharacter))
+	table.insert(appConnections, ControlledBallController.GetDribbleTouchEvent().Event:Connect(function(touch)
+		localPlayer:SetAttribute("Beyond90AnimationLastDribbleFoot", touch.FootSide)
+		localPlayer:SetAttribute("Beyond90AnimationLastDribbleStrength", touch.TouchStrength)
+		localPlayer:SetAttribute("Beyond90AnimationLastDribbleTouchTime", os.clock())
 	end))
-
+	table.insert(appConnections, FootballActionController.GetPresentationEvent().Event:Connect(onFootballActionPresentation))
 	renderConnection = RunService.RenderStepped:Connect(updateAnimation)
 end
 
@@ -904,38 +1089,26 @@ function AnimationController.Destroy()
 	if not initialized then
 		return
 	end
-
 	initialized = false
-
 	if renderConnection then
 		renderConnection:Disconnect()
 		renderConnection = nil
 	end
-
 	for _, connection in appConnections do
 		connection:Disconnect()
 	end
-
 	table.clear(appConnections)
-
 	cleanupCharacter()
 end
 
 function AnimationController.SetJogPlaybackMultiplier(multiplier: number): number
-	local clamped = math.clamp(
-		multiplier,
-		jogConfig.JogPlaybackMultiplierMin,
-		jogConfig.JogPlaybackMultiplierMax
-	)
-	clamped = math.round(clamped * 100) / 100
-
+	local clamped = math.round(math.clamp(multiplier, jogConfig.JogPlaybackMultiplierMin, jogConfig.JogPlaybackMultiplierMax) * 100) / 100
 	if math.abs(clamped - jogPlaybackMultiplier) > 0.001 then
 		jogPlaybackMultiplier = clamped
 		diagnostics.JogPlaybackMultiplier = clamped
 		localPlayer:SetAttribute("Beyond90JogPlaybackMultiplier", clamped)
 		log(string.format("Jog playback multiplier -> %.2fx", clamped))
 	end
-
 	return jogPlaybackMultiplier
 end
 
@@ -952,23 +1125,7 @@ function AnimationController.GetJogPlaybackMultiplierStep(): number
 end
 
 function AnimationController.GetDiagnostics()
-	return {
-		State = diagnostics.State,
-		HorizontalSpeed = diagnostics.HorizontalSpeed,
-		BasePlaybackRate = diagnostics.BasePlaybackRate,
-		JogPlaybackMultiplier = diagnostics.JogPlaybackMultiplier,
-		FinalPlaybackRate = diagnostics.FinalPlaybackRate,
-		HasBall = diagnostics.HasBall,
-		SprintRequested = diagnostics.SprintRequested,
-		TrackPlaying = diagnostics.TrackPlaying,
-		TrackLoaded = diagnostics.TrackLoaded,
-		Asset = diagnostics.Asset,
-		IsPlaceholder = diagnostics.IsPlaceholder,
-		IdleLength = diagnostics.IdleLength,
-		IdleWeight = diagnostics.IdleWeight,
-		JogLength = diagnostics.JogLength,
-		JogWeight = diagnostics.JogWeight,
-	}
+	return table.clone(diagnostics)
 end
 
 return AnimationController

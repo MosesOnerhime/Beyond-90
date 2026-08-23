@@ -1,6 +1,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local GameConfig = require(Shared.Config.GameConfig)
@@ -110,6 +111,9 @@ end
 local function normalizeCharacterPhysics(character: Model)
 	local unanchoredCount = 0
 	local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+	local collidableParts = {}
+	local leftFootCanCollide = false
+	local rightFootCanCollide = false
 
 	for _, descendant in character:GetDescendants() do
 		if descendant:IsA("BasePart") then
@@ -124,6 +128,32 @@ local function normalizeCharacterPhysics(character: Model)
 		humanoidRootPart.CanCollide = false
 	end
 
+	for _, descendant in character:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			if descendant.CanCollide then
+				table.insert(collidableParts, descendant.Name)
+			end
+
+			if descendant.Name == "LeftFoot" then
+				leftFootCanCollide = descendant.CanCollide
+			elseif descendant.Name == "RightFoot" then
+				rightFootCanCollide = descendant.CanCollide
+			end
+		end
+	end
+
+	table.sort(collidableParts)
+	character:SetAttribute("Beyond90RootCanCollide", humanoidRootPart and humanoidRootPart:IsA("BasePart") and humanoidRootPart.CanCollide or false)
+	character:SetAttribute("Beyond90FootPartsCanCollide", leftFootCanCollide or rightFootCanCollide)
+	character:SetAttribute("Beyond90CollidableBodyPartCount", #collidableParts)
+	character:SetAttribute("Beyond90CollidableBodyParts", table.concat(collidableParts, ","))
+	log(string.format(
+		"Character collision rootCanCollide=%s feetCanCollide=%s collidableParts=%s",
+		tostring(character:GetAttribute("Beyond90RootCanCollide")),
+		tostring(character:GetAttribute("Beyond90FootPartsCanCollide")),
+		if #collidableParts > 0 then table.concat(collidableParts, ",") else "none"
+	))
+
 	if unanchoredCount > 0 then
 		warnLog(string.format(
 			"Unanchored %d StarterCharacter part(s) for Humanoid movement compatibility",
@@ -132,8 +162,24 @@ local function normalizeCharacterPhysics(character: Model)
 	end
 end
 
-local function getPitchGroundY(spawnLocation: SpawnLocation): number
-	return spawnLocation.Position.Y - spawnLocation.Size.Y / 2
+local function getPitchGroundContext(character: Model, spawnLocation: SpawnLocation): (number, string, string, number)
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+
+	if rootPart and rootPart:IsA("BasePart") then
+		local raycastParams = RaycastParams.new()
+		raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+		raycastParams.FilterDescendantsInstances = { character }
+		raycastParams.RespectCanCollide = true
+		local probeDistance = (PlayerConfig.Appearance.Grounding or {}).FloorProbeDistanceStuds or 20
+		local result = Workspace:Raycast(rootPart.Position, Vector3.new(0, -probeDistance, 0), raycastParams)
+
+		if result then
+			return result.Position.Y, result.Instance:GetFullName(), result.Material.Name, result.Distance
+		end
+	end
+
+	local fallbackGroundY = spawnLocation.Position.Y - spawnLocation.Size.Y / 2
+	return fallbackGroundY, spawnLocation:GetFullName(), spawnLocation.Material.Name, -1
 end
 
 local function getPartBottomY(character: Model, partName: string): number?
@@ -169,7 +215,7 @@ local function updateGroundingAttributes(
 	hipAdjustment: number
 )
 	local rootPart = character:FindFirstChild("HumanoidRootPart")
-	local groundY = getPitchGroundY(spawnLocation)
+	local groundY, floorPartName, floorMaterial, floorDistance = getPitchGroundContext(character, spawnLocation)
 	local leftFootBottomY = getPartBottomY(character, "LeftFoot")
 	local rightFootBottomY = getPartBottomY(character, "RightFoot")
 	local lowestFootBottomY = getLowestFootBottomY(character)
@@ -188,10 +234,13 @@ local function updateGroundingAttributes(
 	character:SetAttribute("Beyond90HipHeightAdjustment", hipAdjustment)
 	character:SetAttribute("Beyond90TargetFootClearance", targetClearance)
 	character:SetAttribute("Beyond90FootClearanceError", clearanceError or 0)
+	character:SetAttribute("Beyond90FloorPart", floorPartName)
+	character:SetAttribute("Beyond90FloorMaterial", floorMaterial)
+	character:SetAttribute("Beyond90FloorDistance", floorDistance)
 
 	if phase ~= "waiting-settle" then
 		log(string.format(
-			"Grounding phase=%s height=%.2f hipHeight=%.3f rootY=%.3f groundY=%.3f targetClearance=%.3f leftFootBottomY=%.3f rightFootBottomY=%.3f lowestClearance=%.3f clearanceError=%.3f hipAdjustment=%.3f",
+			"Grounding phase=%s height=%.2f hipHeight=%.3f rootY=%.3f groundY=%.3f targetClearance=%.3f leftFootBottomY=%.3f rightFootBottomY=%.3f lowestClearance=%.3f clearanceError=%.3f hipAdjustment=%.3f floor=%s material=%s floorDistance=%.3f",
 			phase,
 			character:GetAttribute("Beyond90MeasuredBodyHeightStuds") or -1,
 			humanoid.HipHeight,
@@ -202,7 +251,10 @@ local function updateGroundingAttributes(
 			rightFootBottomY or -1,
 			footGroundError or 0,
 			clearanceError or 0,
-			hipAdjustment
+			hipAdjustment,
+			floorPartName,
+			floorMaterial,
+			floorDistance
 		))
 	end
 end
@@ -224,7 +276,7 @@ local function applyCharacterGroundingCalibration(
 	canAdjust: boolean,
 	maxCorrectionOverride: number?
 )
-	local groundY = getPitchGroundY(spawnLocation)
+	local groundY = getPitchGroundContext(character, spawnLocation)
 	local lowestFootBottomY = getLowestFootBottomY(character)
 
 	if not lowestFootBottomY then

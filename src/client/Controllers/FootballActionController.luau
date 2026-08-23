@@ -9,6 +9,8 @@ local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local ControlledBallController = require(script.Parent:WaitForChild("ControlledBallController"))
 local InputController = require(script.Parent:WaitForChild("InputController"))
+local MovementController = require(script.Parent:WaitForChild("MovementController"))
+local PassTargetPresentationController = require(script.Parent:WaitForChild("PassTargetPresentationController"))
 
 local FootballActionController = {}
 
@@ -17,6 +19,7 @@ local initialized = false
 local requestRemote: RemoteEvent? = nil
 local feedbackRemote: RemoteEvent? = nil
 local connections: { RBXScriptConnection } = {}
+local presentationEvent = Instance.new("BindableEvent")
 
 local function log(message: string)
 	print(string.format("%s[Client][FootballAction] %s", GameConfig.LogPrefix, message))
@@ -124,8 +127,52 @@ local function onFootballAction(action)
 		return
 	end
 
-	ControlledBallController.NotifyLocalFootballActionRelease(0.22)
+	if actionType == "GroundPass" or actionType == "ThroughPass" then
+		local aimDirection = getAimDirection(action)
+		local plan = PassTargetPresentationController.Select(actionType, aimDirection)
 
+		if not plan or not plan.SelectedCandidate or not plan.SelectedCandidate.UserId then
+			log("[PassTarget] result=none reason=no-valid-receiver")
+			return
+		end
+
+		MovementController.BeginActionMovement("Pass")
+		presentationEvent:Fire({
+			Stage = "Predicted",
+			ActionType = actionType,
+			Timestamp = action.Timestamp or os.clock(),
+			IntendedReceiverUserId = plan.SelectedCandidate.UserId,
+		})
+		log(string.format(
+			"[PassTarget] receiver=%s distance=%.1f angle=%.1f score=%.2f targetPosition=%s",
+			plan.SelectedCandidate.Name,
+			plan.Distance,
+			plan.AngleDegrees or 0,
+			plan.Score,
+			tostring(plan.TargetPosition)
+		))
+
+		local remoteAtRelease = remote
+		task.delay(FootballActionConfig.Targeting.ServerReleaseDelay, function()
+			if requestRemote ~= remoteAtRelease then
+				MovementController.CancelActionMovement("Pass")
+				return
+			end
+
+			ControlledBallController.NotifyLocalFootballActionRelease(0.22)
+			remoteAtRelease:FireServer({
+				ActionType = actionType,
+				HoldDuration = action.HoldDuration or 0,
+				AimDirection = aimDirection,
+				MoveMagnitude = action.MoveMagnitude or 0,
+				Timestamp = action.Timestamp or os.clock(),
+				IntendedReceiverUserId = plan.SelectedCandidate.UserId,
+			})
+		end)
+		return
+	end
+
+	ControlledBallController.NotifyLocalFootballActionRelease(0.22)
 	remote:FireServer({
 		ActionType = actionType,
 		HoldDuration = action.HoldDuration or 0,
@@ -141,12 +188,26 @@ local function onFeedback(payload)
 	end
 
 	if not payload.Accepted then
+		if payload.ActionType == "GroundPass" or payload.ActionType == "ThroughPass" then
+			MovementController.CancelActionMovement("Pass")
+		end
+		presentationEvent:Fire({
+			Stage = "Rejected",
+			ActionType = payload.ActionType,
+			Reason = payload.Reason,
+		})
+
 		if FootballActionConfig.DebugEnabled then
 			log(string.format("%s rejected: %s", tostring(payload.ActionType), tostring(payload.Reason)))
 		end
 
 		return
 	end
+
+	presentationEvent:Fire({
+		Stage = "Accepted",
+		ActionType = payload.ActionType,
+	})
 
 	if typeof(payload.TargetPosition) == "Vector3" then
 		createTargetMarker(payload.TargetPosition, payload.TargetName)
@@ -195,6 +256,10 @@ function FootballActionController.Initialize()
 
 	table.insert(connections, InputController.GetFootballActionEvent().Event:Connect(onFootballAction))
 	table.insert(connections, feedbackRemote.OnClientEvent:Connect(onFeedback))
+end
+
+function FootballActionController.GetPresentationEvent(): BindableEvent
+	return presentationEvent
 end
 
 function FootballActionController.Destroy()

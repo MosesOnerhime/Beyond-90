@@ -1,4 +1,3 @@
-local CollectionService = game:GetService("CollectionService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
@@ -17,6 +16,7 @@ local initialized = false
 local requestRemote: RemoteEvent? = nil
 local feedbackRemote: RemoteEvent? = nil
 local lastActionAtByPlayer: { [Player]: { [string]: number } } = {}
+local nextPassId = 0
 
 local function log(message: string)
 	print(string.format("%s[FootballAction] %s", GameConfig.LogPrefix, message))
@@ -69,8 +69,9 @@ end
 local function getPlayerRoot(player: Player): BasePart?
 	local character = player.Character
 	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 
-	if rootPart and rootPart:IsA("BasePart") then
+	if rootPart and rootPart:IsA("BasePart") and humanoid and humanoid.Health > 0 then
 		return rootPart
 	end
 
@@ -97,44 +98,16 @@ local function getAimDirection(player: Player, payload): Vector3
 	return horizontal.Unit
 end
 
-local function getPartFromTarget(target: Instance): BasePart?
-	if target:IsA("BasePart") then
-		return target
-	end
-
-	if target:IsA("Model") then
-		local primaryPart = target.PrimaryPart
-
-		if primaryPart then
-			return primaryPart
-		end
-
-		local rootPart = target:FindFirstChild("HumanoidRootPart")
-
-		if rootPart and rootPart:IsA("BasePart") then
-			return rootPart
-		end
-
-		local descendant = target:FindFirstChildWhichIsA("BasePart", true)
-
-		if descendant then
-			return descendant
-		end
-	end
-
-	return nil
-end
-
 local function isSameTeamOrDevelopment(passer: Player, candidatePlayer: Player): boolean
 	if passer == candidatePlayer then
 		return false
 	end
 
-	if passer.Team and candidatePlayer.Team then
+	if passer.Team or candidatePlayer.Team then
 		return passer.Team == candidatePlayer.Team
 	end
 
-	return true
+	return FootballActionConfig.Targeting.AllowUnteamedDevelopmentReceivers == true
 end
 
 local function collectCandidates(passer: Player)
@@ -148,27 +121,13 @@ local function collectCandidates(passer: Player)
 				table.insert(candidates, {
 					Kind = "Player",
 					Name = player.Name,
+					UserId = player.UserId,
 					Instance = player,
 					Position = rootPart.Position,
 					Velocity = rootPart.AssemblyLinearVelocity,
 					FacingDirection = BallControlMath.GetHorizontal(rootPart.CFrame.LookVector),
 				})
 			end
-		end
-	end
-
-	for _, tagged in CollectionService:GetTagged(FootballActionConfig.DevelopmentPassTargetTag) do
-		local part = getPartFromTarget(tagged)
-
-		if part then
-			table.insert(candidates, {
-				Kind = "DevelopmentTarget",
-				Name = tagged.Name,
-				Instance = tagged,
-				Position = part.Position,
-				Velocity = part.AssemblyLinearVelocity,
-				FacingDirection = BallControlMath.GetHorizontal(part.CFrame.LookVector),
-			})
 		end
 	end
 
@@ -194,7 +153,7 @@ local function isCooldownReady(player: Player, actionType: string, cooldown: num
 	return true
 end
 
-local function sendFeedback(player: Player, accepted: boolean, reason: string?, plan)
+local function sendFeedback(player: Player, accepted: boolean, reason: string?, plan, actionTypeOverride: string?)
 	local remote = feedbackRemote
 
 	if not remote then
@@ -204,9 +163,10 @@ local function sendFeedback(player: Player, accepted: boolean, reason: string?, 
 	remote:FireClient(player, {
 		Accepted = accepted,
 		Reason = reason or "",
-		ActionType = plan and plan.ActionType or "",
+		ActionType = actionTypeOverride or (plan and plan.ActionType) or "",
 		TargetPosition = plan and plan.TargetPosition or nil,
 		TargetName = plan and plan.SelectedCandidate and plan.SelectedCandidate.Name or "",
+		TargetUserId = plan and plan.SelectedCandidate and plan.SelectedCandidate.UserId or 0,
 		LaunchSpeed = plan and plan.LaunchSpeed or 0,
 		Distance = plan and plan.Distance or 0,
 		PredictedArrivalTime = plan and plan.PredictedArrivalTime or 0,
@@ -248,32 +208,41 @@ local function handlePass(player: Player, actionType: string, payload)
 	local rootPart = getPlayerRoot(player)
 
 	if not ball or not rootPart then
-		sendFeedback(player, false, "missing ball or character", nil)
+		sendFeedback(player, false, "missing ball or character", nil, actionType)
 		return
 	end
 
 	if not BallControlService.IsControlledBy(player, ball) then
-		sendFeedback(player, false, "player does not control ball", nil)
+		sendFeedback(player, false, "player does not control ball", nil, actionType)
 		return
 	end
 
 	local actionConfig = if actionType == "ThroughPass" then FootballActionConfig.ThroughPass else FootballActionConfig.Pass
 
 	if not isCooldownReady(player, actionType, actionConfig.Cooldown) then
-		sendFeedback(player, false, "cooldown", nil)
+		sendFeedback(player, false, "cooldown", nil, actionType)
 		return
 	end
 
 	local ballDistance = BallControlMath.GetHorizontal(ball.Position - rootPart.Position).Magnitude
 
 	if ballDistance > BallConfig.Control.HardControlDistance then
-		sendFeedback(player, false, "ball too far", nil)
+		sendFeedback(player, false, "ball too far", nil, actionType)
 		return
 	end
 
 	local holdDuration = if payload and typeof(payload.HoldDuration) == "number" then payload.HoldDuration else 0
+	local requestedReceiverUserId = if payload and typeof(payload.IntendedReceiverUserId) == "number"
+		then math.floor(payload.IntendedReceiverUserId)
+		else 0
+
+	if requestedReceiverUserId <= 0 then
+		sendFeedback(player, false, "no valid receiver", nil, actionType)
+		return
+	end
+
 	local aimDirection = getAimDirection(player, payload)
-	local intensity = getHoldIntensity(actionConfig, holdDuration)
+	local intensity = 1
 	local plan, reason = PassPlanner.Plan(
 		ball.Position,
 		aimDirection,
@@ -281,14 +250,17 @@ local function handlePass(player: Player, actionType: string, payload)
 		actionType,
 		collectCandidates(player),
 		FootballActionConfig,
-		intensity
+		intensity,
+		requestedReceiverUserId
 	)
 
 	if not plan then
-		sendFeedback(player, false, reason or "could not plan pass", nil)
+		sendFeedback(player, false, reason or "could not plan pass", nil, actionType)
 		return
 	end
 
+	nextPassId += 1
+	local passId = nextPassId
 	local released = BallControlService.ReleaseForFootballAction(
 		ball,
 		player,
@@ -297,10 +269,12 @@ local function handlePass(player: Player, actionType: string, payload)
 		plan.ReleaseReacquireSuppression,
 		plan.ReleaseReacquireExitDistance,
 		{
+			PassId = passId,
 			IntendedReceiverUserId = getSelectedReceiverUserId(plan),
 			IntendedReceiverName = plan.SelectedCandidate and plan.SelectedCandidate.Name or "",
 			TargetPosition = plan.TargetPosition,
 			TargetKind = plan.SelectedCandidate and plan.SelectedCandidate.Kind or "Space",
+			EstimatedArrivalTime = plan.PredictedArrivalTime,
 		}
 	)
 
@@ -310,10 +284,12 @@ local function handlePass(player: Player, actionType: string, payload)
 	end
 
 	log(string.format(
-		"%s by %s target=%s intensity=%.2fx distance=%.1f launchSpeed=%.1f predictedArrivalSpeed=%.1f eta=%.2f score=%.2f",
+		"%s by %s receiver=%s userId=%d angle=%.1f intensity=%.2fx distance=%.1f launchSpeed=%.1f predictedArrivalSpeed=%.1f eta=%.2f score=%.2f",
 		actionType,
 		player.Name,
-		plan.SelectedCandidate and plan.SelectedCandidate.Name or "space",
+		plan.SelectedCandidate.Name,
+		plan.SelectedCandidate.UserId,
+		plan.AngleDegrees or 0,
 		plan.Intensity,
 		plan.Distance,
 		plan.LaunchSpeed,

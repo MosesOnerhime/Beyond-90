@@ -18,6 +18,7 @@ local active = false
 local selectedDistancePresetIndex = config.DefaultDistancePresetIndex or 1
 local smoothedPosition: Vector3? = nil
 local smoothedFocus: Vector3? = nil
+local followAnchor: Vector3? = nil
 local smoothedForward: Vector3? = nil
 local smoothedFOV = config.BaseFOV
 local lastAttributeSampleTime = 0
@@ -276,29 +277,43 @@ local function clampTargetToPitch(position: Vector3, pitchState, distanceScale: 
 	return positionFromOffsets(lengthOffset, widthOffset, pitchState)
 end
 
-local function applySoftCompositionZone(target: Vector3, pitchState): Vector3
-	if not smoothedFocus then
+local function updateFollowAnchor(target: Vector3, pitchState, deltaTime: number): Vector3
+	if not followAnchor then
+		followAnchor = target
 		return target
 	end
 
-	local previousLength, previousWidth = getPitchOffsets(smoothedFocus :: Vector3, pitchState)
+	local previousLength, previousWidth = getPitchOffsets(followAnchor :: Vector3, pitchState)
 	local targetLength, targetWidth = getPitchOffsets(target, pitchState)
 	local lengthDelta = targetLength - previousLength
 	local widthDelta = targetWidth - previousWidth
+	local desiredLength = previousLength
+	local desiredWidth = previousWidth
 
-	if math.abs(lengthDelta) <= config.SoftZoneLength then
-		targetLength = previousLength
-	else
-		targetLength -= sign(lengthDelta) * config.SoftZoneLength
+	if math.abs(lengthDelta) > config.FollowDeadZoneLength then
+		desiredLength = targetLength - sign(lengthDelta) * config.FollowDeadZoneLength
 	end
 
-	if math.abs(widthDelta) <= config.SoftZoneWidth then
-		targetWidth = previousWidth
-	else
-		targetWidth -= sign(widthDelta) * config.SoftZoneWidth
+	if math.abs(widthDelta) > config.FollowDeadZoneWidth then
+		desiredWidth = targetWidth - sign(widthDelta) * config.FollowDeadZoneWidth
 	end
 
-	return positionFromOffsets(targetLength, targetWidth, pitchState)
+	local desired = positionFromOffsets(desiredLength, desiredWidth, pitchState)
+	local lag = BallControlMath.GetHorizontal(target - desired)
+	if lag.Magnitude > config.MaxTargetLag then
+		desired = target - lag.Unit * config.MaxTargetLag
+	end
+
+	local currentLag = BallControlMath.GetHorizontal(target - (followAnchor :: Vector3)).Magnitude
+	local responsiveness = if currentLag >= config.CatchupDistance
+		then config.CatchupResponsiveness
+		else config.FollowResponsiveness
+	followAnchor = smoothVector(followAnchor, desired, responsiveness, deltaTime)
+	local finalLag = BallControlMath.GetHorizontal(target - (followAnchor :: Vector3))
+	if finalLag.Magnitude > config.MaxTargetLag then
+		followAnchor = target - finalLag.Unit * config.MaxTargetLag
+	end
+	return followAnchor :: Vector3
 end
 
 local function clampCameraToSafeCorridor(position: Vector3, pitchState, distanceScale: number): Vector3
@@ -450,7 +465,8 @@ local function updateCamera(deltaTime: number)
 		+ getBoundedBallInfluence(rootPart, ball)
 
 	framingPoint = clampTargetToPitch(framingPoint, pitchState, distanceScale)
-	framingPoint = applySoftCompositionZone(framingPoint, pitchState)
+	local rawFramingPoint = framingPoint
+	framingPoint = updateFollowAnchor(framingPoint, pitchState, deltaTime)
 	framingPoint = clampTargetToPitch(framingPoint, pitchState, distanceScale)
 
 	local sideSign = if config.BroadcastSide >= 0 then 1 else -1
@@ -499,6 +515,8 @@ local function updateCamera(deltaTime: number)
 		localPlayer:SetAttribute("Beyond90CameraDistancePreset", preset.Name)
 		localPlayer:SetAttribute("Beyond90CameraHeight", height)
 		localPlayer:SetAttribute("Beyond90CameraDownAngle", math.deg(math.asin(math.clamp(-forward.Y, -1, 1))))
+		localPlayer:SetAttribute("Beyond90CameraFollowLag", BallControlMath.GetHorizontal(rawFramingPoint - framingPoint).Magnitude)
+		localPlayer:SetAttribute("Beyond90CameraFollowDeadZone", config.FollowDeadZoneLength)
 
 		local head = localPlayer.Character and localPlayer.Character:FindFirstChild("Head")
 		if head and head:IsA("BasePart") then
@@ -517,6 +535,7 @@ function BroadcastCamera.Enable()
 	active = true
 	smoothedPosition = nil
 	smoothedFocus = nil
+	followAnchor = nil
 	smoothedForward = nil
 	smoothedFOV = config.BaseFOV
 	restoreSafeDefaultCamera()
@@ -537,6 +556,7 @@ function BroadcastCamera.Disable()
 
 	smoothedPosition = nil
 	smoothedFocus = nil
+	followAnchor = nil
 	smoothedForward = nil
 	clearObstructionFade()
 	clearBroadcastSideFade()

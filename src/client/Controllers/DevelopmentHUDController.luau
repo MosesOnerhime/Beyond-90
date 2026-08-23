@@ -106,7 +106,7 @@ local function createJogRateControl(parent: Instance, position: UDim2)
 	local container = Instance.new("Frame")
 	container.Name = "JogRateControl"
 	container.Position = position
-	container.Size = UDim2.fromOffset(300, 54)
+	container.Size = UDim2.fromOffset(300, 84)
 	container.BackgroundColor3 = Color3.fromRGB(24, 28, 34)
 	container.BackgroundTransparency = 0.12
 	container.BorderSizePixel = 0
@@ -187,11 +187,18 @@ local function updateJogRateControl()
 
 	local diagnostics = AnimationController.GetDiagnostics()
 	jogRateLabel.Text = string.format(
-		"JOG RATE %.2fx\nSPD %.1f  BASE %.2f  PLAY %.2f",
+		"LOC %s %s  RATE %.2fx\nSPD %.1f  ANG %.0f  PLAY %.2f\nACTION %s  EXIT %s\nBALL %s  LEAD %.1f  ETA %.2f",
+		diagnostics.LocomotionFamily or "Default",
+		diagnostics.Direction or "",
 		AnimationController.GetJogPlaybackMultiplier(),
 		diagnostics.HorizontalSpeed or 0,
-		diagnostics.BasePlaybackRate or 0,
-		diagnostics.FinalPlaybackRate or 0
+		diagnostics.MovementAngle or 0,
+		diagnostics.FinalPlaybackRate or 0,
+		diagnostics.Action ~= "" and diagnostics.Action or "none",
+		diagnostics.ActionExitTarget ~= "" and diagnostics.ActionExitTarget or "--",
+		localPlayer:GetAttribute("Beyond90AnimationDribblePhase") or "--",
+		localPlayer:GetAttribute("Beyond90AnimationBallLead") or 0,
+		localPlayer:GetAttribute("Beyond90AnimationExpectedRecontactTime") or 0
 	)
 end
 

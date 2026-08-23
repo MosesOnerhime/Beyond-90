@@ -144,7 +144,13 @@ end
 
 local function getBallIntentTargetDirection(rootPart: BasePart, locomotionState): Vector3
 	if locomotionState.RawMagnitude > 0 and locomotionState.RawDirection.Magnitude > 0 then
-		return locomotionState.RawDirection.Unit
+		local desiredDirection = locomotionState.RawDirection.Unit
+		local facingDirection = getFacingDirection(rootPart)
+		local facingInfluence = math.clamp(controlConfig.BallIntentFacingInfluence or 0, 0, 0.35)
+		return BallControlMath.SafeUnit(
+			desiredDirection * (1 - facingInfluence) + facingDirection * facingInfluence,
+			desiredDirection
+		)
 	end
 
 	return getLocomotionDirection(rootPart, locomotionState)
@@ -195,28 +201,64 @@ local function getTargetPosition(rootPart: BasePart, direction: Vector3, leadDis
 	return Vector3.new(horizontalTarget.X, rootPart.Position.Y, horizontalTarget.Z)
 end
 
-local function getTouchInterval(locomotionState): number
+local function getMovementTier(locomotionState): string
 	if locomotionState.IsSprinting then
-		return controlConfig.SprintTouchInterval
+		return "Sprint"
 	end
 
-	return controlConfig.WalkTouchInterval
+	if locomotionState.SmoothedSpeed >= controlConfig.LowMovementSpeedThreshold then
+		return "Jog"
+	end
+
+	return "Low"
+end
+
+local function getTouchInterval(locomotionState): number
+	local tier = getMovementTier(locomotionState)
+
+	if tier == "Sprint" then
+		return controlConfig.SprintTouchInterval
+	elseif tier == "Jog" then
+		return controlConfig.JogTouchInterval
+	end
+
+	return controlConfig.LowTouchInterval
 end
 
 local function getTouchSpeedPulse(locomotionState): number
-	if locomotionState.IsSprinting then
+	local tier = getMovementTier(locomotionState)
+
+	if tier == "Sprint" then
 		return controlConfig.SprintTouchSpeedPulse
+	elseif tier == "Jog" then
+		return controlConfig.JogTouchSpeedPulse
 	end
 
-	return controlConfig.WalkTouchSpeedPulse
+	return controlConfig.LowTouchSpeedPulse
+end
+
+local function getTouchImpulseDeltaSpeed(locomotionState): number
+	local tier = getMovementTier(locomotionState)
+
+	if tier == "Sprint" then
+		return controlConfig.SprintTouchImpulseDeltaSpeed
+	elseif tier == "Jog" then
+		return controlConfig.JogTouchImpulseDeltaSpeed
+	end
+
+	return controlConfig.LowTouchImpulseDeltaSpeed
 end
 
 local function getTouchHopHeight(locomotionState): number
-	if locomotionState.IsSprinting then
+	local tier = getMovementTier(locomotionState)
+
+	if tier == "Sprint" then
 		return controlConfig.SprintTouchHopHeight
+	elseif tier == "Jog" then
+		return controlConfig.JogTouchHopHeight
 	end
 
-	return controlConfig.WalkTouchHopHeight
+	return controlConfig.LowTouchHopHeight
 end
 
 local function getTouchUpwardVelocity(locomotionState): number
@@ -230,27 +272,39 @@ local function getTouchUpwardVelocity(locomotionState): number
 end
 
 local function getTouchLeadPulse(locomotionState): number
-	if locomotionState.IsSprinting then
+	local tier = getMovementTier(locomotionState)
+
+	if tier == "Sprint" then
 		return controlConfig.SprintTouchLeadPulse
+	elseif tier == "Jog" then
+		return controlConfig.JogTouchLeadPulse
 	end
 
-	return controlConfig.WalkTouchLeadPulse
+	return controlConfig.LowTouchLeadPulse
 end
 
 local function getTargetPeakForwardLead(locomotionState): number
-	if locomotionState.IsSprinting then
+	local tier = getMovementTier(locomotionState)
+
+	if tier == "Sprint" then
 		return controlConfig.SprintPeakForwardLeadTarget
+	elseif tier == "Jog" then
+		return controlConfig.JogPeakForwardLeadTarget
 	end
 
-	return controlConfig.WalkPeakForwardLeadTarget
+	return controlConfig.LowPeakForwardLeadTarget
 end
 
 local function getMaximumPeakForwardLead(locomotionState): number
-	if locomotionState.IsSprinting then
+	local tier = getMovementTier(locomotionState)
+
+	if tier == "Sprint" then
 		return controlConfig.SprintMaxForwardLead
+	elseif tier == "Jog" then
+		return controlConfig.JogMaxForwardLead
 	end
 
-	return controlConfig.WalkMaxForwardLead
+	return controlConfig.LowMaxForwardLead
 end
 
 local function getTouchElapsed(): number
@@ -467,7 +521,13 @@ local function beginTouchPulse(ball: BasePart, locomotionState, direction: Vecto
 	ball:SetAttribute("LastLocalControlTouchTime", now)
 	ball:SetAttribute("LastLocalControlTouchCount", touchEventCount)
 	ball:SetAttribute("LastLocalDribbleFootSide", if lastTouchSide > 0 then "Right" else "Left")
-	ball:SetAttribute("LastLocalDribbleTouchStrength", if locomotionState.IsSprinting then "Sprint" else "Walk")
+	ball:SetAttribute("LastLocalDribbleTouchStrength", getMovementTier(locomotionState))
+
+	local forwardImpulseDeltaSpeed = getTouchImpulseDeltaSpeed(locomotionState)
+
+	if forwardImpulseDeltaSpeed > 0 then
+		applyVelocityDelta(ball, direction * forwardImpulseDeltaSpeed)
+	end
 
 	local upwardVelocity = getTouchUpwardVelocity(locomotionState)
 
@@ -486,7 +546,7 @@ local function beginTouchPulse(ball: BasePart, locomotionState, direction: Vecto
 	ball.AssemblyAngularVelocity = Vector3.new(angularVelocity.X, ball.AssemblyAngularVelocity.Y, angularVelocity.Z)
 	dribbleTouchEvent:Fire({
 		FootSide = if lastTouchSide > 0 then "Right" else "Left",
-		TouchStrength = if locomotionState.IsSprinting then "Sprint" else "Walk",
+		TouchStrength = getMovementTier(locomotionState),
 		TouchPhase = "Push",
 		IsSprinting = locomotionState.IsSprinting,
 	})

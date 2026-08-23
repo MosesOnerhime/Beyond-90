@@ -1,8 +1,10 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
+local BallConfig = require(Shared.Config.BallConfig)
 local BallControlMath = require(Shared.Football.BallControlMath)
 local GameConfig = require(Shared.Config.GameConfig)
 local PlayerConfig = require(Shared.Config.PlayerConfig)
@@ -18,14 +20,116 @@ local applyStepName = "Beyond90Locomotion"
 
 local initialized = false
 local currentHumanoid: Humanoid? = nil
+local currentRootPart: BasePart? = nil
 local sprintRequested = false
 local sprintRemote: RemoteEvent? = nil
 local characterAddedConnection: RBXScriptConnection? = nil
 local humanoidDiedConnection: RBXScriptConnection? = nil
+local jumpInputConnection: RBXScriptConnection? = nil
+local humanoidStateConnection: RBXScriptConnection? = nil
 local inputSource = "InputAction"
 local locomotionBound = false
 local lastDiagnosticTime = 0
 local setSprintRequested: ((boolean) -> ())? = nil
+local cachedBall: BasePart? = nil
+local movementMode = "Normal"
+local actionProfileName = ""
+local actionBrakeEnd = 0
+local actionLockEnd = 0
+local actionExitEnd = 0
+local observedPassId = 0
+local observedPassAt = 0
+local lastReceptionAssistDiagnostic = 0
+local lastReceptionAssistPhase = ""
+local jumpForce: VectorForce? = nil
+local jumpAttachment: Attachment? = nil
+local jumpStartedAt = 0
+local jumpAssistToken = 0
+local jumpStartY = 0
+local jumpPeakY = 0
+
+local function getFootball(): BasePart?
+	if cachedBall and cachedBall.Parent then
+		return cachedBall
+	end
+
+	local rootFolder = Workspace:FindFirstChild(GameConfig.WorkspaceContainerName)
+	local ballFolder = rootFolder and rootFolder:FindFirstChild("Ball")
+	local ball = ballFolder and ballFolder:FindFirstChild(BallConfig.Name)
+
+	if ball and ball:IsA("BasePart") then
+		cachedBall = ball
+		return ball
+	end
+
+	cachedBall = nil
+	return nil
+end
+
+local function clearJumpAssist()
+	if jumpForce then
+		jumpForce:Destroy()
+		jumpForce = nil
+	end
+
+	if jumpAttachment then
+		jumpAttachment:Destroy()
+		jumpAttachment = nil
+	end
+
+	localPlayer:SetAttribute("Beyond90JumpAssistActive", false)
+end
+
+local function startJumpAssist(rootPart: BasePart)
+	clearJumpAssist()
+	jumpAssistToken += 1
+	local token = jumpAssistToken
+	local profile = movementConfig.JumpProfile
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "Beyond90JumpAssistAttachment"
+	attachment.Parent = rootPart
+	local force = Instance.new("VectorForce")
+	force.Name = "Beyond90JumpAssist"
+	force.Attachment0 = attachment
+	force.ApplyAtCenterOfMass = true
+	force.RelativeTo = Enum.ActuatorRelativeTo.World
+	force.Force = Vector3.yAxis * rootPart.AssemblyMass * Workspace.Gravity * profile.GravityCompensation
+	force.Parent = rootPart
+	jumpAttachment = attachment
+	jumpForce = force
+	jumpStartedAt = os.clock()
+	jumpStartY = rootPart.Position.Y
+	jumpPeakY = jumpStartY
+	localPlayer:SetAttribute("Beyond90JumpAssistActive", true)
+
+	task.delay(profile.MaxAssistDuration, function()
+		if token == jumpAssistToken then
+			clearJumpAssist()
+			localPlayer:SetAttribute("Beyond90JumpAssistActive", false)
+		end
+	end)
+end
+
+local function requestJump()
+	local humanoid = currentHumanoid
+	local rootPart = currentRootPart
+
+	if not movementConfig.JumpEnabled or not humanoid or not rootPart or humanoid.Health <= 0 then
+		return
+	end
+
+	local state = humanoid:GetState()
+	local airborne = state == Enum.HumanoidStateType.Jumping
+		or state == Enum.HumanoidStateType.Freefall
+		or humanoid.FloorMaterial == Enum.Material.Air
+
+	if airborne then
+		return
+	end
+
+	startJumpAssist(rootPart)
+	humanoid.Jump = true
+end
 
 local locomotionState = {
 	RawDirection = Vector3.zero,
@@ -39,6 +143,9 @@ local locomotionState = {
 	IsMoving = false,
 	IsValid = false,
 	InputSource = inputSource,
+	MovementMode = "Normal",
+	ReceptionAssistPhase = "",
+	ReceptionAssistWeight = 0,
 }
 
 local function warnLog(message: string)
@@ -96,6 +203,9 @@ local function resetLocomotionState()
 	locomotionState.IsMoving = false
 	locomotionState.IsValid = currentHumanoid ~= nil
 	locomotionState.InputSource = inputSource
+	locomotionState.MovementMode = "Normal"
+	locomotionState.ReceptionAssistPhase = ""
+	locomotionState.ReceptionAssistWeight = 0
 end
 
 local function getTurnSpeedFactor(currentVelocity: Vector3, targetDirection: Vector3): (number, number)
@@ -170,6 +280,124 @@ local function sampleDiagnostics()
 	localPlayer:SetAttribute("Beyond90TurnAngle", locomotionState.TurnAngle)
 	localPlayer:SetAttribute("Beyond90InputSource", locomotionState.InputSource)
 	localPlayer:SetAttribute("Beyond90SprintRequested", sprintRequested)
+	localPlayer:SetAttribute("Beyond90MovementMode", locomotionState.MovementMode)
+	localPlayer:SetAttribute("Beyond90ReceptionAssistPhase", locomotionState.ReceptionAssistPhase)
+	localPlayer:SetAttribute("Beyond90ReceptionAssistWeight", locomotionState.ReceptionAssistWeight)
+end
+
+local function getActionMovement(now: number): (boolean, number, number)
+	if actionProfileName == "" or now >= actionExitEnd then
+		if actionProfileName ~= "" then
+			actionProfileName = ""
+			movementMode = "Normal"
+		end
+		return false, 1, 0
+	end
+
+	local profile = locomotionConfig.ActionMovement[actionProfileName]
+
+	if not profile then
+		actionProfileName = ""
+		movementMode = "Normal"
+		return false, 1, 0
+	end
+
+	if now < actionBrakeEnd then
+		movementMode = "ActionBrake"
+		return true, 0, profile.BrakeTime
+	elseif now < actionLockEnd then
+		movementMode = "ActionLocked"
+		return true, 0, profile.BrakeTime
+	end
+
+	movementMode = "ActionExit"
+	local exitAlpha = math.clamp((now - actionLockEnd) / math.max(profile.ExitDuration, 1 / 240), 0, 1)
+	return true, exitAlpha, profile.BrakeTime
+end
+
+local function getReceptionAssist(
+	manualDirection: Vector3,
+	manualMagnitude: number,
+	now: number
+): (Vector3, number, string, number)
+	local config = locomotionConfig.ReceptionAssist
+
+	if not config.Enabled or not currentRootPart then
+		return manualDirection, manualMagnitude, "", 0
+	end
+
+	local ball = getFootball()
+	local intendedReceiver = ball and ball:GetAttribute("LastFootballActionIntendedReceiverUserId")
+	local actionType = ball and ball:GetAttribute("LastFootballAction")
+	local passId = ball and ball:GetAttribute("LastFootballActionPassId")
+	local targetPosition = ball and ball:GetAttribute("LastFootballActionTargetPosition")
+	local estimatedArrival = ball and ball:GetAttribute("LastFootballActionEstimatedArrivalTime")
+	local validPass = ball
+		and ball:GetAttribute("State") == "Free"
+		and intendedReceiver == localPlayer.UserId
+		and (actionType == "GroundPass" or actionType == "ThroughPass")
+		and typeof(passId) == "number"
+		and passId > 0
+		and typeof(targetPosition) == "Vector3"
+
+	if not validPass then
+		observedPassId = 0
+		lastReceptionAssistPhase = ""
+		return manualDirection, manualMagnitude, "", 0
+	end
+
+	if passId ~= observedPassId then
+		observedPassId = passId
+		observedPassAt = now
+	end
+
+	local expiry = (if typeof(estimatedArrival) == "number" then estimatedArrival else 0) + config.ExpiryGraceTime
+
+	if now - observedPassAt > expiry then
+		return manualDirection, manualMagnitude, "", 0
+	end
+
+	local offset = BallControlMath.GetHorizontal((targetPosition :: Vector3) - currentRootPart.Position)
+	local distance = offset.Magnitude
+
+	if distance > config.MaxDistance then
+		return manualDirection, manualMagnitude, "", 0
+	end
+
+	local approachAlpha = math.clamp(
+		(distance - config.StopDistance) / math.max(config.BrakeDistance - config.StopDistance, 0.01),
+		0,
+		1
+	)
+	local assistMagnitude = config.MaxMoveMagnitude * approachAlpha
+	local manualOverride = math.clamp(
+		(manualMagnitude - config.ManualBlendStart)
+			/ math.max(config.ManualOverrideMagnitude - config.ManualBlendStart, 0.01),
+		0,
+		1
+	)
+	local assistWeight = 1 - manualOverride
+	local assistDirection = if distance > 0.05 then offset.Unit else Vector3.zero
+	local blended = assistDirection * assistMagnitude * assistWeight + manualDirection * manualMagnitude
+	local outputMagnitude = math.clamp(blended.Magnitude, 0, 1)
+	local outputDirection = if outputMagnitude > 0.05 then blended.Unit else Vector3.zero
+	local phase = if distance <= config.StopDistance then "Receive" elseif distance <= config.BrakeDistance then "Brake" else "Approach"
+
+	if phase ~= lastReceptionAssistPhase or now - lastReceptionAssistDiagnostic >= config.DiagnosticInterval then
+		lastReceptionAssistDiagnostic = now
+		lastReceptionAssistPhase = phase
+		print(string.format(
+			"%s[Client][Movement][ReceptionAssist] receiver=%s distanceToPoint=%.2f eta=%.2f assistWeight=%.2f phase=%s",
+			GameConfig.LogPrefix,
+			localPlayer.Name,
+			distance,
+			math.max(0, expiry - (now - observedPassAt)),
+			assistWeight,
+			phase
+		))
+	end
+
+	return outputDirection, outputMagnitude, phase, assistWeight
 end
 
 local function updateLocomotion(deltaTime: number)
@@ -181,17 +409,36 @@ local function updateLocomotion(deltaTime: number)
 
 	local rawInput = InputController.GetInputState()
 	inputSource = rawInput.Source
+	local now = os.clock()
 
 	if rawInput.SprintRequested ~= sprintRequested then
 		setSprintRequested(rawInput.SprintRequested)
 	end
 
-	local rawDirection = rawInput.MoveDirection
-	local rawMagnitude = rawInput.MoveMagnitude
+	local rawDirection, rawMagnitude, receptionPhase, receptionWeight = getReceptionAssist(
+		rawInput.MoveDirection,
+		rawInput.MoveMagnitude,
+		now
+	)
+	local actionActive, actionInputScale, actionBrakeTime = getActionMovement(now)
+
+	if actionActive then
+		rawMagnitude *= actionInputScale
+		if rawMagnitude <= locomotionConfig.RawInputDeadzone then
+			rawDirection = Vector3.zero
+		end
+	elseif receptionPhase ~= "" then
+		movementMode = "ReceptionAssist"
+	else
+		movementMode = "Normal"
+	end
+
 	local targetSpeed = getTargetSpeed() * rawMagnitude
 	local turnFactor, turnAngle = getTurnSpeedFactor(locomotionState.SmoothedVelocity, rawDirection)
 	local targetVelocity = rawDirection * targetSpeed * turnFactor
-	local changeTime = getVelocityChangeTime(locomotionState.SmoothedVelocity, targetVelocity, turnAngle)
+	local changeTime = if actionActive
+		then actionBrakeTime
+		else getVelocityChangeTime(locomotionState.SmoothedVelocity, targetVelocity, turnAngle)
 	local maxDelta = getTargetSpeed() / math.max(changeTime, 1 / 240) * deltaTime
 	local nextVelocity = moveTowardVector(locomotionState.SmoothedVelocity, targetVelocity, maxDelta)
 	local nextSpeed = nextVelocity.Magnitude
@@ -214,6 +461,9 @@ local function updateLocomotion(deltaTime: number)
 	locomotionState.IsMoving = shouldMove
 	locomotionState.IsValid = true
 	locomotionState.InputSource = inputSource
+	locomotionState.MovementMode = movementMode
+	locomotionState.ReceptionAssistPhase = receptionPhase
+	locomotionState.ReceptionAssistWeight = receptionWeight
 
 	humanoid.WalkSpeed = locomotionState.SmoothedSpeed
 
@@ -221,6 +471,10 @@ local function updateLocomotion(deltaTime: number)
 		humanoid:Move(locomotionState.SmoothedDirection, false)
 	else
 		humanoid:Move(Vector3.zero, false)
+	end
+
+	if jumpStartedAt > 0 and currentRootPart then
+		jumpPeakY = math.max(jumpPeakY, currentRootPart.Position.Y)
 	end
 
 	sampleDiagnostics()
@@ -259,7 +513,13 @@ setSprintRequested = function(requested: boolean)
 end
 
 local function configureCharacter(character: Model)
+	jumpAssistToken += 1
+	clearJumpAssist()
 	sprintRequested = false
+	actionProfileName = ""
+	observedPassId = 0
+	lastReceptionAssistPhase = ""
+	jumpStartedAt = 0
 	resetLocomotionState()
 
 	if humanoidDiedConnection then
@@ -267,22 +527,58 @@ local function configureCharacter(character: Model)
 		humanoidDiedConnection = nil
 	end
 
+	if humanoidStateConnection then
+		humanoidStateConnection:Disconnect()
+		humanoidStateConnection = nil
+	end
+
 	local humanoid = character:WaitForChild("Humanoid", 10)
 
 	if not humanoid or not humanoid:IsA("Humanoid") then
 		warnLog("Character missing Humanoid; movement settings were not applied")
 		currentHumanoid = nil
+		currentRootPart = nil
+		return
+	end
+
+	local rootPart = character:WaitForChild("HumanoidRootPart", 10)
+	if not rootPart or not rootPart:IsA("BasePart") then
+		warnLog("Character missing HumanoidRootPart; movement settings were not applied")
+		currentHumanoid = nil
+		currentRootPart = nil
 		return
 	end
 
 	currentHumanoid = humanoid
+	currentRootPart = rootPart
 	locomotionState.IsValid = true
 	applyMovementSettings(humanoid)
 	sendSprintRequest(false)
 
 	humanoidDiedConnection = humanoid.Died:Connect(function()
+		jumpAssistToken += 1
+		clearJumpAssist()
 		setSprintRequested(false)
 		resetLocomotionState()
+	end)
+
+	humanoidStateConnection = humanoid.StateChanged:Connect(function(_, newState)
+		if newState ~= Enum.HumanoidStateType.Landed and newState ~= Enum.HumanoidStateType.Running then
+			return
+		end
+
+		if jumpStartedAt <= 0 or os.clock() - jumpStartedAt < 0.1 then
+			return
+		end
+
+		local airTime = os.clock() - jumpStartedAt
+		local peakHeight = math.max(0, jumpPeakY - jumpStartY)
+		jumpAssistToken += 1
+		clearJumpAssist()
+		jumpStartedAt = 0
+		localPlayer:SetAttribute("Beyond90JumpAirTime", airTime)
+		localPlayer:SetAttribute("Beyond90JumpPeakHeight", peakHeight)
+		log(string.format("Jump landed airTime=%.2f peakHeight=%.2f", airTime, peakHeight))
 	end)
 end
 
@@ -317,7 +613,46 @@ function MovementController.GetLocomotionState()
 		IsMoving = locomotionState.IsMoving,
 		IsValid = locomotionState.IsValid,
 		InputSource = locomotionState.InputSource,
+		MovementMode = locomotionState.MovementMode,
+		ReceptionAssistPhase = locomotionState.ReceptionAssistPhase,
+		ReceptionAssistWeight = locomotionState.ReceptionAssistWeight,
 	}
+end
+
+function MovementController.BeginActionMovement(profileName: string): boolean
+	local profile = locomotionConfig.ActionMovement[profileName]
+
+	if not profile then
+		warnLog(string.format("Unknown action movement profile: %s", profileName))
+		return false
+	end
+
+	local now = os.clock()
+	actionProfileName = profileName
+	actionBrakeEnd = now + profile.BrakeDuration
+	actionLockEnd = actionBrakeEnd + profile.LockDuration
+	actionExitEnd = actionLockEnd + profile.ExitDuration
+	movementMode = "ActionBrake"
+	log(string.format(
+		"Action movement -> %s brake=%.2f lock=%.2f exit=%.2f",
+		profileName,
+		profile.BrakeDuration,
+		profile.LockDuration,
+		profile.ExitDuration
+	))
+	return true
+end
+
+function MovementController.CancelActionMovement(profileName: string?)
+	if profileName and actionProfileName ~= profileName then
+		return
+	end
+
+	actionProfileName = ""
+	actionBrakeEnd = 0
+	actionLockEnd = 0
+	actionExitEnd = 0
+	movementMode = "Normal"
 end
 
 function MovementController.Initialize()
@@ -328,6 +663,7 @@ function MovementController.Initialize()
 	initialized = true
 	resolveSprintRemote()
 	bindLocomotion()
+	jumpInputConnection = InputController.GetJumpEvent().Event:Connect(requestJump)
 	log(string.format("Locomotion smoothing input source: %s", inputSource))
 
 	characterAddedConnection = localPlayer.CharacterAdded:Connect(configureCharacter)
@@ -359,7 +695,21 @@ function MovementController.Destroy()
 		humanoidDiedConnection = nil
 	end
 
+	if humanoidStateConnection then
+		humanoidStateConnection:Disconnect()
+		humanoidStateConnection = nil
+	end
+
+	if jumpInputConnection then
+		jumpInputConnection:Disconnect()
+		jumpInputConnection = nil
+	end
+
+	jumpAssistToken += 1
+	clearJumpAssist()
 	currentHumanoid = nil
+	currentRootPart = nil
+	actionProfileName = ""
 	sprintRequested = false
 	resetLocomotionState()
 end

@@ -22,6 +22,11 @@ A development `StarterCharacter` should:
 - have unanchored runtime body parts, especially `HumanoidRootPart`.
 - have a valid `Humanoid.HipHeight` and foot-ground relationship on a flat
   pitch after centralized scaling.
+- use a Roblox-compatible character collision setup: unanchored body assembly,
+  non-colliding `HumanoidRootPart` where appropriate, intentional body-part
+  colliders, and no imported mesh collider extending below the visible sole.
+- resolve grounding against the actual collidable floor, not a decorative,
+  transparent, or query-only pitch helper.
 - omit bundled/default `Animate` scripts unless they are explicitly being kept
   only as an inspectable reference outside the active player character.
 
@@ -60,9 +65,11 @@ foot-ground clearance after scaling. A single idle-frame measurement is not
 enough: inspect Idle and at least one forward Jog loop so animation foot
 trajectory does not hide pitch penetration.
 
-The current A0.5 flat-pitch target is a small visual sole clearance of `0.18`
-studs. This value was selected after sampling the Jog cycle, because lower
-static clearances still allowed visible penetration during foot travel.
+The current flat-pitch calibration target is `0.13` studs. A1 established that
+the real collidable grass surface is at `Y=0.500`; `0.18` produced visible
+floating while `0.08` produced measured penetration in later animation poses.
+The compromise must still be validated in Third Person across Idle and
+complete Jog cycles.
 Grounding may apply one bounded HipHeight calibration after spawn settle and
 one bounded late correction, followed by validation only. Do not introduce
 per-frame vertical correction, mesh offsets, limb resizing, or foot IK for this
@@ -83,19 +90,24 @@ baseline.
 11. Keep development scaling centralized in `PlayerConfig`.
 12. Verify measured height, `Humanoid.HipHeight`, both foot bottoms, and target
     foot clearance against the pitch ground surface.
-13. Test custom animation loading.
-14. Sample Idle and forward Jog grounding over multiple frames.
-15. Test movement and sprint.
-16. Test Broadcast and Third Person cameras.
-17. Test possession and controlled dribbling.
-18. Test passing and reception.
-19. Test reset and respawn.
-20. Test multiplayer visibility when practical.
-21. Revert to the previous saved character if compatibility is unacceptable.
+13. Audit `CanCollide`, collision groups, `Massless`, mesh collision
+    fidelity, floor material, and Humanoid floor detection.
+14. Confirm a collision-respecting floor ray reaches the same surface visible
+    as the grass.
+15. Test custom animation loading.
+16. Sample Idle and directional Jog grounding over multiple frames.
+17. Test movement and sprint.
+18. Test Broadcast and Third Person cameras.
+19. Test possession and controlled dribbling.
+20. Test passing and reception.
+21. Test reset and respawn.
+22. Test multiplayer visibility when practical.
+23. Revert to the previous saved character if compatibility is unacceptable.
 
 ## Animation Authority
 
-`AnimationController` owns custom Idle and Jog presentation. The active player
+`AnimationController` owns custom Idle, eight-way Jog, and Sprint
+presentation. The active player
 character should not depend on Roblox's default `Animate` script or bundled
 third-party animation IDs.
 
@@ -103,12 +115,13 @@ Current owned prototype assets:
 
 ```text
 B90_LOC_OffBall_Idle: rbxassetid://100655709305107
-B90_LOC_OffBall_Jog_F: rbxassetid://107084636256080
+B90_LOC_OffBall_Jog_F: rbxassetid://92336242583689
+B90_LOC_OffBall_Sprint_F: rbxassetid://131195698609108
 ```
 
-Missing custom states such as Sprint, Jump, Fall, and Ball Jog use neutral
-fallback presentation until Beyond 90-owned clips are authored. Do not stretch
-the jog clip into sprint or add character-specific joint correction hacks.
+Missing custom states such as Jump, Fall, and Ball Jog use neutral or explicit
+placeholder presentation until Beyond 90-owned clips are authored. Do not add
+character-specific joint correction hacks.
 
 Future possession jog work should add:
 
@@ -116,9 +129,9 @@ Future possession jog work should add:
 B90_LOC_Ball_Jog_F
 ```
 
-to `AnimationConfig.Assets.Locomotion.Ball.JogForward`. Until then,
-`BallJogPlaceholder` is allowed to use the off-ball jog clip for visual testing
-only.
+to the matching keys under `AnimationConfig.Assets.Locomotion.Ball.Jog`.
+Until then, `BallJogPlaceholder` may use the off-ball directional jog clips
+for visual testing only.
 
 The future possession jog should be authored as a football dribble posture:
 

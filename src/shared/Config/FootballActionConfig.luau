@@ -4,6 +4,16 @@ local FootballActionConfig = {
 	FeedbackRemoteName = "FootballActionFeedback",
 	DevelopmentPassTargetTag = "Beyond90PassTarget",
 	DebugEnabled = true,
+	Targeting = {
+		RequirePlayerReceiver = true,
+		AllowUnteamedDevelopmentReceivers = true,
+		PreviewRefreshInterval = 0.1,
+		ServerReleaseDelay = 0.12,
+		LineHeight = 0.06,
+		LineThickness = 0.08,
+		LineTransparency = 0.48,
+		LineColor = Color3.fromRGB(150, 155, 164),
+	},
 
 	DevelopmentIntensity = {
 		Min = 0.7,
@@ -38,6 +48,7 @@ local FootballActionConfig = {
 		ReceiverRadius = 3.5,
 		ReleaseReacquireSuppression = 0.1,
 		ReacquireExitDistance = 4.4,
+		PowerMode = "DistanceDerived",
 	},
 
 	ThroughPass = {
@@ -71,6 +82,7 @@ local FootballActionConfig = {
 		ReceiverRadius = 5,
 		ReleaseReacquireSuppression = 0.12,
 		ReacquireExitDistance = 4.8,
+		PowerMode = "DistanceDerived",
 	},
 
 	KnockOn = {

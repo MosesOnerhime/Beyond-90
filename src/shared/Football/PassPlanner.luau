@@ -20,12 +20,8 @@ local function isFiniteVector(vector: Vector3): boolean
 	return isFiniteNumber(vector.X) and isFiniteNumber(vector.Y) and isFiniteNumber(vector.Z)
 end
 
-local function getHoldAlpha(holdDuration: number, actionConfig): number
-	return math.clamp(holdDuration / math.max(actionConfig.HoldMaxTime, EPSILON), 0, 1)
-end
-
 local function getCandidatePosition(candidate): Vector3?
-	if typeof(candidate.Position) == "Vector3" then
+	if typeof(candidate.Position) == "Vector3" and isFiniteVector(candidate.Position) then
 		return candidate.Position
 	end
 
@@ -33,7 +29,7 @@ local function getCandidatePosition(candidate): Vector3?
 end
 
 local function getCandidateVelocity(candidate): Vector3
-	if typeof(candidate.Velocity) == "Vector3" then
+	if typeof(candidate.Velocity) == "Vector3" and isFiniteVector(candidate.Velocity) then
 		return getHorizontal(candidate.Velocity)
 	end
 
@@ -41,7 +37,7 @@ local function getCandidateVelocity(candidate): Vector3
 end
 
 local function getCandidateFacing(candidate): Vector3
-	if typeof(candidate.FacingDirection) == "Vector3" then
+	if typeof(candidate.FacingDirection) == "Vector3" and isFiniteVector(candidate.FacingDirection) then
 		return safeUnit(candidate.FacingDirection, Vector3.zAxis)
 	end
 
@@ -135,33 +131,24 @@ local function scoreCandidate(origin: Vector3, aimDirection: Vector3, candidate,
 	}
 end
 
-local function getDirectTarget(origin: Vector3, aimDirection: Vector3, holdDuration: number, actionConfig): Vector3
-	local holdAlpha = getHoldAlpha(holdDuration, actionConfig)
-	local distance = actionConfig.MinDistance
-		+ (actionConfig.DirectPassDistance - actionConfig.MinDistance) * (0.35 + holdAlpha * 0.65)
-
-	return origin + aimDirection * distance
-end
-
 local function getLaunchVelocity(
 	origin: Vector3,
 	target: Vector3,
-	holdDuration: number,
 	actionConfig,
 	intensity: number
 ): (Vector3, number, number, number)
 	local toTarget = getHorizontal(target - origin)
 	local distance = toTarget.Magnitude
 	local direction = safeUnit(toTarget, Vector3.zAxis)
-	local holdAlpha = getHoldAlpha(holdDuration, actionConfig)
-	local speedBasis = (actionConfig.MinLaunchSpeed + holdAlpha * 14) * intensity
-	local travelTime = math.clamp(
-		distance / math.max(speedBasis, 1),
-		actionConfig.TravelTimeMin,
-		actionConfig.TravelTimeMax
+	local distanceAlpha = math.clamp(
+		(distance - actionConfig.MinDistance) / math.max(actionConfig.MaxDistance - actionConfig.MinDistance, EPSILON),
+		0,
+		1
 	)
+	local travelTime = actionConfig.TravelTimeMin
+		+ (actionConfig.TravelTimeMax - actionConfig.TravelTimeMin) * math.sqrt(distanceAlpha)
 	local speed = math.clamp(
-		(distance / math.max(travelTime, EPSILON) + actionConfig.ArrivalSpeed * (0.35 + holdAlpha * 0.65)) * intensity,
+		(distance / math.max(travelTime, EPSILON) + actionConfig.ArrivalSpeed * 0.55) * intensity,
 		actionConfig.MinLaunchSpeed,
 		actionConfig.MaxLaunchSpeed * math.max(intensity, 1)
 	)
@@ -177,21 +164,31 @@ function PassPlanner.Plan(
 	actionType: string,
 	candidates: { any },
 	config,
-	intensity: number?
+	intensity: number?,
+	requiredReceiverUserId: number?
 )
 	if not isFiniteVector(origin) then
 		return nil, "invalid origin"
 	end
+	if not isFiniteVector(aimDirection) then
+		return nil, "invalid aim direction"
+	end
 
 	local actionConfig = if actionType == "ThroughPass" then config.ThroughPass else config.Pass
 	local intensityConfig = config.DevelopmentIntensity
-	local safeIntensity = if typeof(intensity) == "number"
+	local safeIntensity = if actionConfig.PowerMode == "DistanceDerived"
+		then 1
+		elseif typeof(intensity) == "number"
 		then math.clamp(intensity, intensityConfig.Min, intensityConfig.Max)
 		else 1
 	local normalizedAim = safeUnit(aimDirection, Vector3.zAxis)
 	local bestPlan = nil
 
 	for _, candidate in candidates do
+		if requiredReceiverUserId and requiredReceiverUserId > 0 and candidate.UserId ~= requiredReceiverUserId then
+			continue
+		end
+
 		local candidatePlan = scoreCandidate(origin, normalizedAim, candidate, actionType, actionConfig)
 
 		if candidatePlan and (not bestPlan or candidatePlan.Score > bestPlan.Score) then
@@ -199,24 +196,18 @@ function PassPlanner.Plan(
 		end
 	end
 
-	local targetPosition
-	local selectedCandidate = nil
-	local score = 0
-	local leadTime = 0
-
-	if bestPlan then
-		selectedCandidate = bestPlan.Candidate
-		targetPosition = bestPlan.TargetPosition
-		score = bestPlan.Score
-		leadTime = bestPlan.LeadTime
-	else
-		targetPosition = getDirectTarget(origin, normalizedAim, holdDuration, actionConfig)
+	if not bestPlan then
+		return nil, "no valid receiver"
 	end
+
+	local selectedCandidate = bestPlan.Candidate
+	local targetPosition = bestPlan.TargetPosition
+	local score = bestPlan.Score
+	local leadTime = bestPlan.LeadTime
 
 	local launchVelocity, launchSpeed, predictedArrivalTime, predictedArrivalSpeed = getLaunchVelocity(
 		origin,
 		targetPosition,
-		holdDuration,
 		actionConfig,
 		safeIntensity
 	)
@@ -232,6 +223,7 @@ function PassPlanner.Plan(
 		PredictedArrivalSpeed = predictedArrivalSpeed,
 		Intensity = safeIntensity,
 		ReceiverLeadTime = leadTime,
+		AngleDegrees = bestPlan.AngleDegrees,
 		Score = score,
 		Distance = getHorizontal(targetPosition - origin).Magnitude,
 		ReceiverRadius = actionConfig.ReceiverRadius,

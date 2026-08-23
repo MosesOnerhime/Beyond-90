@@ -20,6 +20,7 @@ local inputFolder: Folder? = nil
 local inputContext: Instance? = nil
 local movementAction: Instance? = nil
 local sprintAction: Instance? = nil
+local jumpAction: Instance? = nil
 local cameraToggleAction: Instance? = nil
 local passAction: Instance? = nil
 local throughPassAction: Instance? = nil
@@ -30,6 +31,7 @@ local pressedKeys: { [Enum.KeyCode]: boolean } = {}
 local actionStartedAt: { [string]: number } = {}
 local fallbackThumbstick = Vector2.zero
 local cameraToggleEvent = Instance.new("BindableEvent")
+local jumpEvent = Instance.new("BindableEvent")
 local footballActionEvent = Instance.new("BindableEvent")
 local autoSprintChangedEvent = Instance.new("BindableEvent")
 local manualSprintRequested = false
@@ -286,6 +288,9 @@ local function setupInputActions(): boolean
 	local okSprint, sprint = pcall(function()
 		return Instance.new("InputAction")
 	end)
+	local okJump, jump = pcall(function()
+		return Instance.new("InputAction")
+	end)
 	local okCameraToggle, cameraToggle = pcall(function()
 		return Instance.new("InputAction")
 	end)
@@ -302,6 +307,7 @@ local function setupInputActions(): boolean
 	if not okContext
 		or not okMove
 		or not okSprint
+		or not okJump
 		or not okCameraToggle
 		or not okPass
 		or not okThroughPass
@@ -376,6 +382,24 @@ local function setupInputActions(): boolean
 	table.insert(connections, sprint.StateChanged:Connect(function(value)
 		if typeof(value) == "boolean" then
 			setManualSprintRequested(value, "InputAction")
+		end
+	end))
+
+	jump.Name = inputConfig.JumpActionName
+	setProperty(jump, "Type", Enum.InputActionType.Bool)
+	jump.Parent = context
+	jumpAction = jump
+
+	addBinding(jump, "KeyboardJump", {
+		KeyCode = inputConfig.JumpKey,
+	})
+	addBinding(jump, "GamepadJump", {
+		KeyCode = Enum.KeyCode.ButtonA,
+	})
+
+	table.insert(connections, jump.StateChanged:Connect(function(value)
+		if value == true then
+			jumpEvent:Fire()
 		end
 	end))
 
@@ -516,6 +540,10 @@ local function setupUserInputFallback()
 			cameraToggleEvent:Fire()
 		end
 
+		if inputObject.KeyCode == inputConfig.JumpKey or inputObject.KeyCode == Enum.KeyCode.ButtonA then
+			jumpEvent:Fire()
+		end
+
 		if inputObject.KeyCode == inputConfig.PassKey then
 			actionStartedAt.GroundPass = os.clock()
 			fireFootballAction("GroundPass", "Pressed", 0)
@@ -609,6 +637,10 @@ function InputController.GetCameraToggleEvent(): BindableEvent
 	return cameraToggleEvent
 end
 
+function InputController.GetJumpEvent(): BindableEvent
+	return jumpEvent
+end
+
 function InputController.GetFootballActionEvent(): BindableEvent
 	return footballActionEvent
 end
@@ -684,6 +716,7 @@ function InputController.Destroy()
 
 	movementAction = nil
 	sprintAction = nil
+	jumpAction = nil
 	cameraToggleAction = nil
 	passAction = nil
 	throughPassAction = nil
