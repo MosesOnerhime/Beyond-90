@@ -50,6 +50,9 @@ local function restoreDefaultCamera()
 end
 
 local function setMode(mode: string)
+	if mode == "Broadcast" then
+		mode = "Broadcast1"
+	end
 	if mode == "FirstPerson" and not CameraConfig.FirstPerson.Enabled then
 		mode = "ThirdPerson"
 	end
@@ -78,22 +81,23 @@ local function setMode(mode: string)
 		end)
 	end
 
-	if mode == "Broadcast" then
+	if mode == "Broadcast1" or mode == "Broadcast2" then
 		if activeMode == "Default" then
 			originalCameraType = camera.CameraType
 			originalCameraSubject = camera.CameraSubject
 		end
 
-		activeMode = "Broadcast"
+		activeMode = mode
 		ThirdPersonCamera.Disable()
 		FirstPersonCamera.Disable()
 		FirstPersonCamera.RestoreLocalCharacterVisibility()
+		BroadcastCamera.SetProfile(mode)
 		afterFirstPersonExit(function()
-			if activeMode == "Broadcast" then
+			if activeMode == mode then
 				BroadcastCamera.Enable()
 			end
 		end)
-		log("Mode -> Broadcast")
+		log("Mode -> " .. mode)
 	elseif mode == "ThirdPerson" then
 		if activeMode == "Default" then
 			originalCameraType = camera.CameraType
@@ -134,10 +138,12 @@ local function setMode(mode: string)
 end
 
 local function togglePrimaryMode()
-	if activeMode == "Broadcast" then
+	if activeMode == "Broadcast1" then
+		setMode("Broadcast2")
+	elseif activeMode == "Broadcast2" then
 		setMode("ThirdPerson")
 	else
-		setMode("Broadcast")
+		setMode("Broadcast1")
 	end
 end
 
@@ -158,7 +164,7 @@ function CameraController.Initialize()
 	FirstPersonCamera.RestoreLocalCharacterVisibility()
 
 	if CameraConfig.DefaultMode == "Broadcast" then
-		setMode("Broadcast")
+		setMode("Broadcast1")
 	else
 		restoreDefaultCamera()
 	end

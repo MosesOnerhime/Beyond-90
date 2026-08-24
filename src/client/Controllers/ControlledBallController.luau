@@ -763,11 +763,6 @@ local function applyBodyExclusion(ball: BasePart, rootPart: BasePart, direction:
 	local outward = BallControlMath.SafeUnit(horizontalFromPlayer, direction)
 	local overlap = minDistance - distance
 
-	if distance <= controlConfig.DeepOverlapRescueDistance then
-		local rescuedHorizontal = BallControlMath.GetHorizontal(rootPart.Position) + outward * minDistance
-		ball.CFrame = CFrame.new(Vector3.new(rescuedHorizontal.X, ball.Position.Y, rescuedHorizontal.Z))
-	end
-
 	return outward * overlap * controlConfig.BodyExclusionGain
 end
 

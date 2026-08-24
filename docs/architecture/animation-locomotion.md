@@ -38,7 +38,7 @@ angle addresses eight 45-degree sectors:
 The two tracks bordering the current angle receive linear target weights. Their
 weights are exponentially smoothed and the dominant diagnostic direction uses
 hysteresis. Tracks are loaded once per character and reused. The accepted
-forward-jog baseline is a `0.90` playback multiplier at `14 studs/s`;
+forward-jog baseline is a `1.05` playback multiplier at `14 studs/s`;
 per-direction multipliers remain configurable.
 
 Locomotion presentation enters from movement intent as well as physical speed.
@@ -53,20 +53,19 @@ meaningful movement intent.
 Straight sprint uses `SprintForward`. The signed angle from smoothed movement
 to raw desired movement selects `SprintTurnLeft` or `SprintTurnRight` only
 after a meaningful turn threshold. Sprint tracks blend by weight and return to
-Forward below the exit threshold. Gameplay sprint speed remains `30 studs/s`.
+Forward below the exit threshold. Gameplay sprint speed is `28 studs/s`.
 A visual latch prevents transient velocity samples from switching back to Jog
 while sprint remains requested. After sprint release, Sprint remains visible
 during high-speed deceleration and blends to Jog below its exit speed.
 
-## Direction Change
+## Possession Direction Changes
 
-A presentation-only `DirectionChange180` action can play when consecutive
-nonzero desired movement directions differ by at least the configured reversal
-angle and movement exceeds the minimum speed. A cooldown prevents repeated
-triggers. The action does not lock, rotate, or translate the character.
-Runtime diagnostics compare world-root yaw with `RootJoint.Transform` yaw so a
-double-rotation problem can be classified without character-specific
-correction code.
+The dedicated `DirectionChange180` clip is intentionally removed. Without the
+ball, directional movement remains responsive. With controlled possession,
+`MovementController` stores major input changes as a pending direction while
+the player indicator immediately shows intent. Physical direction commits at a
+gameplay-controlled touch/recontact window, or after an angle- and gait-based
+maximum wait. Animation markers never authorize the turn or ball touch.
 
 ## Action Overlay And Exit Resolution
 
@@ -76,10 +75,9 @@ action weight fades out toward the current base locomotion. The resolver uses
 current speed, movement intent, sprint request, possession, and facing rather
 than restoring the gait that preceded the action.
 
-This shared path is used by `DirectionChange180`, `ReceivePass`, `Pass`, and
-`Jump`. It prevents an action from blindly returning to Sprint after a reversal
-has reduced the player to jog speed, and avoids empty-pose frames between an
-action and locomotion.
+This shared path is used by `ReceivePass`, `Pass`, `Shoot`, and `Jump`. It
+prevents stale gait restoration and avoids empty-pose frames between an action
+and locomotion.
 
 ## Jump
 
@@ -97,8 +95,10 @@ Ground Pass and Through Pass begin a predicted local presentation on release so
 the player does not wait for a server round trip. The existing server remains
 authoritative for possession, target, and ball velocity. Acceptance does not
 restart the animation, while rejection fades it out through the shared action
-exit path. The Shoot asset is loaded for validation but has no gameplay trigger
-in A1.2.
+exit path. The Shoot asset is preloaded and presented immediately after local
+intent. The server validates possession and goal geometry, prepares the shot,
+and releases on a `BallContact` marker when present or a short configured
+fallback when absent.
 
 In A1.2, normal passes require a selected eligible teammate. Local selection
 previews a candidate, while the server independently rebuilds the candidate
@@ -111,7 +111,17 @@ not homed after launch and remains interceptable.
 profiles. They brake and briefly plant the physical character while action
 tracks play, then restore input early instead of locking movement for the full
 clip. Reception assistance uses replicated intended-receiver metadata and
-blends a bounded approach toward the receive point with manual input.
+blends a bounded approach toward the receive point with manual input. For a
+free pass, the target is updated from current ball velocity and estimated
+airborne landing time rather than relying only on launch-time data.
+
+## Coming To Rest
+
+Physical coast and visual locomotion exit are separate. Jog begins fading to
+Idle or the temporary possession trap near `2 studs/s`, while movement finishes
+its final bounded coast. Sprint remains visible until actual horizontal speed
+falls below the sprint exit envelope, then blends through Jog rather than
+forcing Jog at near-sprint velocity.
 
 ## Possession Locomotion
 

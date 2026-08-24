@@ -1,8 +1,21 @@
 local BallControlMath = require(script.Parent.BallControlMath)
+local GameConfig = require(script.Parent.Parent.Config.GameConfig)
+local Workspace = game:GetService("Workspace")
 
 local PassPlanner = {}
 
 local EPSILON = 1e-4
+
+function PassPlanner.GetMaximumTargetRange(config): number
+	local gameRoot = Workspace:FindFirstChild(GameConfig.WorkspaceContainerName)
+	local pitchFolder = gameRoot and gameRoot:FindFirstChild("Pitch")
+	local gameplayBounds = pitchFolder and pitchFolder:FindFirstChild("GameplayBounds")
+	local pitchLength = gameplayBounds and gameplayBounds:GetAttribute("PitchLength")
+	if typeof(pitchLength) == "number" and pitchLength > 0 then
+		return pitchLength * config.Targeting.PitchLengthRangeScale
+	end
+	return config.Targeting.FallbackMaxTargetRange
+end
 
 local function getHorizontal(vector: Vector3): Vector3
 	return BallControlMath.GetHorizontal(vector)
@@ -147,14 +160,32 @@ local function getLaunchVelocity(
 	)
 	local travelTime = actionConfig.TravelTimeMin
 		+ (actionConfig.TravelTimeMax - actionConfig.TravelTimeMin) * math.sqrt(distanceAlpha)
+	local arrivalAlpha = distanceAlpha * distanceAlpha * (3 - 2 * distanceAlpha)
+	local desiredArrivalSpeed = actionConfig.ArrivalSpeed
+		+ ((actionConfig.LongArrivalSpeed or actionConfig.ArrivalSpeed) - actionConfig.ArrivalSpeed) * arrivalAlpha
+	local rollingDeceleration = actionConfig.EstimatedRollingDeceleration or 0
+	local etaDrivenSpeed = distance / math.max(travelTime, EPSILON) + 0.5 * rollingDeceleration * travelTime
+	local arrivalDrivenSpeed = desiredArrivalSpeed + rollingDeceleration * travelTime
 	local speed = math.clamp(
-		(distance / math.max(travelTime, EPSILON) + actionConfig.ArrivalSpeed * 0.55) * intensity,
+		math.max(etaDrivenSpeed, arrivalDrivenSpeed) * intensity,
 		actionConfig.MinLaunchSpeed,
 		actionConfig.MaxLaunchSpeed * math.max(intensity, 1)
 	)
-	local predictedArrivalSpeed = math.clamp(actionConfig.ArrivalSpeed * intensity, 0, speed)
+	local discriminant = math.max(0, speed * speed - 2 * rollingDeceleration * distance)
+	local predictedArrivalSpeed = math.sqrt(discriminant)
+	if rollingDeceleration > EPSILON then
+		travelTime = (speed - predictedArrivalSpeed) / rollingDeceleration
+	else
+		travelTime = distance / math.max(speed, EPSILON)
+	end
+	local liftStart = actionConfig.LiftStartDistance or math.huge
+	local liftFull = math.max(actionConfig.LiftFullDistance or liftStart, liftStart + EPSILON)
+	local liftAlpha = math.clamp((distance - liftStart) / (liftFull - liftStart), 0, 1)
+	liftAlpha = liftAlpha * liftAlpha * (3 - 2 * liftAlpha)
+	local verticalSpeed = actionConfig.GroundLiftSpeed
+		+ ((actionConfig.LongLiftSpeed or actionConfig.GroundLiftSpeed) - actionConfig.GroundLiftSpeed) * liftAlpha
 
-	return direction * speed + Vector3.yAxis * actionConfig.GroundLiftSpeed, speed, travelTime, predictedArrivalSpeed
+	return direction * speed + Vector3.yAxis * verticalSpeed, speed, travelTime, predictedArrivalSpeed
 end
 
 function PassPlanner.Plan(
@@ -165,7 +196,8 @@ function PassPlanner.Plan(
 	candidates: { any },
 	config,
 	intensity: number?,
-	requiredReceiverUserId: number?
+	requiredReceiverUserId: number?,
+	intentConeOverride: number?
 )
 	if not isFiniteVector(origin) then
 		return nil, "invalid origin"
@@ -174,7 +206,16 @@ function PassPlanner.Plan(
 		return nil, "invalid aim direction"
 	end
 
-	local actionConfig = if actionType == "ThroughPass" then config.ThroughPass else config.Pass
+	local sourceActionConfig = if actionType == "ThroughPass"
+		then config.ThroughPass
+		elseif actionType == "LobPass"
+		then config.LobPass
+		else config.Pass
+	local actionConfig = table.clone(sourceActionConfig)
+	actionConfig.MaxDistance = PassPlanner.GetMaximumTargetRange(config)
+	if intentConeOverride then
+		actionConfig.IntentConeDegrees = intentConeOverride
+	end
 	local intensityConfig = config.DevelopmentIntensity
 	local safeIntensity = if actionConfig.PowerMode == "DistanceDerived"
 		then 1
@@ -185,7 +226,7 @@ function PassPlanner.Plan(
 	local bestPlan = nil
 
 	for _, candidate in candidates do
-		if requiredReceiverUserId and requiredReceiverUserId > 0 and candidate.UserId ~= requiredReceiverUserId then
+		if requiredReceiverUserId and requiredReceiverUserId ~= 0 and candidate.UserId ~= requiredReceiverUserId then
 			continue
 		end
 
@@ -221,6 +262,8 @@ function PassPlanner.Plan(
 		LaunchSpeed = launchSpeed,
 		PredictedArrivalTime = predictedArrivalTime,
 		PredictedArrivalSpeed = predictedArrivalSpeed,
+		VerticalLaunchSpeed = launchVelocity.Y,
+		Trajectory = if launchVelocity.Y > actionConfig.GroundLiftSpeed + 0.5 then "DrivenLift" else "Ground",
 		Intensity = safeIntensity,
 		ReceiverLeadTime = leadTime,
 		AngleDegrees = bestPlan.AngleDegrees,
@@ -230,6 +273,32 @@ function PassPlanner.Plan(
 		ReleaseReacquireSuppression = actionConfig.ReleaseReacquireSuppression,
 		ReleaseReacquireExitDistance = actionConfig.ReacquireExitDistance,
 	}, nil
+end
+
+function PassPlanner.PlanForReceiver(
+	origin: Vector3,
+	aimDirection: Vector3,
+	holdDuration: number,
+	actionType: string,
+	candidate,
+	config,
+	intensity: number?,
+	retentionConeDegrees: number?
+)
+	if not candidate then
+		return nil, "receiver-missing"
+	end
+	return PassPlanner.Plan(
+		origin,
+		aimDirection,
+		holdDuration,
+		actionType,
+		{ candidate },
+		config,
+		intensity,
+		candidate.UserId,
+		retentionConeDegrees or config.Targeting.RetentionConeDegrees
+	)
 end
 
 return PassPlanner

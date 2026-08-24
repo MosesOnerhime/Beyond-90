@@ -20,6 +20,10 @@ local cameraDistanceButton: TextButton? = nil
 local jogRateLabel: TextLabel? = nil
 local jogRateMinusButton: TextButton? = nil
 local jogRatePlusButton: TextButton? = nil
+local shootingSkillLabel: TextLabel? = nil
+local shootingSkillMinusButton: TextButton? = nil
+local shootingSkillPlusButton: TextButton? = nil
+local shootingSkillRemote: RemoteEvent? = nil
 local connections: { RBXScriptConnection } = {}
 local heldActions: { [string]: number } = {}
 local meters = {}
@@ -154,6 +158,66 @@ local function createJogRateControl(parent: Instance, position: UDim2)
 	jogRatePlusButton = plusButton
 end
 
+local function createShootingSkillControl(parent: Instance, position: UDim2)
+	local container = Instance.new("Frame")
+	container.Name = "ShootingSkillControl"
+	container.Position = position
+	container.Size = UDim2.fromOffset(300, 54)
+	container.BackgroundColor3 = Color3.fromRGB(24, 28, 34)
+	container.BackgroundTransparency = 0.12
+	container.BorderSizePixel = 0
+	container.Parent = parent
+
+	local minus = Instance.new("TextButton")
+	minus.Name = "ShootingSkillMinus"
+	minus.Position = UDim2.fromOffset(10, 10)
+	minus.Size = UDim2.fromOffset(34, 34)
+	minus.BackgroundColor3 = Color3.fromRGB(45, 52, 61)
+	minus.BorderSizePixel = 0
+	minus.Font = Enum.Font.GothamBold
+	minus.Text = "-"
+	minus.TextColor3 = Color3.fromRGB(245, 245, 245)
+	minus.TextSize = 20
+	minus.Parent = container
+
+	local label = Instance.new("TextLabel")
+	label.Name = "ShootingSkillLabel"
+	label.Position = UDim2.fromOffset(52, 0)
+	label.Size = UDim2.new(1, -104, 1, 0)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamSemibold
+	label.TextColor3 = Color3.fromRGB(245, 245, 245)
+	label.TextSize = 13
+	label.Parent = container
+
+	local plus = minus:Clone()
+	plus.Name = "ShootingSkillPlus"
+	plus.Position = UDim2.new(1, -44, 0, 10)
+	plus.Text = "+"
+	plus.Parent = container
+
+	shootingSkillLabel = label
+	shootingSkillMinusButton = minus
+	shootingSkillPlusButton = plus
+end
+
+local function updateShootingSkillControl()
+	if shootingSkillLabel then
+		local skill = localPlayer:GetAttribute("Beyond90ShootingSkill")
+		shootingSkillLabel.Text = string.format("SHOOTING SKILL  %.0f", (if typeof(skill) == "number" then skill else 0) * 100)
+	end
+end
+
+local function adjustShootingSkill(delta: number)
+	if not shootingSkillRemote then
+		return
+	end
+	local config = FootballActionConfig.Shoot.Skill
+	local current = localPlayer:GetAttribute("Beyond90ShootingSkill")
+	local value = if typeof(current) == "number" then current else config.Default
+	shootingSkillRemote:FireServer(math.clamp(value + delta, config.Minimum, config.Maximum))
+end
+
 local function setMeterValue(actionType: string, holdDuration: number)
 	local meter = meters[actionType]
 
@@ -275,6 +339,9 @@ local function createGui()
 	createIntensityMeter(screenGui, "ThroughPass", "THROUGH INTENSITY", UDim2.fromOffset(16, 200))
 	createIntensityMeter(screenGui, "KnockOn", "KNOCK-ON INTENSITY", UDim2.fromOffset(16, 252))
 	createJogRateControl(screenGui, UDim2.fromOffset(16, 304))
+	createShootingSkillControl(screenGui, UDim2.fromOffset(16, 394))
+	local remotes = ReplicatedStorage:FindFirstChild(FootballActionConfig.RemotesFolderName)
+	shootingSkillRemote = remotes and remotes:FindFirstChild(FootballActionConfig.DevelopmentShootingSkillRemoteName) :: RemoteEvent?
 
 	table.insert(connections, autoSprintButton.Activated:Connect(function()
 		InputController.ToggleAutoSprint()
@@ -294,6 +361,13 @@ local function createGui()
 		AnimationController.AdjustJogPlaybackMultiplier(AnimationController.GetJogPlaybackMultiplierStep())
 		updateJogRateControl()
 	end))
+	table.insert(connections, shootingSkillMinusButton.Activated:Connect(function()
+		adjustShootingSkill(-FootballActionConfig.Shoot.Skill.DevelopmentStep)
+	end))
+	table.insert(connections, shootingSkillPlusButton.Activated:Connect(function()
+		adjustShootingSkill(FootballActionConfig.Shoot.Skill.DevelopmentStep)
+	end))
+	table.insert(connections, localPlayer:GetAttributeChangedSignal("Beyond90ShootingSkill"):Connect(updateShootingSkillControl))
 	table.insert(connections, InputController.GetAutoSprintChangedEvent().Event:Connect(updateAutoSprintButton))
 	table.insert(connections, CameraController.GetModeChangedEvent().Event:Connect(updateCameraButton))
 	table.insert(connections, InputController.GetFootballActionEvent().Event:Connect(onFootballAction))
@@ -306,6 +380,7 @@ local function createGui()
 	updateCameraButton()
 	updateCameraDistanceButton()
 	updateJogRateControl()
+	updateShootingSkillControl()
 end
 
 function DevelopmentHUDController.Initialize()
@@ -342,6 +417,10 @@ function DevelopmentHUDController.Destroy()
 	jogRateLabel = nil
 	jogRateMinusButton = nil
 	jogRatePlusButton = nil
+	shootingSkillLabel = nil
+	shootingSkillMinusButton = nil
+	shootingSkillPlusButton = nil
+	shootingSkillRemote = nil
 	table.clear(meters)
 end
 

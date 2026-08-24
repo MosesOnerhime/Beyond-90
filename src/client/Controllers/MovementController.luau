@@ -41,12 +41,25 @@ local observedPassId = 0
 local observedPassAt = 0
 local lastReceptionAssistDiagnostic = 0
 local lastReceptionAssistPhase = ""
+local receptionFacingActive = false
+local receptionFacingDirection: Vector3? = nil
 local jumpForce: VectorForce? = nil
 local jumpAttachment: Attachment? = nil
 local jumpStartedAt = 0
 local jumpAssistToken = 0
 local jumpStartY = 0
 local jumpPeakY = 0
+local coastStartedAt = 0
+local coastStartPosition = Vector3.zero
+local coastStartSpeed = 0
+local coastSource = ""
+local committedPossessionDirection = Vector3.zero
+local pendingPossessionDirection = Vector3.zero
+local pendingPossessionTurnStartedAt = 0
+local pendingPossessionTurnTouchCount = 0
+local pendingPossessionTurnAngle = 0
+local log: (string) -> ()
+local locomotionState
 
 local function getFootball(): BasePart?
 	if cachedBall and cachedBall.Parent then
@@ -64,6 +77,107 @@ local function getFootball(): BasePart?
 
 	cachedBall = nil
 	return nil
+end
+
+local function hasLocalPossession(ball: BasePart?): boolean
+	return ball ~= nil
+		and ball:GetAttribute("State") == "Controlled"
+		and ball:GetAttribute("ControllerUserId") == localPlayer.UserId
+end
+
+local function clearPendingPossessionTurn()
+	pendingPossessionDirection = Vector3.zero
+	pendingPossessionTurnStartedAt = 0
+	pendingPossessionTurnTouchCount = 0
+	pendingPossessionTurnAngle = 0
+	localPlayer:SetAttribute("Beyond90PendingTurnActive", false)
+end
+
+local function commitPossessionDirection(direction: Vector3, reason: string, ball: BasePart?)
+	committedPossessionDirection = direction
+	if pendingPossessionTurnStartedAt > 0 then
+		local elapsed = os.clock() - pendingPossessionTurnStartedAt
+		log(string.format(
+			"[PossessionTurn] angle=%.1f pendingTime=%.2f touchId=%d commitReason=%s lead=%.2f",
+			pendingPossessionTurnAngle,
+			elapsed,
+			ball and (ball:GetAttribute("LastLocalControlTouchCount") or 0) or 0,
+			reason,
+			ball and (ball:GetAttribute("ClientBallLead") or 0) or 0
+		))
+	end
+	clearPendingPossessionTurn()
+end
+
+local function resolvePossessionTurnDirection(direction: Vector3, magnitude: number, now: number): Vector3
+	local config = locomotionConfig.PossessionTurn
+	local ball = getFootball()
+	if not config or not config.Enabled or not hasLocalPossession(ball) then
+		clearPendingPossessionTurn()
+		committedPossessionDirection = direction
+		return direction
+	end
+	if magnitude <= locomotionConfig.RawInputDeadzone then
+		clearPendingPossessionTurn()
+		return Vector3.zero
+	end
+	if locomotionState.SmoothedSpeed < config.MinimumPlayerSpeed then
+		commitPossessionDirection(direction, "low-speed", ball)
+		return direction
+	end
+
+	local reference = committedPossessionDirection
+	if reference.Magnitude <= 0.05 then
+		reference = if locomotionState.SmoothedDirection.Magnitude > 0.05
+			then locomotionState.SmoothedDirection
+			else direction
+	end
+	local angle = math.deg(math.acos(math.clamp(reference.Unit:Dot(direction.Unit), -1, 1)))
+	if angle <= config.ImmediateAngleDegrees then
+		commitPossessionDirection(direction, "small-correction", ball)
+		return direction
+	end
+
+	local pendingChanged = pendingPossessionDirection.Magnitude <= 0.05
+		or pendingPossessionDirection:Dot(direction) < 0.985
+	if pendingChanged then
+		pendingPossessionDirection = direction
+		pendingPossessionTurnStartedAt = now
+		pendingPossessionTurnTouchCount = ball and (ball:GetAttribute("LastLocalControlTouchCount") or 0) or 0
+		pendingPossessionTurnAngle = angle
+		localPlayer:SetAttribute("Beyond90PendingTurnActive", true)
+		localPlayer:SetAttribute("Beyond90PendingTurnAngle", angle)
+	end
+
+	local elapsed = now - pendingPossessionTurnStartedAt
+	local touchCount = ball and (ball:GetAttribute("LastLocalControlTouchCount") or 0) or 0
+	local lead = math.abs(ball and (ball:GetAttribute("ClientBallLead") or math.huge) or math.huge)
+	local relativeSpeed = ball and (ball:GetAttribute("BallRelativeSpeed") or math.huge) or math.huge
+	local phase = ball and (ball:GetAttribute("DribblePhase") or "") or ""
+	local minimumPreparation = config.MinimumPreparationSeconds
+	local contactReady = elapsed >= minimumPreparation
+		and (touchCount > pendingPossessionTurnTouchCount
+			or (phase == "Collect" and lead <= config.ContactLeadDistance and relativeSpeed <= config.ContactRelativeSpeed))
+	local maximumWait
+	if pendingPossessionTurnAngle < config.MajorAngleDegrees then
+		maximumWait = config.SmallCorrectionMaximumWaitSeconds
+	elseif pendingPossessionTurnAngle < config.SevereAngleDegrees then
+		maximumWait = if sprintRequested
+			then config.SprintModerateMaximumWaitSeconds
+			else config.JogModerateMaximumWaitSeconds
+	else
+		maximumWait = if sprintRequested then config.SprintMaximumWaitSeconds else config.JogMaximumWaitSeconds
+	end
+	if contactReady then
+		commitPossessionDirection(pendingPossessionDirection, "touch-window", ball)
+		return committedPossessionDirection
+	elseif elapsed >= maximumWait then
+		commitPossessionDirection(pendingPossessionDirection, "maximum-wait", ball)
+		return committedPossessionDirection
+	end
+
+	localPlayer:SetAttribute("Beyond90PendingTurnTime", elapsed)
+	return reference
 end
 
 local function clearJumpAssist()
@@ -131,7 +245,9 @@ local function requestJump()
 	humanoid.Jump = true
 end
 
-local locomotionState = {
+locomotionState = {
+	InputDirection = Vector3.zero,
+	InputMagnitude = 0,
 	RawDirection = Vector3.zero,
 	RawMagnitude = 0,
 	SmoothedDirection = Vector3.zero,
@@ -152,7 +268,7 @@ local function warnLog(message: string)
 	warn(string.format("%s[Client][Movement] %s", GameConfig.LogPrefix, message))
 end
 
-local function log(message: string)
+log = function(message: string)
 	print(string.format("%s[Client][Movement] %s", GameConfig.LogPrefix, message))
 end
 
@@ -192,6 +308,8 @@ local function applyMovementSettings(humanoid: Humanoid)
 end
 
 local function resetLocomotionState()
+	locomotionState.InputDirection = Vector3.zero
+	locomotionState.InputMagnitude = 0
 	locomotionState.RawDirection = Vector3.zero
 	locomotionState.RawMagnitude = 0
 	locomotionState.SmoothedDirection = Vector3.zero
@@ -206,6 +324,8 @@ local function resetLocomotionState()
 	locomotionState.MovementMode = "Normal"
 	locomotionState.ReceptionAssistPhase = ""
 	locomotionState.ReceptionAssistWeight = 0
+	committedPossessionDirection = Vector3.zero
+	clearPendingPossessionTurn()
 end
 
 local function getTurnSpeedFactor(currentVelocity: Vector3, targetDirection: Vector3): (number, number)
@@ -285,6 +405,20 @@ local function sampleDiagnostics()
 	localPlayer:SetAttribute("Beyond90ReceptionAssistWeight", locomotionState.ReceptionAssistWeight)
 end
 
+local function finishCoast(result: string)
+	if coastStartedAt <= 0 or not currentRootPart then
+		return
+	end
+	local duration = os.clock() - coastStartedAt
+	local distance = BallControlMath.GetHorizontal(currentRootPart.Position - coastStartPosition).Magnitude
+	log(string.format("[Coast] source=%s distance=%.2f duration=%.2f result=%s", coastSource, distance, duration, result))
+	localPlayer:SetAttribute("Beyond90LastCoastDistance", distance)
+	localPlayer:SetAttribute("Beyond90LastCoastDuration", duration)
+	coastStartedAt = 0
+	coastStartSpeed = 0
+	coastSource = ""
+end
+
 local function getActionMovement(now: number): (boolean, number, number)
 	if actionProfileName == "" or now >= actionExitEnd then
 		if actionProfileName ~= "" then
@@ -335,7 +469,7 @@ local function getReceptionAssist(
 	local validPass = ball
 		and ball:GetAttribute("State") == "Free"
 		and intendedReceiver == localPlayer.UserId
-		and (actionType == "GroundPass" or actionType == "ThroughPass")
+		and (actionType == "GroundPass" or actionType == "ThroughPass" or actionType == "LobPass")
 		and typeof(passId) == "number"
 		and passId > 0
 		and typeof(targetPosition) == "Vector3"
@@ -357,7 +491,35 @@ local function getReceptionAssist(
 		return manualDirection, manualMagnitude, "", 0
 	end
 
-	local offset = BallControlMath.GetHorizontal((targetPosition :: Vector3) - currentRootPart.Position)
+	local elapsed = now - observedPassAt
+	local remainingTime = math.max(0.1, expiry - elapsed)
+	local liveTarget = targetPosition :: Vector3
+	local horizontalBallVelocity = BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity)
+	if horizontalBallVelocity.Magnitude > 3 then
+		local distanceToPlannedTarget = BallControlMath.GetHorizontal(liveTarget - ball.Position).Magnitude
+		local predictionTime = math.clamp(
+			distanceToPlannedTarget / horizontalBallVelocity.Magnitude,
+			0.1,
+			math.min(1, remainingTime)
+		)
+		local verticalVelocity = ball.AssemblyLinearVelocity.Y
+		local heightAboveTarget = math.max(0, ball.Position.Y - liveTarget.Y)
+		local discriminant = verticalVelocity * verticalVelocity + 2 * Workspace.Gravity * heightAboveTarget
+		if discriminant >= 0 then
+			local landingTime = (verticalVelocity + math.sqrt(discriminant)) / Workspace.Gravity
+			if landingTime > 0 then
+				predictionTime = math.max(predictionTime, math.min(landingTime, remainingTime, 1))
+			end
+		end
+		local liveProjection = ball.Position + horizontalBallVelocity * predictionTime
+		local correction = BallControlMath.ClampMagnitude(
+			BallControlMath.GetHorizontal(liveProjection - liveTarget),
+			config.MaxLiveTargetCorrection
+		)
+		liveTarget += correction * config.LiveTargetWeight
+	end
+
+	local offset = BallControlMath.GetHorizontal(liveTarget - currentRootPart.Position)
 	local distance = offset.Magnitude
 
 	if distance > config.MaxDistance then
@@ -400,6 +562,76 @@ local function getReceptionAssist(
 	return outputDirection, outputMagnitude, phase, assistWeight
 end
 
+local function getLooseBallAssist(manualDirection: Vector3, manualMagnitude: number): (Vector3, number, string, number)
+	local config = locomotionConfig.LooseBallAssist
+	local ball = getFootball()
+	if not config or config.Enabled ~= true or not currentRootPart or not ball or ball:GetAttribute("State") ~= "Free" then
+		return manualDirection, manualMagnitude, "", 0
+	end
+
+	local predictedBall = ball.Position
+		+ BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity) * config.PredictionTime
+	local offset = BallControlMath.GetHorizontal(predictedBall - currentRootPart.Position)
+	local distance = offset.Magnitude
+	if distance <= config.ContactDistance or distance > config.ActivationDistance then
+		return manualDirection, manualMagnitude, "", 0
+	end
+
+	local manualOverride = math.clamp(
+		(manualMagnitude - config.ManualBlendStart)
+			/ math.max(config.ManualOverrideMagnitude - config.ManualBlendStart, 0.01),
+		0,
+		1
+	)
+	local approachMagnitude = config.MaximumMoveMagnitude
+		* math.clamp((distance - config.ContactDistance) / math.max(config.ActivationDistance - config.ContactDistance, 0.01), 0.25, 1)
+	local assistDirection = if distance > 0.05 then offset.Unit else Vector3.zero
+	local blended = assistDirection * approachMagnitude * (1 - manualOverride) + manualDirection * manualMagnitude
+	local magnitude = math.clamp(blended.Magnitude, 0, 1)
+	return if magnitude > 0.05 then blended.Unit else Vector3.zero, magnitude, "LooseBall", 1 - manualOverride
+end
+
+local function updateReceptionFacing(deltaTime: number, phase: string)
+	local ball = getFootball()
+	local config = locomotionConfig.ReceptionAssist
+	local shouldFaceBall = (phase == "Brake" or phase == "Receive")
+		and currentRootPart ~= nil
+		and ball ~= nil
+		and BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity).Magnitude >= config.FacingMinimumBallSpeed
+
+	if not shouldFaceBall then
+		if receptionFacingActive and currentHumanoid then
+			currentHumanoid.AutoRotate = movementConfig.AutoRotate
+		end
+		receptionFacingActive = false
+		receptionFacingDirection = nil
+		return
+	end
+
+	local rootPart = currentRootPart :: BasePart
+	local incoming = BallControlMath.SafeUnit(
+		-BallControlMath.GetHorizontal((ball :: BasePart).AssemblyLinearVelocity),
+		BallControlMath.GetHorizontal(rootPart.CFrame.LookVector)
+	)
+	if not receptionFacingDirection then
+		receptionFacingDirection = incoming
+	elseif phase == "Brake" then
+		local dot = math.clamp((receptionFacingDirection :: Vector3):Dot(incoming), -1, 1)
+		if math.deg(math.acos(dot)) >= (config.FacingRelockAngle or 35) then
+			receptionFacingDirection = BallControlMath.SafeUnit((receptionFacingDirection :: Vector3):Lerp(incoming, 0.2), incoming)
+		end
+	end
+	incoming = receptionFacingDirection :: Vector3
+	local currentFacing = BallControlMath.SafeUnit(BallControlMath.GetHorizontal(rootPart.CFrame.LookVector), incoming)
+	local alpha = 1 - math.exp(-config.FacingResponsiveness * deltaTime)
+	local facing = BallControlMath.SafeUnit(currentFacing:Lerp(incoming, alpha), incoming)
+	if currentHumanoid then
+		currentHumanoid.AutoRotate = false
+	end
+	rootPart.CFrame = CFrame.lookAt(rootPart.Position, rootPart.Position + facing, Vector3.yAxis)
+	receptionFacingActive = true
+end
+
 local function updateLocomotion(deltaTime: number)
 	local humanoid = currentHumanoid
 
@@ -415,11 +647,25 @@ local function updateLocomotion(deltaTime: number)
 		setSprintRequested(rawInput.SprintRequested)
 	end
 
+	local inputDirection = rawInput.MoveDirection
+	local inputMagnitude = rawInput.MoveMagnitude
 	local rawDirection, rawMagnitude, receptionPhase, receptionWeight = getReceptionAssist(
 		rawInput.MoveDirection,
 		rawInput.MoveMagnitude,
 		now
 	)
+	if receptionPhase == "" then
+		rawDirection, rawMagnitude, receptionPhase, receptionWeight = getLooseBallAssist(rawDirection, rawMagnitude)
+	end
+	updateReceptionFacing(deltaTime, receptionPhase)
+	if localPlayer:GetAttribute("Beyond90MenuOpen") == true then
+		inputDirection = Vector3.zero
+		inputMagnitude = 0
+		rawDirection = Vector3.zero
+		rawMagnitude = 0
+	else
+		rawDirection = resolvePossessionTurnDirection(rawDirection, rawMagnitude, now)
+	end
 	local actionActive, actionInputScale, actionBrakeTime = getActionMovement(now)
 
 	if actionActive then
@@ -428,9 +674,19 @@ local function updateLocomotion(deltaTime: number)
 			rawDirection = Vector3.zero
 		end
 	elseif receptionPhase ~= "" then
-		movementMode = "ReceptionAssist"
+		movementMode = if receptionPhase == "LooseBall" then "LooseBallAssist" else "ReceptionAssist"
 	else
 		movementMode = "Normal"
+	end
+
+	local neutralCoast = inputMagnitude <= locomotionConfig.RawInputDeadzone
+		and not actionActive
+		and receptionPhase == ""
+	if neutralCoast and coastStartedAt <= 0 and locomotionState.SmoothedSpeed > locomotionConfig.StopSpeed then
+		coastStartedAt = now
+		coastStartPosition = if currentRootPart then currentRootPart.Position else Vector3.zero
+		coastStartSpeed = locomotionState.SmoothedSpeed
+		coastSource = if locomotionState.SmoothedSpeed > movementConfig.BaseSpeed + 1 then "Sprint" else "Jog"
 	end
 
 	local targetSpeed = getTargetSpeed() * rawMagnitude
@@ -439,7 +695,10 @@ local function updateLocomotion(deltaTime: number)
 	local changeTime = if actionActive
 		then actionBrakeTime
 		else getVelocityChangeTime(locomotionState.SmoothedVelocity, targetVelocity, turnAngle)
-	local maxDelta = getTargetSpeed() / math.max(changeTime, 1 / 240) * deltaTime
+	local referenceSpeed = if neutralCoast and coastStartSpeed > 0
+		then coastStartSpeed
+		else math.max(locomotionState.SmoothedVelocity.Magnitude, targetVelocity.Magnitude, movementConfig.BaseSpeed)
+	local maxDelta = referenceSpeed / math.max(changeTime, 1 / 240) * deltaTime
 	local nextVelocity = moveTowardVector(locomotionState.SmoothedVelocity, targetVelocity, maxDelta)
 	local nextSpeed = nextVelocity.Magnitude
 
@@ -449,7 +708,16 @@ local function updateLocomotion(deltaTime: number)
 	end
 
 	local shouldMove = nextSpeed > locomotionConfig.StopSpeed
+	if not neutralCoast and coastStartedAt > 0 then
+		finishCoast("Interrupted")
+	elseif not shouldMove and coastStartedAt > 0 then
+		local ball = getFootball()
+		local hasBall = ball and ball:GetAttribute("State") == "Controlled" and ball:GetAttribute("ControllerUserId") == localPlayer.UserId
+		finishCoast(if hasBall then "StopTrap" else "Idle")
+	end
 
+	locomotionState.InputDirection = inputDirection
+	locomotionState.InputMagnitude = inputMagnitude
 	locomotionState.RawDirection = rawDirection
 	locomotionState.RawMagnitude = rawMagnitude
 	locomotionState.SmoothedVelocity = nextVelocity
@@ -472,7 +740,6 @@ local function updateLocomotion(deltaTime: number)
 	else
 		humanoid:Move(Vector3.zero, false)
 	end
-
 	if jumpStartedAt > 0 and currentRootPart then
 		jumpPeakY = math.max(jumpPeakY, currentRootPart.Position.Y)
 	end
@@ -520,6 +787,7 @@ local function configureCharacter(character: Model)
 	observedPassId = 0
 	lastReceptionAssistPhase = ""
 	jumpStartedAt = 0
+	coastStartedAt = 0
 	resetLocomotionState()
 
 	if humanoidDiedConnection then
@@ -602,6 +870,8 @@ end
 
 function MovementController.GetLocomotionState()
 	return {
+		InputDirection = locomotionState.InputDirection,
+		InputMagnitude = locomotionState.InputMagnitude,
 		RawDirection = locomotionState.RawDirection,
 		RawMagnitude = locomotionState.RawMagnitude,
 		SmoothedDirection = locomotionState.SmoothedDirection,
@@ -711,6 +981,7 @@ function MovementController.Destroy()
 	currentRootPart = nil
 	actionProfileName = ""
 	sprintRequested = false
+	coastStartedAt = 0
 	resetLocomotionState()
 end
 

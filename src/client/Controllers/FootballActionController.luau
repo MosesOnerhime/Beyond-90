@@ -10,7 +10,7 @@ local GameConfig = require(Shared.Config.GameConfig)
 local ControlledBallController = require(script.Parent:WaitForChild("ControlledBallController"))
 local InputController = require(script.Parent:WaitForChild("InputController"))
 local MovementController = require(script.Parent:WaitForChild("MovementController"))
-local PassTargetPresentationController = require(script.Parent:WaitForChild("PassTargetPresentationController"))
+local PassTargetResolver = require(script.Parent:WaitForChild("PassTargetResolver"))
 
 local FootballActionController = {}
 
@@ -20,6 +20,8 @@ local requestRemote: RemoteEvent? = nil
 local feedbackRemote: RemoteEvent? = nil
 local connections: { RBXScriptConnection } = {}
 local presentationEvent = Instance.new("BindableEvent")
+local shootActionSequence = 0
+local pendingShootActionId = ""
 
 local function log(message: string)
 	print(string.format("%s[Client][FootballAction] %s", GameConfig.LogPrefix, message))
@@ -115,26 +117,49 @@ end
 local function onFootballAction(action)
 	local remote = requestRemote
 
-	if not remote then
+	if not remote or localPlayer:GetAttribute("Beyond90MenuOpen") == true then
 		return
 	end
 
 	local actionType = action.ActionType
 
-	if (actionType == "GroundPass" or actionType == "ThroughPass" or actionType == "KnockOn")
+	if (actionType == "GroundPass" or actionType == "ThroughPass" or actionType == "LobPass" or actionType == "KnockOn" or actionType == "Shoot")
 		and action.Phase ~= "Released"
 	then
 		return
 	end
 
-	if actionType == "GroundPass" or actionType == "ThroughPass" then
-		local aimDirection = getAimDirection(action)
-		local plan = PassTargetPresentationController.Select(actionType, aimDirection)
+	if actionType == "Shoot" then
+		shootActionSequence += 1
+		pendingShootActionId = string.format("%d:%d:%d", localPlayer.UserId, shootActionSequence, math.floor(os.clock() * 1000))
+		MovementController.BeginActionMovement("Shoot")
+		ControlledBallController.NotifyLocalFootballActionRelease(FootballActionConfig.Shoot.ContactFallbackTime + 0.15)
+		presentationEvent:Fire({
+			Stage = "Predicted",
+			ActionType = "Shoot",
+			ClientActionId = pendingShootActionId,
+			Timestamp = action.Timestamp or os.clock(),
+		})
+		remote:FireServer({
+			ActionType = "Shoot",
+			Phase = "Prepare",
+			ClientActionId = pendingShootActionId,
+			HoldDuration = action.HoldDuration or 0,
+			AimDirection = getAimDirection(action),
+			MoveMagnitude = action.MoveMagnitude or 0,
+			Timestamp = action.Timestamp or os.clock(),
+		})
+		return
+	end
+
+	if actionType == "GroundPass" or actionType == "ThroughPass" or actionType == "LobPass" then
+		local plan = PassTargetResolver.ConsumeSelection(actionType)
 
 		if not plan or not plan.SelectedCandidate or not plan.SelectedCandidate.UserId then
 			log("[PassTarget] result=none reason=no-valid-receiver")
 			return
 		end
+		local aimDirection = plan.AimDirection or getAimDirection(action)
 
 		MovementController.BeginActionMovement("Pass")
 		presentationEvent:Fire({
@@ -167,6 +192,7 @@ local function onFootballAction(action)
 				MoveMagnitude = action.MoveMagnitude or 0,
 				Timestamp = action.Timestamp or os.clock(),
 				IntendedReceiverUserId = plan.SelectedCandidate.UserId,
+				SelectedTargetPosition = plan.TargetPosition,
 			})
 		end)
 		return
@@ -188,8 +214,11 @@ local function onFeedback(payload)
 	end
 
 	if not payload.Accepted then
-		if payload.ActionType == "GroundPass" or payload.ActionType == "ThroughPass" then
+		if payload.ActionType == "GroundPass" or payload.ActionType == "ThroughPass" or payload.ActionType == "LobPass" then
 			MovementController.CancelActionMovement("Pass")
+		elseif payload.ActionType == "Shoot" then
+			MovementController.CancelActionMovement("Shoot")
+			pendingShootActionId = ""
 		end
 		presentationEvent:Fire({
 			Stage = "Rejected",
@@ -204,10 +233,15 @@ local function onFeedback(payload)
 		return
 	end
 
-	presentationEvent:Fire({
-		Stage = "Accepted",
-		ActionType = payload.ActionType,
-	})
+	if payload.Stage ~= "Prepared" then
+		presentationEvent:Fire({
+			Stage = "Accepted",
+			ActionType = payload.ActionType,
+		})
+	end
+	if payload.ActionType == "Shoot" and payload.Stage == "Released" then
+		pendingShootActionId = ""
+	end
 
 	if typeof(payload.TargetPosition) == "Vector3" then
 		createTargetMarker(payload.TargetPosition, payload.TargetName)
@@ -227,16 +261,30 @@ local function onFeedback(payload)
 			))
 			return
 		end
+		if payload.ActionType == "Shoot" then
+			log(string.format(
+				"Shoot %s goal=%s distance=%.1f launchSpeed=%.1f verticalSpeed=%.1f eta=%.2f",
+				tostring(payload.Stage),
+				tostring(payload.GoalId),
+				tonumber(payload.Distance) or 0,
+				tonumber(payload.LaunchSpeed) or 0,
+				tonumber(payload.VerticalLaunchSpeed) or 0,
+				tonumber(payload.PredictedArrivalTime) or 0
+			))
+			return
+		end
 
 		log(string.format(
-			"%s accepted target=%s intensity=%.2fx distance=%.1f launchSpeed=%.1f predictedArrivalSpeed=%.1f eta=%.2f",
+			"%s accepted target=%s intensity=%.2fx distance=%.1f launchSpeed=%.1f verticalSpeed=%.1f predictedArrivalSpeed=%.1f eta=%.2f trajectory=%s",
 			tostring(payload.ActionType),
 			tostring(payload.TargetName),
 			tonumber(payload.Intensity) or 1,
 			tonumber(payload.Distance) or 0,
 			tonumber(payload.LaunchSpeed) or 0,
+			tonumber(payload.VerticalLaunchSpeed) or 0,
 			tonumber(payload.PredictedArrivalSpeed) or 0,
-			tonumber(payload.PredictedArrivalTime) or 0
+			tonumber(payload.PredictedArrivalTime) or 0,
+			tostring(payload.Trajectory)
 		))
 	end
 end
@@ -262,6 +310,17 @@ function FootballActionController.GetPresentationEvent(): BindableEvent
 	return presentationEvent
 end
 
+function FootballActionController.NotifyAnimationMarker(actionType: string, markerName: string)
+	if actionType ~= "Shoot" or markerName ~= "BallContact" or pendingShootActionId == "" or not requestRemote then
+		return
+	end
+	requestRemote:FireServer({
+		ActionType = "Shoot",
+		Phase = "Commit",
+		ClientActionId = pendingShootActionId,
+	})
+end
+
 function FootballActionController.Destroy()
 	if not initialized then
 		return
@@ -276,6 +335,7 @@ function FootballActionController.Destroy()
 	table.clear(connections)
 	requestRemote = nil
 	feedbackRemote = nil
+	pendingShootActionId = ""
 end
 
 return FootballActionController

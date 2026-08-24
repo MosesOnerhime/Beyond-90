@@ -12,7 +12,8 @@ local GameConfig = require(Shared.Config.GameConfig)
 local BroadcastCamera = {}
 
 local localPlayer = Players.LocalPlayer
-local config = CameraConfig.Broadcast
+local profileName = "Broadcast1"
+local config = CameraConfig.Broadcast1 or CameraConfig.Broadcast
 local renderConnection: RBXScriptConnection? = nil
 local active = false
 local selectedDistancePresetIndex = config.DefaultDistancePresetIndex or 1
@@ -21,6 +22,10 @@ local smoothedFocus: Vector3? = nil
 local followAnchor: Vector3? = nil
 local smoothedForward: Vector3? = nil
 local smoothedFOV = config.BaseFOV
+local targetHistory = {}
+local safetyCatchupBlend = 0
+local cameraVelocity = Vector3.zero
+local focusVelocity = Vector3.zero
 local lastAttributeSampleTime = 0
 local fadedObstructionParts: { [BasePart]: number } = {}
 local broadcastSideFadeParts: { [BasePart]: number } = {}
@@ -112,6 +117,36 @@ local function smoothVector(current: Vector3?, target: Vector3, responsiveness: 
 	end
 
 	return current:Lerp(target, expAlpha(responsiveness, deltaTime))
+end
+
+local function clampMagnitude(vector: Vector3, maximum: number): Vector3
+	if vector.Magnitude <= maximum then
+		return vector
+	end
+	return vector.Unit * maximum
+end
+
+local function smoothLimitedVector(
+	current: Vector3?,
+	target: Vector3,
+	velocity: Vector3,
+	responsiveness: number,
+	maxAcceleration: number,
+	maxSpeed: number,
+	deltaTime: number
+): (Vector3, Vector3)
+	if not current then
+		return target, Vector3.zero
+	end
+	local offset = target - current
+	local desiredVelocity = clampMagnitude(offset * responsiveness, maxSpeed)
+	local velocityDelta = desiredVelocity - velocity
+	velocity += clampMagnitude(velocityDelta, maxAcceleration * deltaTime)
+	local step = velocity * deltaTime
+	if step.Magnitude >= offset.Magnitude and step:Dot(offset) > 0 then
+		return target, Vector3.zero
+	end
+	return current + step, velocity
 end
 
 local function updateObstructionFade(blockingParts: { BasePart })
@@ -277,7 +312,7 @@ local function clampTargetToPitch(position: Vector3, pitchState, distanceScale: 
 	return positionFromOffsets(lengthOffset, widthOffset, pitchState)
 end
 
-local function updateFollowAnchor(target: Vector3, pitchState, deltaTime: number): Vector3
+local function updateFollowAnchor(target: Vector3, pitchState, deltaTime: number, safetyBlend: number): Vector3
 	if not followAnchor then
 		followAnchor = target
 		return target
@@ -305,15 +340,44 @@ local function updateFollowAnchor(target: Vector3, pitchState, deltaTime: number
 	end
 
 	local currentLag = BallControlMath.GetHorizontal(target - (followAnchor :: Vector3)).Magnitude
-	local responsiveness = if currentLag >= config.CatchupDistance
+	local baseResponsiveness = if currentLag >= config.CatchupDistance
 		then config.CatchupResponsiveness
 		else config.FollowResponsiveness
+	local responsiveness = baseResponsiveness
+		+ (config.SafetyCatchupResponsiveness - baseResponsiveness) * safetyBlend
 	followAnchor = smoothVector(followAnchor, desired, responsiveness, deltaTime)
-	local finalLag = BallControlMath.GetHorizontal(target - (followAnchor :: Vector3))
-	if finalLag.Magnitude > config.MaxTargetLag then
-		followAnchor = target - finalLag.Unit * config.MaxTargetLag
-	end
 	return followAnchor :: Vector3
+end
+
+local function getDelayedFramingTarget(target: Vector3, deltaTime: number): (Vector3, number)
+	local now = os.clock()
+	table.insert(targetHistory, { Time = now, Position = target })
+	local oldestAllowed = now - config.TargetHistorySeconds
+	while #targetHistory > 2 and targetHistory[2].Time < oldestAllowed do
+		table.remove(targetHistory, 1)
+	end
+
+	local delayed = targetHistory[1].Position
+	local cutoff = now - config.FollowDelaySeconds
+	for index = #targetHistory, 1, -1 do
+		local sample = targetHistory[index]
+		if sample.Time <= cutoff then
+			delayed = sample.Position
+			break
+		end
+	end
+
+	local separation = BallControlMath.GetHorizontal(target - delayed).Magnitude
+	local targetSafetyBlend = math.clamp(
+		(separation - config.SafetyCatchupDistance)
+			/ math.max(config.SafetyCatchupFullDistance - config.SafetyCatchupDistance, 0.01),
+		0,
+		1
+	)
+	targetSafetyBlend = targetSafetyBlend * targetSafetyBlend * (3 - 2 * targetSafetyBlend)
+	safetyCatchupBlend += (targetSafetyBlend - safetyCatchupBlend)
+		* expAlpha(config.SafetyBlendResponsiveness, deltaTime)
+	return delayed:Lerp(target, safetyCatchupBlend), safetyCatchupBlend
 end
 
 local function clampCameraToSafeCorridor(position: Vector3, pitchState, distanceScale: number): Vector3
@@ -466,7 +530,9 @@ local function updateCamera(deltaTime: number)
 
 	framingPoint = clampTargetToPitch(framingPoint, pitchState, distanceScale)
 	local rawFramingPoint = framingPoint
-	framingPoint = updateFollowAnchor(framingPoint, pitchState, deltaTime)
+	local safetyBlend
+	framingPoint, safetyBlend = getDelayedFramingTarget(framingPoint, deltaTime)
+	framingPoint = updateFollowAnchor(framingPoint, pitchState, deltaTime, safetyBlend)
 	framingPoint = clampTargetToPitch(framingPoint, pitchState, distanceScale)
 
 	local sideSign = if config.BroadcastSide >= 0 then 1 else -1
@@ -483,14 +549,37 @@ local function updateCamera(deltaTime: number)
 	rigPosition = resolveObstruction(focusTarget, rigPosition, pitchState, distanceScale, ball)
 
 	local ballSeparation = if ball then BallControlMath.GetHorizontal(ball.Position - rootPart.Position).Magnitude else 0
+	local fieldProgress = math.clamp(math.abs(lengthOffset) / math.max(pitchState.Length / 2, 1), 0, 1)
+	local dangerAlpha = math.clamp((fieldProgress - 0.58) / 0.32, 0, 1)
+	dangerAlpha = dangerAlpha * dangerAlpha * (3 - 2 * dangerAlpha)
+	local contextualFOV = (config.OpenPlayFOVBoost or 0) * (1 - dangerAlpha)
+		- (config.GoalAreaFOVReduction or 0) * dangerAlpha
 	local targetFOV = math.clamp(
-		config.BaseFOV + math.max(0, ballSeparation - config.BallSeparationZoomDeadzone) * config.BallSeparationZoomScale,
+		config.BaseFOV
+			+ contextualFOV
+			+ math.max(0, ballSeparation - config.BallSeparationZoomDeadzone) * config.BallSeparationZoomScale,
 		config.MinFOV,
 		config.MaxFOV
 	)
 
-	smoothedPosition = smoothVector(smoothedPosition, rigPosition, config.PositionResponsiveness, deltaTime)
-	smoothedFocus = smoothVector(smoothedFocus, focusTarget, config.FocusResponsiveness, deltaTime)
+	smoothedPosition, cameraVelocity = smoothLimitedVector(
+		smoothedPosition,
+		rigPosition,
+		cameraVelocity,
+		config.PositionResponsiveness,
+		config.PositionMaxAcceleration,
+		config.PositionMaxSpeed,
+		deltaTime
+	)
+	smoothedFocus, focusVelocity = smoothLimitedVector(
+		smoothedFocus,
+		focusTarget,
+		focusVelocity,
+		config.FocusResponsiveness,
+		config.FocusMaxAcceleration,
+		config.FocusMaxSpeed,
+		deltaTime
+	)
 	smoothedFOV += (targetFOV - smoothedFOV) * expAlpha(config.ZoomResponsiveness, deltaTime)
 
 	local desiredForward = BallControlMath.SafeUnit((smoothedFocus :: Vector3) - (smoothedPosition :: Vector3), camera.CFrame.LookVector)
@@ -506,7 +595,7 @@ local function updateCamera(deltaTime: number)
 
 	if now - lastAttributeSampleTime >= config.AttributeSampleInterval then
 		lastAttributeSampleTime = now
-		localPlayer:SetAttribute("Beyond90CameraMode", "Broadcast")
+		localPlayer:SetAttribute("Beyond90CameraMode", profileName)
 		localPlayer:SetAttribute("Beyond90CameraTargetDistance", ((smoothedPosition :: Vector3) - (smoothedFocus :: Vector3)).Magnitude)
 		localPlayer:SetAttribute("Beyond90CameraFOV", smoothedFOV)
 		localPlayer:SetAttribute("Beyond90CameraLengthOffset", cameraLengthOffset)
@@ -517,6 +606,9 @@ local function updateCamera(deltaTime: number)
 		localPlayer:SetAttribute("Beyond90CameraDownAngle", math.deg(math.asin(math.clamp(-forward.Y, -1, 1))))
 		localPlayer:SetAttribute("Beyond90CameraFollowLag", BallControlMath.GetHorizontal(rawFramingPoint - framingPoint).Magnitude)
 		localPlayer:SetAttribute("Beyond90CameraFollowDeadZone", config.FollowDeadZoneLength)
+		localPlayer:SetAttribute("Beyond90CameraFollowDelaySeconds", config.FollowDelaySeconds)
+		localPlayer:SetAttribute("Beyond90CameraSafetyCatchup", safetyBlend > 0.01)
+		localPlayer:SetAttribute("Beyond90CameraSafetyCatchupBlend", safetyBlend)
 
 		local head = localPlayer.Character and localPlayer.Character:FindFirstChild("Head")
 		if head and head:IsA("BasePart") then
@@ -538,6 +630,10 @@ function BroadcastCamera.Enable()
 	followAnchor = nil
 	smoothedForward = nil
 	smoothedFOV = config.BaseFOV
+	table.clear(targetHistory)
+	safetyCatchupBlend = 0
+	cameraVelocity = Vector3.zero
+	focusVelocity = Vector3.zero
 	restoreSafeDefaultCamera()
 	renderConnection = RunService.RenderStepped:Connect(updateCamera)
 end
@@ -558,8 +654,31 @@ function BroadcastCamera.Disable()
 	smoothedFocus = nil
 	followAnchor = nil
 	smoothedForward = nil
+	table.clear(targetHistory)
+	safetyCatchupBlend = 0
+	cameraVelocity = Vector3.zero
+	focusVelocity = Vector3.zero
 	clearObstructionFade()
 	clearBroadcastSideFade()
+end
+
+function BroadcastCamera.SetProfile(nextProfileName: string)
+	local nextConfig = CameraConfig[nextProfileName]
+	if typeof(nextConfig) ~= "table" then
+		return false
+	end
+	profileName = nextProfileName
+	config = nextConfig
+	selectedDistancePresetIndex = math.clamp(
+		selectedDistancePresetIndex,
+		1,
+		math.max(#(config.DistancePresets or {}), 1)
+	)
+	return true
+end
+
+function BroadcastCamera.GetProfile(): string
+	return profileName
 end
 
 function BroadcastCamera.IsEnabled(): boolean

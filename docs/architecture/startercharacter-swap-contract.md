@@ -70,8 +70,11 @@ the real collidable grass surface is at `Y=0.500`; `0.18` produced visible
 floating while `0.08` produced measured penetration in later animation poses.
 The compromise must still be validated in Third Person across Idle and
 complete Jog cycles.
-Grounding may apply one bounded HipHeight calibration after spawn settle and
-one bounded late correction, followed by validation only. Do not introduce
+Grounding supports bounded spawn-time calibration followed by validation only.
+For the current imported 8.27-stud rig, geometry-based correction is disabled
+and a documented minimum HipHeight of `3.78` is used because the server's
+unsettled spawn pose does not represent the client animation's sole envelope.
+Late validation must not chase the animated feet downward. Do not introduce
 per-frame vertical correction, mesh offsets, limb resizing, or foot IK for this
 baseline.
 
@@ -119,9 +122,15 @@ B90_LOC_OffBall_Jog_F: rbxassetid://92336242583689
 B90_LOC_OffBall_Sprint_F: rbxassetid://131195698609108
 ```
 
-Missing custom states such as Jump, Fall, and Ball Jog use neutral or explicit
-placeholder presentation until Beyond 90-owned clips are authored. Do not add
-character-specific joint correction hacks.
+Jump is a Beyond 90-owned action presentation. Fall and Ball Jog still use
+neutral or explicit placeholder presentation until owned clips are authored.
+Do not add character-specific joint correction hacks.
+
+Every floor query must exclude all player characters, the football, local
+indicators, pass-target helpers, goal-bound helpers, reference rigs, and other
+non-floor gameplay geometry. A collidable body part from another player is
+never a valid grounding surface. Imported visual sole geometry may use a
+documented measurement-only `VisualSoleOffset`; it must not move a mesh or limb.
 
 Future possession jog work should add:
 

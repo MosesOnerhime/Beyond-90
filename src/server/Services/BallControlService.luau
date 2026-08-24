@@ -29,6 +29,9 @@ local lastAcceptedBallState: { Position: Vector3, Velocity: Vector3, Timestamp: 
 local controllerNoCollisionConstraints: { NoCollisionConstraint } = {}
 local controllerCharacterConnection: RBXScriptConnection? = nil
 local controlEpoch = 0
+local previousFreeBallPosition: Vector3? = nil
+local networkOwnershipHandoffUntil = 0
+local receptionTransactionByPassId: { [number]: { Player: Player, Time: number, Epoch: number } } = {}
 
 local function log(message: string)
 	print(string.format("%s[Ball] %s", GameConfig.LogPrefix, message))
@@ -357,7 +360,7 @@ local function getCandidateContext(player: Player, ball: BasePart)
 		return nil
 	end
 
-	return ReceptionPlanner.Evaluate(player, ball, rootPart, humanoid, BallConfig.Reception)
+	return ReceptionPlanner.Evaluate(player, ball, rootPart, humanoid, BallConfig.Reception, previousFreeBallPosition)
 end
 
 local function getActiveControllerContext(player: Player, ball: BasePart)
@@ -461,6 +464,22 @@ local function applyReceptionFirstTouch(ball: BasePart, candidate, epoch: number
 	ball:SetAttribute("InitialBallVelocityAfterFirstTouch", ball.AssemblyLinearVelocity)
 	ball:SetAttribute("ControlHandoffFirstTouchType", candidate.FirstTouchType)
 	ball:SetAttribute("ControlHandoffUntil", os.clock() + BallConfig.Control.HandoffStabilizationDuration)
+	local actionStartedAt = ball:GetAttribute("LastFootballActionTime")
+	local predictedArrival = ball:GetAttribute("LastFootballActionEstimatedArrivalTime")
+	if candidate.IntendedReceiver
+		and (candidate.ActionType == "GroundPass" or candidate.ActionType == "ThroughPass" or candidate.ActionType == "LobPass")
+		and typeof(actionStartedAt) == "number"
+	then
+		local measuredArrival = os.clock() - actionStartedAt
+		log(string.format(
+			"[PassArrival] type=%s receiver=%s predictedETA=%.2f measuredETA=%.2f measuredArrivalSpeed=%.1f",
+			candidate.ActionType,
+			candidate.Player.Name,
+			if typeof(predictedArrival) == "number" then predictedArrival else 0,
+			measuredArrival,
+			ballSpeedBefore
+		))
+	end
 
 	if not BallConfig.Reception.DebugEnabled then
 		return
@@ -500,6 +519,7 @@ local function applyReceptionFirstTouch(ball: BasePart, candidate, epoch: number
 end
 
 local function releaseControl(ball: BasePart, reason: string)
+	networkOwnershipHandoffUntil = 0
 	if not activeController then
 		setServerNetworkOwner(ball)
 		setBallState(ball, CONTROL_STATE_FREE, nil)
@@ -544,21 +564,33 @@ local function acquireControl(ball: BasePart, player: Player, receptionContext)
 		leadDiagnosticSampleIdByPlayer[previousController] = nil
 	end
 
-	local epoch = advanceControlEpoch(ball)
+	local passId = ball:GetAttribute("LastFootballActionPassId")
+	local previousReception = if receptionContext and receptionContext.IntendedReceiver and typeof(passId) == "number"
+		then receptionTransactionByPassId[passId]
+		else nil
+	local reuseReception = previousReception ~= nil
+		and previousReception.Player == player
+		and os.clock() - previousReception.Time <= BallConfig.Reception.DuplicateReceptionGuardSeconds
+	local epoch = if reuseReception then previousReception.Epoch else advanceControlEpoch(ball)
 
-	if receptionContext then
+	if receptionContext and not reuseReception then
 		applyReceptionFirstTouch(ball, receptionContext, epoch)
 		lastControlDirectionByPlayer[player] = BallControlMath.SafeUnit(
 			receptionContext.ControlDirection,
 			getFacingDirection(receptionContext.RootPart)
 		)
-	else
+	elseif not reuseReception then
 		ball:SetAttribute("InitialControlDirection", nil)
 		ball:SetAttribute("InitialExpectedLead", 0)
 		ball:SetAttribute("InitialPlayerVelocity", Vector3.zero)
 		ball:SetAttribute("InitialBallVelocityAfterFirstTouch", ball.AssemblyLinearVelocity)
 		ball:SetAttribute("ControlHandoffFirstTouchType", "")
 		ball:SetAttribute("ControlHandoffUntil", 0)
+	end
+	if receptionContext and receptionContext.IntendedReceiver and typeof(passId) == "number" and not reuseReception then
+		receptionTransactionByPassId[passId] = { Player = player, Time = os.clock(), Epoch = epoch }
+	elseif reuseReception then
+		log(string.format("[Reception] reused transaction passId=%d player=%s epoch=%d", passId, player.Name, epoch))
 	end
 
 	activeController = player
@@ -611,7 +643,22 @@ local function acquireControl(ball: BasePart, player: Player, receptionContext)
 	log(string.format("Control acquired by %s", player.Name))
 
 	if isPlayerOwnedMode() then
-		setPlayerNetworkOwner(ball, player)
+		if receptionContext then
+			setServerNetworkOwner(ball)
+			networkOwnershipHandoffUntil = os.clock() + BallConfig.Reception.NetworkOwnershipHandoffDelay
+			local handoffEpoch = epoch
+			task.delay(BallConfig.Reception.NetworkOwnershipHandoffDelay, function()
+				if activeController == player
+					and ball.Parent
+					and ball:GetAttribute("ControlEpoch") == handoffEpoch
+				then
+					setPlayerNetworkOwner(ball, player)
+					networkOwnershipHandoffUntil = 0
+				end
+			end)
+		else
+			setPlayerNetworkOwner(ball, player)
+		end
 	else
 		setServerNetworkOwner(ball)
 	end
@@ -987,6 +1034,7 @@ local function applyCoupledPossessionControl(ball: BasePart, candidate, deltaTim
 end
 
 function BallControlService.Initialize(ball: BasePart)
+	previousFreeBallPosition = ball.Position
 	activeController = nil
 	table.clear(lastLogicalTouchByPlayer)
 	table.clear(logicalTouchCountByPlayer)
@@ -995,9 +1043,11 @@ function BallControlService.Initialize(ball: BasePart)
 	table.clear(leadDiagnosticSampleIdByPlayer)
 	table.clear(acquisitionSuppressedUntilByPlayer)
 	table.clear(lastReceptionDiagnosticAtByPlayer)
+	table.clear(receptionTransactionByPassId)
 	lastOwnershipValidationAt = 0
 	distanceViolationStartedAt = nil
 	lastAcceptedBallState = nil
+	networkOwnershipHandoffUntil = 0
 	clearControllerNoCollision()
 	setServerNetworkOwner(ball)
 	setBallState(ball, CONTROL_STATE_FREE, nil)
@@ -1041,6 +1091,7 @@ function BallControlService.Initialize(ball: BasePart)
 	ball:SetAttribute("LastFootballActionEstimatedArrivalTime", 0)
 	ball:SetAttribute("LastFootballActionPredictedCatchTime", 0)
 	ball:SetAttribute("LastFootballActionPeakSeparation", 0)
+	ball:SetAttribute("LastFootballActionGoalId", "")
 	ball:SetAttribute("LastReceptionPlayerUserId", 0)
 	ball:SetAttribute("LastReceptionPlayerName", "")
 	ball:SetAttribute("LastReceptionType", "")
@@ -1059,6 +1110,7 @@ function BallControlService.Initialize(ball: BasePart)
 end
 
 function BallControlService.Reset(ball: BasePart)
+	previousFreeBallPosition = nil
 	if activeController then
 		releaseControl(ball, "ball reset")
 	else
@@ -1078,6 +1130,7 @@ function BallControlService.Reset(ball: BasePart)
 	lastOwnershipValidationAt = 0
 	distanceViolationStartedAt = nil
 	lastAcceptedBallState = nil
+	networkOwnershipHandoffUntil = 0
 	advanceControlEpoch(ball)
 	ball:SetAttribute("LastControlTouchTime", -1)
 	ball:SetAttribute("LastControlTouchCount", 0)
@@ -1115,6 +1168,7 @@ function BallControlService.Reset(ball: BasePart)
 	ball:SetAttribute("LastFootballActionEstimatedArrivalTime", 0)
 	ball:SetAttribute("LastFootballActionPredictedCatchTime", 0)
 	ball:SetAttribute("LastFootballActionPeakSeparation", 0)
+	ball:SetAttribute("LastFootballActionGoalId", "")
 	ball:SetAttribute("LastReceptionPlayerUserId", 0)
 	ball:SetAttribute("LastReceptionPlayerName", "")
 	ball:SetAttribute("LastReceptionType", "")
@@ -1214,10 +1268,12 @@ function BallControlService.ReleaseForFootballAction(
 	ball:SetAttribute("LastFootballActionEstimatedArrivalTime", actionContext and actionContext.EstimatedArrivalTime or 0)
 	ball:SetAttribute("LastFootballActionPredictedCatchTime", actionContext and actionContext.PredictedCatchTime or 0)
 	ball:SetAttribute("LastFootballActionPeakSeparation", actionContext and actionContext.PeakSeparation or 0)
+	ball:SetAttribute("LastFootballActionGoalId", actionContext and actionContext.GoalId or "")
 	return true
 end
 
 function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
+	local sampledBallPosition = ball.Position
 	local stepDeltaTime = math.max(deltaTime or BallConfig.BasicTouch.CheckInterval, 1 / 240)
 
 	if activeController then
@@ -1256,6 +1312,7 @@ function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
 	end
 
 	if not activeController then
+		previousFreeBallPosition = sampledBallPosition
 		setBallState(ball, CONTROL_STATE_FREE, nil)
 		ball:SetAttribute("ControlTargetError", -1)
 		ball:SetAttribute("CurrentBallLead", 0)
@@ -1272,6 +1329,9 @@ function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
 		ball:SetAttribute("LastLocalDribbleTouchStrength", "")
 		return false
 	end
+	if activeController then
+		previousFreeBallPosition = nil
+	end
 
 	local activeCandidate = getActiveControllerContext(activeController, ball)
 
@@ -1280,7 +1340,9 @@ function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
 		return false
 	end
 
-	if isPlayerOwnedMode() then
+	if isPlayerOwnedMode() and os.clock() < networkOwnershipHandoffUntil then
+		applyCoupledPossessionControl(ball, activeCandidate, stepDeltaTime)
+	elseif isPlayerOwnedMode() then
 		local controlDirection = updateControlDirection(
 			activeCandidate.Player,
 			activeCandidate.RootPart,

@@ -6,6 +6,7 @@ local Workspace = game:GetService("Workspace")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local GameConfig = require(Shared.Config.GameConfig)
 local PlayerConfig = require(Shared.Config.PlayerConfig)
+local GroundProbe = require(Shared.World.GroundProbe)
 local CharacterAppearanceService = require(script.Parent.CharacterAppearanceService)
 
 local PlayerService = {}
@@ -166,12 +167,8 @@ local function getPitchGroundContext(character: Model, spawnLocation: SpawnLocat
 	local rootPart = character:FindFirstChild("HumanoidRootPart")
 
 	if rootPart and rootPart:IsA("BasePart") then
-		local raycastParams = RaycastParams.new()
-		raycastParams.FilterType = Enum.RaycastFilterType.Exclude
-		raycastParams.FilterDescendantsInstances = { character }
-		raycastParams.RespectCanCollide = true
 		local probeDistance = (PlayerConfig.Appearance.Grounding or {}).FloorProbeDistanceStuds or 20
-		local result = Workspace:Raycast(rootPart.Position, Vector3.new(0, -probeDistance, 0), raycastParams)
+		local result = GroundProbe.Raycast(rootPart.Position, probeDistance, { character })
 
 		if result then
 			return result.Position.Y, result.Instance:GetFullName(), result.Material.Name, result.Distance
@@ -189,7 +186,8 @@ local function getPartBottomY(character: Model, partName: string): number?
 		return nil
 	end
 
-	return part.Position.Y - part.Size.Y / 2
+	local visualSoleOffset = (PlayerConfig.Appearance.Grounding or {}).VisualSoleOffsetStuds or 0
+	return part.Position.Y - part.Size.Y / 2 + visualSoleOffset
 end
 
 local function getLowestFootBottomY(character: Model): number?
@@ -237,16 +235,20 @@ local function updateGroundingAttributes(
 	character:SetAttribute("Beyond90FloorPart", floorPartName)
 	character:SetAttribute("Beyond90FloorMaterial", floorMaterial)
 	character:SetAttribute("Beyond90FloorDistance", floorDistance)
+	character:SetAttribute("Beyond90GroundSurfaceValid", string.find(floorPartName, ".Player", 1, true) == nil)
 
 	if phase ~= "waiting-settle" then
 		log(string.format(
-			"Grounding phase=%s height=%.2f hipHeight=%.3f rootY=%.3f groundY=%.3f targetClearance=%.3f leftFootBottomY=%.3f rightFootBottomY=%.3f lowestClearance=%.3f clearanceError=%.3f hipAdjustment=%.3f floor=%s material=%s floorDistance=%.3f",
+			"[Ground] player=%s validSurface=%s phase=%s height=%.2f hipHeight=%.3f rootY=%.3f groundY=%.3f targetClearance=%.3f visualSoleOffset=%.3f leftFootBottomY=%.3f rightFootBottomY=%.3f lowestClearance=%.3f clearanceError=%.3f hipAdjustment=%.3f hit=%s material=%s floorDistance=%.3f",
+			character.Name,
+			tostring(character:GetAttribute("Beyond90GroundSurfaceValid")),
 			phase,
 			character:GetAttribute("Beyond90MeasuredBodyHeightStuds") or -1,
 			humanoid.HipHeight,
 			if rootPart and rootPart:IsA("BasePart") then rootPart.Position.Y else -1,
 			groundY,
 			targetClearance,
+			groundingConfig.VisualSoleOffsetStuds or 0,
 			leftFootBottomY or -1,
 			rightFootBottomY or -1,
 			footGroundError or 0,
@@ -292,10 +294,20 @@ local function applyCharacterGroundingCalibration(
 	local maxCorrection = maxCorrectionOverride or groundingConfig.MaxHipHeightCorrectionStuds or 0.25
 	local hipAdjustment = 0
 
-	if canAdjust and math.abs(correction) > tolerance then
-		hipAdjustment = math.clamp(correction, -maxCorrection, maxCorrection)
-		humanoid.HipHeight = math.max(0, humanoid.HipHeight + hipAdjustment)
-		RunService.Heartbeat:Wait()
+	if canAdjust then
+		if groundingConfig.GeometryHipHeightCorrectionEnabled ~= false and math.abs(correction) > tolerance then
+			hipAdjustment = math.clamp(correction, -maxCorrection, maxCorrection)
+			if groundingConfig.AllowDownwardHipHeightCorrection == false then
+				hipAdjustment = math.max(0, hipAdjustment)
+			end
+		end
+		local minimumHipHeight = groundingConfig.MinimumHipHeightStuds or 0
+		local nextHipHeight = math.max(minimumHipHeight, humanoid.HipHeight + hipAdjustment)
+		hipAdjustment = nextHipHeight - humanoid.HipHeight
+		if math.abs(hipAdjustment) > 1e-4 then
+			humanoid.HipHeight = nextHipHeight
+			RunService.Heartbeat:Wait()
+		end
 	end
 
 	local resultPhase = phase
@@ -437,6 +449,12 @@ local function configureCharacter(player: Player, character: Model, spawnLocatio
 	normalizeCharacterPhysics(character)
 	placeCharacterAtDevelopmentSpawn(character, spawnLocation)
 	applyMovementSettings(player, humanoid)
+	local animator = humanoid:FindFirstChildOfClass("Animator")
+	if not animator then
+		animator = Instance.new("Animator")
+		animator.Parent = humanoid
+	end
+	character:SetAttribute("Beyond90CharacterReady", true)
 	scheduleSettledGrounding(character, humanoid, spawnLocation)
 
 	if not configuredHumanoids[humanoid] then
@@ -518,6 +536,7 @@ function PlayerService.Initialize(spawnLocation: SpawnLocation)
 	end
 
 	initialized = true
+	Players.CharacterAutoLoads = false
 
 	local remotes = getOrCreateFolder(ReplicatedStorage, "Remotes")
 	sprintRemote = getOrCreateRemoteEvent(remotes, inputConfig.SprintRemoteName)

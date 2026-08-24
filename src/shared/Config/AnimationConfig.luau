@@ -40,7 +40,6 @@ local AnimationConfig = {
 		},
 
 		Actions = {
-			DirectionChange180 = "rbxassetid://139073207440259",
 			ReceivePass = "rbxassetid://86547436800404",
 			Pass = "rbxassetid://126850541210145",
 			Shoot = "rbxassetid://138798529340032",
@@ -55,7 +54,6 @@ local AnimationConfig = {
 		SprintToJog = 0.1,
 		ActionEnter = 0.06,
 		ActionExit = 0.12,
-		DirectionChangeExit = 0.14,
 		JumpEnter = 0.05,
 		JumpExit = 0.1,
 		PassEnter = 0.05,
@@ -78,9 +76,10 @@ local AnimationConfig = {
 
 			JogEnterSpeed = 0.75,
 			JogExitSpeed = 0.35,
+			VisualExitSpeed = 4,
 			MovementIntentThreshold = 0.05,
 			JogReferenceSpeed = 14,
-			JogPlaybackMultiplier = 0.9,
+			JogPlaybackMultiplier = 1.05,
 			JogPlaybackMultiplierMin = 0.8,
 			JogPlaybackMultiplierMax = 1.6,
 			JogPlaybackMultiplierStep = 0.05,
@@ -129,33 +128,29 @@ local AnimationConfig = {
 		Sprint = {
 			Enabled = true,
 			IntentThreshold = 0.05,
-			ExitSpeed = 18,
-			ReferenceSpeed = 30,
+			ExitSpeed = 19,
+			ReferenceSpeed = 28,
 			PlaybackMultiplier = 1,
 			MinPlaybackRate = 0.55,
 			MaxPlaybackRate = 1.25,
 			TurnEnterAngle = 22,
 			TurnExitAngle = 12,
 			TurnFullWeightAngle = 65,
+			TurnMinimumSpeed = 18,
+			TurnSustainTime = 0.08,
 			WeightResponsiveness = 16,
 			FadeInTime = 0.1,
 			FadeOutTime = 0.1,
 			Priority = Enum.AnimationPriority.Movement,
 		},
 
-		DirectionChange = {
-			Enabled = true,
-			TriggerAngle = 150,
-			MinimumSpeed = 7.5,
-			Cooldown = 0.7,
-			FadeInTime = 0.06,
-			FadeOutTime = 0.1,
-			ExitBlendTime = 0.14,
-			FallbackDuration = 0.55,
-			PlaybackRate = 1,
-			RootAuditEnabled = true,
-			Priority = Enum.AnimationPriority.Action,
-		},
+	},
+
+	AirbornePresentation = {
+		EnterDelay = 0.2,
+		GroundedVerticalSpeedTolerance = 1.5,
+		MinimumFallSpeed = 2.25,
+		ClearGroundDistancePadding = 1.5,
 	},
 
 	Jump = {
@@ -172,6 +167,7 @@ local AnimationConfig = {
 		ActionTypes = {
 			GroundPass = true,
 			ThroughPass = true,
+			LobPass = true,
 		},
 		FallbackDuration = 0.72,
 		PlaybackRate = 1,
@@ -181,7 +177,12 @@ local AnimationConfig = {
 	},
 
 	Shoot = {
-		Enabled = false,
+		Enabled = true,
+		FallbackDuration = 0.9,
+		PlaybackRate = 1,
+		FadeInTime = 0.05,
+		FadeOutTime = 0.12,
+		ExitBlendTime = 0.12,
 		Priority = Enum.AnimationPriority.Action,
 	},
 
@@ -190,11 +191,24 @@ local AnimationConfig = {
 		PassActionTypes = {
 			GroundPass = true,
 			ThroughPass = true,
+			LobPass = true,
 		},
 		FadeInTime = 0.06,
 		FadeOutTime = 0.12,
 		ExitBlendTime = 0.12,
 		FallbackDuration = 0.7,
+		PlaybackRate = 1,
+		Priority = Enum.AnimationPriority.Action,
+	},
+
+	StopTrap = {
+		Enabled = true,
+		TriggerSpeed = 4,
+		MaximumBallLead = 4.5,
+		FadeInTime = 0.06,
+		FadeOutTime = 0.08,
+		ExitBlendTime = 0.1,
+		FallbackDuration = 0.65,
 		PlaybackRate = 1,
 		Priority = Enum.AnimationPriority.Action,
 	},

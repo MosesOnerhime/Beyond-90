@@ -1,5 +1,6 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterPlayer = game:GetService("StarterPlayer")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
@@ -8,6 +9,7 @@ local BallControlMath = require(Shared.Football.BallControlMath)
 local CameraConfig = require(Shared.Config.CameraConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local PlayerConfig = require(Shared.Config.PlayerConfig)
+local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 
 local InputController = {}
 
@@ -25,6 +27,7 @@ local cameraToggleAction: Instance? = nil
 local passAction: Instance? = nil
 local throughPassAction: Instance? = nil
 local knockOnAction: Instance? = nil
+local shootAction: Instance? = nil
 local sprintButtonGui: ScreenGui? = nil
 local connections: { RBXScriptConnection } = {}
 local pressedKeys: { [Enum.KeyCode]: boolean } = {}
@@ -36,6 +39,11 @@ local footballActionEvent = Instance.new("BindableEvent")
 local autoSprintChangedEvent = Instance.new("BindableEvent")
 local manualSprintRequested = false
 local autoSprintEnabled = inputConfig.AutoSprintDefaultEnabled == true
+local passCommitToken = 0
+local lastPassReleaseAt = -math.huge
+local passSecondTap = false
+local nativeControls = nil
+local clickToMoveConnection: RBXScriptConnection? = nil
 
 local inputState = {
 	MoveVector = Vector2.zero,
@@ -53,6 +61,28 @@ end
 
 local function warnLog(message: string)
 	warn(string.format("%s[Client][Input] %s", GameConfig.LogPrefix, message))
+end
+
+local function disableNativeClickToMove()
+	local playerModule = StarterPlayer:FindFirstChild("PlayerModule")
+	local contexts = playerModule and playerModule:FindFirstChild("InputContexts")
+	local characterContext = contexts and contexts:FindFirstChild("CharacterContext")
+	for _, actionName in { "ClickToMoveAction", "ClickToMovePositionAction" } do
+		local action = characterContext and characterContext:FindFirstChild(actionName)
+		if action then
+			pcall(function() action.Enabled = false end)
+		end
+	end
+	local camera = Workspace.CurrentCamera
+	local marker = camera and camera:FindFirstChild("ClickToMoveDisplay")
+	if marker then marker:Destroy() end
+	if camera then
+		clickToMoveConnection = camera.ChildAdded:Connect(function(child)
+			if child.Name == "ClickToMoveDisplay" then
+				child:Destroy()
+			end
+		end)
+	end
 end
 
 local function setProperty(instance: Instance, property: string, value: any): boolean
@@ -212,6 +242,44 @@ local function handleBoolFootballAction(actionType: string, value: any)
 	end
 end
 
+local function handlePassGesture(value: any)
+	if typeof(value) ~= "boolean" then
+		return
+	end
+	local now = os.clock()
+	if value then
+		passSecondTap = now - lastPassReleaseAt <= FootballActionConfig.Input.DoubleTapWindow
+		actionStartedAt.GroundPass = now
+		if passSecondTap then
+			passCommitToken += 1
+			fireFootballAction("LobPass", "Pressed", 0)
+		else
+			fireFootballAction("GroundPass", "Pressed", 0)
+		end
+		return
+	end
+	local startedAt = actionStartedAt.GroundPass
+	actionStartedAt.GroundPass = nil
+	if not startedAt then return end
+	local duration = now - startedAt
+	if passSecondTap then
+		passCommitToken += 1
+		lastPassReleaseAt = -math.huge
+		passSecondTap = false
+		fireFootballAction("LobPass", "Released", duration)
+		return
+	end
+	lastPassReleaseAt = now
+	passCommitToken += 1
+	local token = passCommitToken
+	task.delay(FootballActionConfig.Input.SingleTapCommitDelay, function()
+		if initialized and token == passCommitToken then
+			lastPassReleaseAt = -math.huge
+			fireFootballAction("GroundPass", "Released", duration)
+		end
+	end)
+end
+
 local function createInputFolder(): Folder
 	local existing = ReplicatedStorage:FindFirstChild(inputConfig.InputFolderName)
 
@@ -303,6 +371,9 @@ local function setupInputActions(): boolean
 	local okKnockOn, knockOn = pcall(function()
 		return Instance.new("InputAction")
 	end)
+	local okShoot, shoot = pcall(function()
+		return Instance.new("InputAction")
+	end)
 
 	if not okContext
 		or not okMove
@@ -312,6 +383,7 @@ local function setupInputActions(): boolean
 		or not okPass
 		or not okThroughPass
 		or not okKnockOn
+		or not okShoot
 	then
 		return false
 	end
@@ -367,8 +439,8 @@ local function setupInputActions(): boolean
 	addBinding(sprint, "GamepadLeftStickButton", {
 		KeyCode = Enum.KeyCode.ButtonL3,
 	})
-	addBinding(sprint, "GamepadY", {
-		KeyCode = Enum.KeyCode.ButtonY,
+	addBinding(sprint, "GamepadRightTrigger", {
+		KeyCode = Enum.KeyCode.ButtonR2,
 	})
 
 	local sprintButton = createSprintTouchButton()
@@ -411,6 +483,9 @@ local function setupInputActions(): boolean
 	addBinding(cameraToggle, "KeyboardC", {
 		KeyCode = inputConfig.CameraToggleKey,
 	})
+	addBinding(cameraToggle, "GamepadSelect", {
+		KeyCode = Enum.KeyCode.ButtonSelect,
+	})
 
 	table.insert(connections, cameraToggle.StateChanged:Connect(function(value)
 		if value == true then
@@ -426,9 +501,12 @@ local function setupInputActions(): boolean
 	addBinding(pass, "KeyboardPass", {
 		KeyCode = inputConfig.PassKey,
 	})
+	addBinding(pass, "GamepadPass", {
+		KeyCode = Enum.KeyCode.ButtonX,
+	})
 
 	table.insert(connections, pass.StateChanged:Connect(function(value)
-		handleBoolFootballAction("GroundPass", value)
+		handlePassGesture(value)
 	end))
 
 	throughPass.Name = inputConfig.ThroughPassActionName
@@ -438,6 +516,9 @@ local function setupInputActions(): boolean
 
 	addBinding(throughPass, "KeyboardThroughPass", {
 		KeyCode = inputConfig.ThroughPassKey,
+	})
+	addBinding(throughPass, "GamepadThroughPass", {
+		KeyCode = Enum.KeyCode.ButtonY,
 	})
 
 	table.insert(connections, throughPass.StateChanged:Connect(function(value)
@@ -452,9 +533,28 @@ local function setupInputActions(): boolean
 	addBinding(knockOn, "KeyboardKnockOn", {
 		KeyCode = inputConfig.KnockOnKey,
 	})
+	addBinding(knockOn, "GamepadKnockOn", {
+		KeyCode = Enum.KeyCode.ButtonR1,
+	})
 
 	table.insert(connections, knockOn.StateChanged:Connect(function(value)
 		handleBoolFootballAction("KnockOn", value)
+	end))
+
+	shoot.Name = inputConfig.ShootActionName
+	setProperty(shoot, "Type", Enum.InputActionType.Bool)
+	shoot.Parent = context
+	shootAction = shoot
+
+	addBinding(shoot, "KeyboardShoot", {
+		KeyCode = inputConfig.ShootKey,
+	})
+	addBinding(shoot, "GamepadShoot", {
+		KeyCode = Enum.KeyCode.ButtonB,
+	})
+
+	table.insert(connections, shoot.StateChanged:Connect(function(value)
+		handleBoolFootballAction("Shoot", value)
 	end))
 
 	local moveStateOk, moveState = pcall(function()
@@ -531,12 +631,12 @@ local function setupUserInputFallback()
 		if inputObject.KeyCode == Enum.KeyCode.LeftShift
 			or inputObject.KeyCode == Enum.KeyCode.RightShift
 			or inputObject.KeyCode == Enum.KeyCode.ButtonL3
-			or inputObject.KeyCode == Enum.KeyCode.ButtonY
+			or inputObject.KeyCode == Enum.KeyCode.ButtonR2
 		then
 			setManualSprintRequested(true, "UserInputService")
 		end
 
-		if inputObject.KeyCode == inputConfig.CameraToggleKey then
+		if inputObject.KeyCode == inputConfig.CameraToggleKey or inputObject.KeyCode == Enum.KeyCode.ButtonSelect then
 			cameraToggleEvent:Fire()
 		end
 
@@ -544,15 +644,17 @@ local function setupUserInputFallback()
 			jumpEvent:Fire()
 		end
 
-		if inputObject.KeyCode == inputConfig.PassKey then
-			actionStartedAt.GroundPass = os.clock()
-			fireFootballAction("GroundPass", "Pressed", 0)
-		elseif inputObject.KeyCode == inputConfig.ThroughPassKey then
+		if inputObject.KeyCode == inputConfig.PassKey or inputObject.KeyCode == Enum.KeyCode.ButtonX then
+			handlePassGesture(true)
+		elseif inputObject.KeyCode == inputConfig.ThroughPassKey or inputObject.KeyCode == Enum.KeyCode.ButtonY then
 			actionStartedAt.ThroughPass = os.clock()
 			fireFootballAction("ThroughPass", "Pressed", 0)
-		elseif inputObject.KeyCode == inputConfig.KnockOnKey then
+		elseif inputObject.KeyCode == inputConfig.KnockOnKey or inputObject.KeyCode == Enum.KeyCode.ButtonR1 then
 			actionStartedAt.KnockOn = os.clock()
 			fireFootballAction("KnockOn", "Pressed", 0)
+		elseif inputObject.KeyCode == inputConfig.ShootKey or inputObject.KeyCode == Enum.KeyCode.ButtonB then
+			actionStartedAt.Shoot = os.clock()
+			fireFootballAction("Shoot", "Pressed", 0)
 		end
 
 		refreshFallbackMoveVector()
@@ -564,7 +666,7 @@ local function setupUserInputFallback()
 		if inputObject.KeyCode == Enum.KeyCode.LeftShift
 			or inputObject.KeyCode == Enum.KeyCode.RightShift
 			or inputObject.KeyCode == Enum.KeyCode.ButtonL3
-			or inputObject.KeyCode == Enum.KeyCode.ButtonY
+			or inputObject.KeyCode == Enum.KeyCode.ButtonR2
 		then
 			setManualSprintRequested(false, "UserInputService")
 		end
@@ -573,26 +675,28 @@ local function setupUserInputFallback()
 			fallbackThumbstick = Vector2.zero
 		end
 
-		if inputObject.KeyCode == inputConfig.PassKey then
-			local startedAt = actionStartedAt.GroundPass
-			actionStartedAt.GroundPass = nil
-
-			if startedAt then
-				fireFootballAction("GroundPass", "Released", os.clock() - startedAt)
-			end
-		elseif inputObject.KeyCode == inputConfig.ThroughPassKey then
+		if inputObject.KeyCode == inputConfig.PassKey or inputObject.KeyCode == Enum.KeyCode.ButtonX then
+			handlePassGesture(false)
+		elseif inputObject.KeyCode == inputConfig.ThroughPassKey or inputObject.KeyCode == Enum.KeyCode.ButtonY then
 			local startedAt = actionStartedAt.ThroughPass
 			actionStartedAt.ThroughPass = nil
 
 			if startedAt then
 				fireFootballAction("ThroughPass", "Released", os.clock() - startedAt)
 			end
-		elseif inputObject.KeyCode == inputConfig.KnockOnKey then
+		elseif inputObject.KeyCode == inputConfig.KnockOnKey or inputObject.KeyCode == Enum.KeyCode.ButtonR1 then
 			local startedAt = actionStartedAt.KnockOn
 			actionStartedAt.KnockOn = nil
 
 			if startedAt then
 				fireFootballAction("KnockOn", "Released", os.clock() - startedAt)
+			end
+		elseif inputObject.KeyCode == inputConfig.ShootKey or inputObject.KeyCode == Enum.KeyCode.ButtonB then
+			local startedAt = actionStartedAt.Shoot
+			actionStartedAt.Shoot = nil
+
+			if startedAt then
+				fireFootballAction("Shoot", "Released", os.clock() - startedAt)
 			end
 		end
 
@@ -675,6 +779,16 @@ function InputController.Initialize()
 	end
 
 	initialized = true
+	disableNativeClickToMove()
+	pcall(function()
+		local playerModuleScript = localPlayer.PlayerScripts:WaitForChild("PlayerModule", 2)
+		if not playerModuleScript then
+			return
+		end
+		local playerModule = require(playerModuleScript)
+		nativeControls = playerModule:GetControls()
+		nativeControls:Disable()
+	end)
 
 	if setupInputActions() then
 		log("Input source: InputAction")
@@ -690,6 +804,13 @@ function InputController.Destroy()
 	end
 
 	initialized = false
+	passCommitToken += 1
+	lastPassReleaseAt = -math.huge
+	passSecondTap = false
+	if clickToMoveConnection then
+		clickToMoveConnection:Disconnect()
+		clickToMoveConnection = nil
+	end
 
 	for _, connection in connections do
 		connection:Disconnect()
@@ -721,6 +842,7 @@ function InputController.Destroy()
 	passAction = nil
 	throughPassAction = nil
 	knockOnAction = nil
+	shootAction = nil
 	inputFolder = nil
 end
 

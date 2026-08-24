@@ -115,28 +115,66 @@ local function getFirstTouchVelocity(
 		Vector3.new(target.X, ball.Position.Y, target.Z)
 end
 
-function ReceptionPlanner.Evaluate(player: Player, ball: BasePart, rootPart: BasePart, humanoid: Humanoid, config)
+function ReceptionPlanner.Evaluate(
+	player: Player,
+	ball: BasePart,
+	rootPart: BasePart,
+	humanoid: Humanoid,
+	config,
+	previousBallPosition: Vector3?
+)
 	local actionContext = getBallActionContext(ball)
+	local intendedReceiver = actionContext.IntendedReceiverUserId == player.UserId
+		and player.UserId ~= 0
+		and os.clock() - actionContext.ActionTime <= config.IntendedReceiverWindowSeconds
 	local ballVelocity = ball.AssemblyLinearVelocity
 	local ballHorizontalVelocity = getHorizontal(ballVelocity)
 	local ballSpeed = ballHorizontalVelocity.Magnitude
 	local ballHeight = ball.Position.Y
 
-	if ballHeight > config.MaxControlCenterHeight then
+	local maximumCenterHeight = if intendedReceiver
+		then config.IntendedReceiverMaxCenterHeight
+		else config.MaxControlCenterHeight
+	if ballHeight > maximumCenterHeight then
 		return nil
 	end
 
-	if ballSpeed > config.MaxControllableBallSpeed then
+	local maximumBallSpeed = if intendedReceiver
+		then config.IntendedReceiverMaxBallSpeed
+		else config.MaxControllableBallSpeed
+	if ballSpeed > maximumBallSpeed then
 		return nil
 	end
 
 	local facingDirection = getFacingDirection(rootPart)
 	local movementDirection, playerSpeed = getMovementDirection(rootPart, humanoid, facingDirection)
 	local playerVelocity = getHorizontal(rootPart.AssemblyLinearVelocity)
-	local horizontalFromPlayer = getHorizontal(ball.Position - rootPart.Position)
+	local evaluationPosition = ball.Position
+	if intendedReceiver and typeof(previousBallPosition) == "Vector3" then
+		local segment = getHorizontal(ball.Position - previousBallPosition)
+		local segmentLengthSquared = segment:Dot(segment)
+		if segmentLengthSquared > EPSILON then
+			local toPlayer = getHorizontal(rootPart.Position - previousBallPosition)
+			local alpha = math.clamp(toPlayer:Dot(segment) / segmentLengthSquared, 0, 1)
+			local sweptPosition = previousBallPosition + (ball.Position - previousBallPosition) * alpha
+			if getHorizontal(sweptPosition - rootPart.Position).Magnitude
+				< getHorizontal(evaluationPosition - rootPart.Position).Magnitude
+			then
+				evaluationPosition = sweptPosition
+			end
+		end
+	end
+	local horizontalFromPlayer = getHorizontal(evaluationPosition - rootPart.Position)
 	local distance = horizontalFromPlayer.Magnitude
+	if intendedReceiver and distance <= EPSILON and ballSpeed > EPSILON then
+		horizontalFromPlayer = -ballHorizontalVelocity.Unit * EPSILON
+		distance = EPSILON
+	end
 
-	if distance <= EPSILON or distance > config.MaxReachDistance then
+	local maximumReachDistance = if intendedReceiver
+		then config.IntendedReceiverReachDistance
+		else config.MaxReachDistance
+	if distance < EPSILON or distance > maximumReachDistance then
 		return nil
 	end
 
@@ -152,9 +190,13 @@ function ReceptionPlanner.Evaluate(player: Player, ball: BasePart, rootPart: Bas
 		and lateralDistance <= config.LateralReachDistance
 	local loosePickup = distance <= config.LoosePickupDistance
 		and (forwardLead >= -config.LooseBehindTolerance or towardBallDot >= config.TurnTowardBehindDot)
+	local incomingReachDistance = if intendedReceiver then maximumReachDistance else config.IncomingReachDistance
+	local incomingLateralTolerance = if intendedReceiver
+		then config.IntendedReceiverLateralTolerance
+		else config.IncomingLateralTolerance
 	local incomingReception = ballApproachDot >= config.IncomingApproachDot
-		and distance <= config.IncomingReachDistance
-		and lateralDistance <= config.IncomingLateralTolerance
+		and distance <= incomingReachDistance
+		and lateralDistance <= incomingLateralTolerance
 	local chasingBall = playerSpeed >= config.MinChasePlayerSpeed
 		and towardBallDot >= config.MinTowardBallDot
 		and distance <= config.ChaseReachDistance
@@ -175,8 +217,8 @@ function ReceptionPlanner.Evaluate(player: Player, ball: BasePart, rootPart: Bas
 
 	local touchDirection = movementDirection
 
-	if playerSpeed < config.StationaryPlayerSpeed and incomingReception then
-		touchDirection = facingDirection
+	if incomingReception and ballSpeed > EPSILON then
+		touchDirection = -ballHorizontalVelocity.Unit
 	end
 
 	if actionContext.ActionType == "KnockOn" and player.UserId == actionContext.InitiatorUserId and playerSpeed >= config.MinChasePlayerSpeed then
@@ -192,7 +234,6 @@ function ReceptionPlanner.Evaluate(player: Player, ball: BasePart, rootPart: Bas
 		config
 	)
 
-	local intendedReceiver = actionContext.IntendedReceiverUserId == player.UserId and player.UserId ~= 0
 	local estimatedTimeToBall = math.max(0, (distance - config.ControlRadius) / math.max(playerSpeed + ballSpeed * math.max(ballApproachDot, 0), 1))
 	local score = 8
 		- distance * config.DistanceScorePenalty

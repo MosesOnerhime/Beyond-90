@@ -16,10 +16,30 @@ local activeBall: Part? = nil
 local heartbeatConnection: RBXScriptConnection? = nil
 local playerRemovingConnection: RBXScriptConnection? = nil
 local accumulatedTime = 0
+local ballSampledEvent = Instance.new("BindableEvent")
 local lastTouchByPlayer: { [Player]: number } = {}
 local warnedMissingFootballVisual = false
 local loggedFootballVisualLoaded = false
 local loggedBallScale = false
+local sessionActive = false
+
+local function applySessionVisibility(ball: BasePart, active: boolean)
+	ball.Anchored = not active
+	ball.CanCollide = active
+	ball.CanQuery = active
+	ball.CanTouch = active
+	ball.Transparency = if active then 0 else 1
+	for _, descendant in ball:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			descendant.Transparency = if active then 0 else 1
+			descendant.CanCollide = false
+			descendant.CanQuery = false
+			descendant.CanTouch = false
+		elseif descendant:IsA("Decal") or descendant:IsA("Texture") then
+			descendant.Transparency = if active then 0 else 1
+		end
+	end
+end
 
 local function getRootFolder(): Folder
 	local rootFolder = Workspace:FindFirstChild(GameConfig.WorkspaceContainerName)
@@ -288,6 +308,7 @@ local function resetBall(ball: BasePart)
 	ball.AssemblyAngularVelocity = Vector3.zero
 	ball.CFrame = CFrame.new(getBallSpawnPosition())
 	ball:SetNetworkOwner(nil)
+	ballSampledEvent:Fire(ball, ball.Position, true)
 end
 
 local function getHorizontal(vector: Vector3): Vector3
@@ -475,10 +496,12 @@ local function startInteractionLoop()
 	end)
 
 	heartbeatConnection = RunService.Heartbeat:Connect(function(deltaTime)
-		if not activeBall then
+		if not activeBall or not sessionActive then
 			return
 		end
 
+		-- Goal-line observers must see the physical sample before bounds validation can reset it.
+		ballSampledEvent:Fire(activeBall, activeBall.Position, false)
 		accumulatedTime += deltaTime
 		local allowFreeTouch = accumulatedTime >= BallConfig.BasicTouch.CheckInterval
 
@@ -532,9 +555,41 @@ function BallService.Initialize()
 	end
 	activeBall = ball
 	BallControlService.Initialize(ball)
+	applySessionVisibility(ball, false)
 	startInteractionLoop()
 
 	return ball
+end
+
+function BallService.SetSessionActive(active: boolean)
+	sessionActive = active
+	if not activeBall then
+		return
+	end
+	if active then
+		applySessionVisibility(activeBall, true)
+		BallControlService.Reset(activeBall)
+		resetBall(activeBall)
+	else
+		BallControlService.Reset(activeBall)
+		resetBall(activeBall)
+		applySessionVisibility(activeBall, false)
+	end
+end
+
+function BallService.IsSessionActive(): boolean
+	return sessionActive
+end
+
+function BallService.Reset()
+	if activeBall then
+		BallControlService.Reset(activeBall)
+		resetBall(activeBall)
+	end
+end
+
+function BallService.GetBallSampledEvent(): BindableEvent
+	return ballSampledEvent
 end
 
 return BallService

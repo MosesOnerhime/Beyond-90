@@ -8,6 +8,7 @@ local AnimationConfig = require(Shared.Config.AnimationConfig)
 local BallConfig = require(Shared.Config.BallConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local PlayerConfig = require(Shared.Config.PlayerConfig)
+local GroundProbe = require(Shared.World.GroundProbe)
 
 local Controllers = script.Parent
 local ControlledBallController = require(Controllers:WaitForChild("ControlledBallController"))
@@ -20,12 +21,12 @@ local localPlayer = Players.LocalPlayer
 local idleConfig = AnimationConfig.Locomotion.Idle
 local jogConfig = AnimationConfig.Locomotion.Jog
 local sprintConfig = AnimationConfig.Locomotion.Sprint
-local directionChangeConfig = AnimationConfig.Locomotion.DirectionChange
 local blendConfig = AnimationConfig.Blend
 local jumpConfig = AnimationConfig.Jump
 local passConfig = AnimationConfig.Pass
 local shootConfig = AnimationConfig.Shoot
 local receptionConfig = AnimationConfig.Reception
+local stopTrapConfig = AnimationConfig.StopTrap
 local groundingConfig = PlayerConfig.Appearance.Grounding or {}
 local assets = AnimationConfig.Assets
 
@@ -48,8 +49,6 @@ local currentPlaybackRate = 0
 local currentBasePlaybackRate = 0
 local jogPlaybackMultiplier = jogConfig.JogPlaybackMultiplier
 local sprintActive = false
-local previousDesiredDirection: Vector3? = nil
-local lastDirectionChangeAt = -math.huge
 local activeAction = ""
 local activeActionUntil = 0
 local activeActionExitAt = 0
@@ -58,12 +57,16 @@ local desiredBaseState = "Idle"
 local locomotionVisualActive = false
 local jumpWasAirborne = false
 local lastObservedControlEpoch: number? = nil
-local directionChangeAudit = nil
 local warnedHighPlayback = false
 local jogWeights = {}
 local sprintWeights = {}
 local groundingSamples = {}
 local previousFootSample = nil
+local airborneCandidateAt = 0
+local stopTrapArmed = false
+local stopTrapPlayed = false
+local sprintTurnCandidate = "Forward"
+local sprintTurnCandidateAt = 0
 local diagnostics = {
 	State = "Default",
 	BaseState = "Default",
@@ -104,15 +107,6 @@ end
 
 local function getHorizontal(vector: Vector3): Vector3
 	return Vector3.new(vector.X, 0, vector.Z)
-end
-
-local function getYaw(cframe: CFrame): number
-	local look = cframe.LookVector
-	return math.deg(math.atan2(-look.X, -look.Z))
-end
-
-local function getWrappedAngleDelta(fromAngle: number, toAngle: number): number
-	return (toAngle - fromAngle + 180) % 360 - 180
 end
 
 local function getFootball(): BasePart?
@@ -168,7 +162,7 @@ local function getFootBottomY(character: Model, footName: string): number?
 	if not foot or not foot:IsA("BasePart") then
 		return nil
 	end
-	return foot.Position.Y - foot.Size.Y / 2
+	return foot.Position.Y - foot.Size.Y / 2 + (groundingConfig.VisualSoleOffsetStuds or 0)
 end
 
 local function chooseContactClearance(left: number?, right: number?, leftVelocityY: number, rightVelocityY: number): number?
@@ -412,17 +406,55 @@ end
 
 local function isAirborne(humanoid: Humanoid): boolean
 	local state = humanoid:GetState()
-	return state == Enum.HumanoidStateType.Freefall
-		or state == Enum.HumanoidStateType.FallingDown
-		or state == Enum.HumanoidStateType.Jumping
+	if state == Enum.HumanoidStateType.Jumping then
+		local intentionalJump = localPlayer:GetAttribute("Beyond90JumpAssistActive") == true
+		local upwardVelocity = currentRootPart and currentRootPart.AssemblyLinearVelocity.Y or 0
+		if intentionalJump or upwardVelocity > 2 then
+			airborneCandidateAt = 0
+			return true
+		end
+	elseif state == Enum.HumanoidStateType.FallingDown
 		or state == Enum.HumanoidStateType.Ragdoll
 		or state == Enum.HumanoidStateType.Swimming
 		or state == Enum.HumanoidStateType.Climbing
+	then
+		airborneCandidateAt = 0
+		return true
+	end
+
+	if state ~= Enum.HumanoidStateType.Freefall or humanoid.FloorMaterial ~= Enum.Material.Air then
+		airborneCandidateAt = 0
+		return false
+	end
+
+	local config = AnimationConfig.AirbornePresentation or {}
+	local rootPart = currentRootPart
+	if rootPart then
+		local ground = GroundProbe.Raycast(rootPart.Position, 8, { currentCharacter :: Instance })
+		local nearGround = ground and ground.Distance <= (humanoid.HipHeight + rootPart.Size.Y / 2 + 0.75)
+		local fallingMeaningfully = rootPart.AssemblyLinearVelocity.Y <= -(config.MinimumFallSpeed or 2.25)
+		local clearlyAboveGround = ground == nil
+			or ground.Distance > (humanoid.HipHeight + rootPart.Size.Y / 2 + (config.ClearGroundDistancePadding or 1.5))
+		if nearGround or (not fallingMeaningfully and not clearlyAboveGround) then
+			airborneCandidateAt = 0
+			return false
+		end
+	end
+	if airborneCandidateAt <= 0 then
+		airborneCandidateAt = os.clock()
+	end
+	return os.clock() - airborneCandidateAt >= (config.EnterDelay or 0.12)
 end
 
 local function isJumpAirborne(humanoid: Humanoid): boolean
 	local state = humanoid:GetState()
-	return state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall
+	if state == Enum.HumanoidStateType.Jumping then
+		return localPlayer:GetAttribute("Beyond90JumpAssistActive") == true
+			or (currentRootPart ~= nil and currentRootPart.AssemblyLinearVelocity.Y > 2)
+	elseif state == Enum.HumanoidStateType.Freefall then
+		return activeAction == "Jump" or isAirborne(humanoid)
+	end
+	return false
 end
 
 local function getLocalMovement(rootPart: BasePart, horizontalVelocity: Vector3): (number, number, number)
@@ -506,7 +538,7 @@ local function updateSprintActive(speed: number, requested: boolean, rawMagnitud
 	local wasActive = sprintActive
 	local hasIntent = rawMagnitude > sprintConfig.IntentThreshold
 
-	if requested and hasIntent then
+	if requested and (hasIntent or (sprintActive and speed > jogConfig.JogExitSpeed)) then
 		sprintActive = true
 	elseif sprintActive and not requested and speed > sprintConfig.ExitSpeed then
 		-- Preserve the sprint presentation while physical sprint momentum decays.
@@ -540,10 +572,29 @@ local function getSignedTurn(locomotionState): (number, string)
 	return angle, side
 end
 
-local function playSprint(speed: number, locomotionState, deltaTime: number): (string, number)
+local function playSprint(speed: number, locomotionState, deltaTime: number, forceForward: boolean?): (string, number)
 	stopTrack("Idle", blendConfig.IdleToLocomotion)
 	stopFamily("Jog", blendConfig.JogToSprint)
 	local turnAngle, proposedTurn = getSignedTurn(locomotionState)
+	if forceForward or speed < (sprintConfig.TurnMinimumSpeed or 0) then
+		turnAngle = 0
+		proposedTurn = "Forward"
+		currentSprintTurn = "Forward"
+		sprintTurnCandidate = "Forward"
+		sprintTurnCandidateAt = 0
+	elseif proposedTurn ~= "Forward" and turnAngle >= sprintConfig.TurnEnterAngle then
+		if sprintTurnCandidate ~= proposedTurn then
+			sprintTurnCandidate = proposedTurn
+			sprintTurnCandidateAt = os.clock()
+		end
+		if os.clock() - sprintTurnCandidateAt < (sprintConfig.TurnSustainTime or 0) then
+			proposedTurn = "Forward"
+			turnAngle = 0
+		end
+	else
+		sprintTurnCandidate = "Forward"
+		sprintTurnCandidateAt = 0
+	end
 	if currentSprintTurn == "Forward" then
 		if turnAngle >= sprintConfig.TurnEnterAngle then
 			currentSprintTurn = proposedTurn
@@ -579,14 +630,16 @@ local function playSprint(speed: number, locomotionState, deltaTime: number): (s
 end
 
 local function getActionConfig(slot: string)
-	if slot == "DirectionChange180" then
-		return directionChangeConfig
-	elseif slot == "ReceivePass" then
+	if slot == "ReceivePass" then
 		return receptionConfig
 	elseif slot == "Pass" then
 		return passConfig
 	elseif slot == "Jump" then
 		return jumpConfig
+	elseif slot == "StopTrapPlaceholder" then
+		return stopTrapConfig
+	elseif slot == "Shoot" then
+		return shootConfig
 	end
 
 	return nil
@@ -604,9 +657,6 @@ local function startAction(slot: string)
 	if activeAction ~= "" and activeAction ~= slot then
 		local previousConfig = getActionConfig(activeAction)
 		stopTrack(activeAction, if previousConfig then previousConfig.FadeOutTime else blendConfig.ActionExit)
-		if activeAction == "DirectionChange180" then
-			directionChangeAudit = nil
-		end
 	end
 
 	local playbackRate = config.PlaybackRate or 1
@@ -621,40 +671,7 @@ local function startAction(slot: string)
 	activeActionExitAt = math.max(os.clock(), activeActionUntil - exitBlend)
 	activeActionExitStarted = false
 
-	if slot == "DirectionChange180" and directionChangeConfig.RootAuditEnabled and currentRootPart then
-		local rootJoint = currentRootPart:FindFirstChild("RootJoint")
-		directionChangeAudit = {
-			EntryFamily = currentLocomotionFamily,
-			RootYaw = getYaw(currentRootPart.CFrame),
-			RootJoint = if rootJoint and rootJoint:IsA("Motor6D") then rootJoint else nil,
-			MotorYaw = if rootJoint and rootJoint:IsA("Motor6D") then getYaw(rootJoint.Transform) else 0,
-			MaxRootYawDelta = 0,
-			MaxAnimationYawDelta = 0,
-		}
-	end
-
 	log(string.format("Action -> %s length=%.2f", slot, track.Length))
-end
-
-local function sampleDirectionChangeAudit()
-	local audit = directionChangeAudit
-	local rootPart = currentRootPart
-
-	if activeAction ~= "DirectionChange180" or not audit or not rootPart then
-		return
-	end
-
-	audit.MaxRootYawDelta = math.max(
-		audit.MaxRootYawDelta,
-		math.abs(getWrappedAngleDelta(audit.RootYaw, getYaw(rootPart.CFrame)))
-	)
-	local rootJoint = audit.RootJoint
-	if rootJoint and rootJoint.Parent then
-		audit.MaxAnimationYawDelta = math.max(
-			audit.MaxAnimationYawDelta,
-			math.abs(getWrappedAngleDelta(audit.MotorYaw, getYaw(rootJoint.Transform)))
-		)
-	end
 end
 
 local function beginActionExit(reason: string, fadeOverride: number?, speed: number?, sprintRequested: boolean?)
@@ -671,17 +688,6 @@ local function beginActionExit(reason: string, fadeOverride: number?, speed: num
 
 	if track and track.IsPlaying then
 		track:AdjustWeight(0, fadeTime)
-	end
-
-	if activeAction == "DirectionChange180" and directionChangeAudit then
-		log(string.format(
-			"[Turn180] entryFamily=%s rootYawDelta=%.1f animationRootYawDelta=%.1f exitFamily=%s fade=%.2f",
-			directionChangeAudit.EntryFamily,
-			directionChangeAudit.MaxRootYawDelta,
-			directionChangeAudit.MaxAnimationYawDelta,
-			desiredBaseState,
-			fadeTime
-		))
 	end
 
 	log(string.format(
@@ -730,14 +736,19 @@ local function onFootballActionPresentation(payload)
 
 	local actionType = payload.ActionType
 
-	if typeof(actionType) ~= "string" or passConfig.ActionTypes[actionType] ~= true then
+	if typeof(actionType) ~= "string" then
+		return
+	end
+	local slot = if actionType == "Shoot" then "Shoot" elseif passConfig.ActionTypes[actionType] == true then "Pass" else nil
+	if not slot then
 		return
 	end
 
 	if payload.Stage == "Predicted" then
-		startAction("Pass")
-	elseif payload.Stage == "Rejected" and activeAction == "Pass" then
-		beginActionExit("rejected", passConfig.FadeOutTime)
+		startAction(slot)
+	elseif payload.Stage == "Rejected" and activeAction == slot then
+		local config = getActionConfig(slot)
+		beginActionExit("rejected", config and config.FadeOutTime or blendConfig.ActionExit)
 	end
 end
 
@@ -753,25 +764,41 @@ local function updateJumpAction(humanoid: Humanoid, speed: number, sprintRequest
 	jumpWasAirborne = airborne
 end
 
-local function maybeTriggerDirectionChange(locomotionState, speed: number)
-	local desired = locomotionState.RawDirection
-
-	if not directionChangeConfig.Enabled or desired.Magnitude <= 0.05 then
+local function updateStopTrapAction(locomotionState, speed: number, hasBall: boolean, ball: BasePart?)
+	if not stopTrapConfig.Enabled then
 		return
 	end
 
-	if activeAction ~= "" then
-		previousDesiredDirection = desired.Unit
-		return
-	end
-	if previousDesiredDirection and speed >= directionChangeConfig.MinimumSpeed and os.clock() - lastDirectionChangeAt >= directionChangeConfig.Cooldown then
-		local angle = math.deg(math.acos(math.clamp(previousDesiredDirection:Dot(desired.Unit), -1, 1)))
-		if angle >= directionChangeConfig.TriggerAngle then
-			lastDirectionChangeAt = os.clock()
-			startAction("DirectionChange180")
+	local inputMagnitude = locomotionState.InputMagnitude or locomotionState.RawMagnitude or 0
+	if activeAction == "StopTrapPlaceholder" then
+		if inputMagnitude > jogConfig.MovementIntentThreshold or not hasBall then
+			beginActionExit("cancelled-by-movement", stopTrapConfig.FadeOutTime, speed, locomotionState.IsSprinting)
 		end
+		return
 	end
-	previousDesiredDirection = desired.Unit
+
+	if not hasBall or inputMagnitude > jogConfig.MovementIntentThreshold then
+		stopTrapArmed = false
+		stopTrapPlayed = false
+		return
+	end
+
+	if speed > stopTrapConfig.TriggerSpeed then
+		stopTrapArmed = true
+		return
+	end
+
+	local lead = if ball then math.abs(ball:GetAttribute("ClientBallLead") or math.huge) else math.huge
+	if stopTrapArmed
+		and not stopTrapPlayed
+		and activeAction == ""
+		and lead <= stopTrapConfig.MaximumBallLead
+	then
+		stopTrapPlayed = true
+		stopTrapArmed = false
+		startAction("StopTrapPlaceholder")
+		log(string.format("StopTrapPlaceholder lead=%.2f speed=%.2f", lead, speed))
+	end
 end
 
 local function updateActionLifecycle(speed: number, sprintRequested: boolean): boolean
@@ -805,7 +832,6 @@ local function updateActionLifecycle(speed: number, sprintRequested: boolean): b
 	activeActionUntil = 0
 	activeActionExitAt = 0
 	activeActionExitStarted = false
-	directionChangeAudit = nil
 	return false
 end
 
@@ -882,10 +908,10 @@ end
 
 local function updateLocomotionVisualActive(rawMagnitude: number, speed: number): boolean
 	if locomotionVisualActive then
-		if rawMagnitude <= jogConfig.MovementIntentThreshold and speed <= jogConfig.JogExitSpeed then
+		if rawMagnitude <= jogConfig.MovementIntentThreshold and speed <= (jogConfig.VisualExitSpeed or jogConfig.JogExitSpeed) then
 			locomotionVisualActive = false
 		end
-	elseif rawMagnitude > jogConfig.MovementIntentThreshold or speed >= jogConfig.JogEnterSpeed then
+	elseif rawMagnitude > jogConfig.MovementIntentThreshold then
 		locomotionVisualActive = true
 	end
 
@@ -903,10 +929,9 @@ local function resolveBaseLocomotion(
 	local sprintTurn = currentSprintTurn
 	local sprintTurnAngle = 0
 	local direction = currentDirection
-	local rawMagnitude = locomotionState.RawMagnitude or 0
+	local rawMagnitude = locomotionState.InputMagnitude or locomotionState.RawMagnitude or 0
 	local visualMovement = updateLocomotionVisualActive(rawMagnitude, speed)
 	local unsupportedAirborne = isAirborne(humanoid) and activeAction ~= "Jump"
-
 	if unsupportedAirborne then
 		stopLocomotion(blendConfig.JumpEnter)
 		currentLocomotionFamily = "AirborneFallback"
@@ -965,11 +990,8 @@ local function updateAnimation(deltaTime: number)
 	local ball = getFootball()
 	updateReceptionAction(ball)
 	updateJumpAction(humanoid, speed, sprintRequested)
-	updateSprintActive(speed, sprintRequested, locomotionState.RawMagnitude or 0)
-
-	if not isAirborne(humanoid) then
-		maybeTriggerDirectionChange(locomotionState, speed)
-	end
+	updateSprintActive(speed, sprintRequested, locomotionState.InputMagnitude or locomotionState.RawMagnitude or 0)
+	updateStopTrapAction(locomotionState, speed, hasBall, ball)
 
 	local baseState, family, direction, sprintTurn, sprintTurnAngle = resolveBaseLocomotion(
 		humanoid,
@@ -980,7 +1002,6 @@ local function updateAnimation(deltaTime: number)
 		deltaTime
 	)
 	desiredBaseState = baseState
-	sampleDirectionChangeAudit()
 	local actionActive = updateActionLifecycle(speed, sprintRequested)
 	local displayState = if actionActive then activeAction else baseState
 
@@ -1015,7 +1036,8 @@ local function cleanupCharacter()
 	currentPlaybackRate = 0
 	currentBasePlaybackRate = 0
 	sprintActive = false
-	previousDesiredDirection = nil
+	sprintTurnCandidate = "Forward"
+	sprintTurnCandidateAt = 0
 	activeAction = ""
 	activeActionUntil = 0
 	activeActionExitAt = 0
@@ -1024,7 +1046,9 @@ local function cleanupCharacter()
 	locomotionVisualActive = false
 	jumpWasAirborne = false
 	lastObservedControlEpoch = nil
-	directionChangeAudit = nil
+	airborneCandidateAt = 0
+	stopTrapArmed = false
+	stopTrapPlayed = false
 	table.clear(jogWeights)
 	table.clear(sprintWeights)
 end
@@ -1052,11 +1076,18 @@ local function configureCharacter(character: Model)
 		loadTrack("Sprint" .. direction, animationId, "B90_LOC_OffBall_Sprint_" .. direction, sprintConfig.Priority, true)
 		sprintWeights[direction] = 0
 	end
-	loadTrack("DirectionChange180", assets.Actions.DirectionChange180, "B90_LOC_DirectionChange_180", directionChangeConfig.Priority, false)
 	loadTrack("ReceivePass", assets.Actions.ReceivePass, "B90_ACT_ReceivePass", receptionConfig.Priority, false)
+	loadTrack("StopTrapPlaceholder", assets.Actions.ReceivePass, "B90_ACT_StopTrapPlaceholder", stopTrapConfig.Priority, false)
 	loadTrack("Jump", assets.Locomotion.Jump, "B90_LOC_Jump", jumpConfig.Priority, false)
 	loadTrack("Pass", assets.Actions.Pass, "B90_ACT_Pass", passConfig.Priority, false)
 	loadTrack("Shoot", assets.Actions.Shoot, "B90_ACT_Shoot", shootConfig.Priority, false)
+	local shootRecord = activeTracks.Shoot
+	if shootRecord then
+		table.insert(characterConnections, shootRecord.Track:GetMarkerReachedSignal("BallContact"):Connect(function()
+			localPlayer:SetAttribute("Beyond90ShootBallContactMarkerObserved", true)
+			FootballActionController.NotifyAnimationMarker("Shoot", "BallContact")
+		end))
+	end
 	local ball = getFootball()
 	lastObservedControlEpoch = if ball then ball:GetAttribute("ControlEpoch") else nil
 	table.insert(characterConnections, character:GetAttributeChangedSignal("Beyond90HipHeight"):Connect(resetGroundingDiagnostics))
