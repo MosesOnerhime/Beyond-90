@@ -8,6 +8,7 @@ local BallControlMath = require(Shared.Football.BallControlMath)
 local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local ControlledBallController = require(script.Parent:WaitForChild("ControlledBallController"))
+local AudioController = require(script.Parent:WaitForChild("AudioController"))
 local InputController = require(script.Parent:WaitForChild("InputController"))
 local MovementController = require(script.Parent:WaitForChild("MovementController"))
 local PassTargetResolver = require(script.Parent:WaitForChild("PassTargetResolver"))
@@ -239,8 +240,25 @@ local function onFeedback(payload)
 			ActionType = payload.ActionType,
 		})
 	end
+	if payload.ActionType == "Shoot"
+		and payload.Stage == "Prepared"
+		and payload.Trajectory == "Clearance"
+		and typeof(payload.TargetPosition) == "Vector3"
+	then
+		local character = localPlayer.Character
+		local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+		if rootPart and rootPart:IsA("BasePart") then
+			local clearanceDirection = BallControlMath.GetHorizontal(payload.TargetPosition - rootPart.Position)
+			if clearanceDirection.Magnitude > 0.05 then
+				MovementController.FaceActionDirection(clearanceDirection, FootballActionConfig.Shoot.ContactFallbackTime)
+			end
+		end
+	end
 	if payload.ActionType == "Shoot" and payload.Stage == "Released" then
 		pendingShootActionId = ""
+		AudioController.PlayFootballKick("Shoot")
+	elseif payload.ActionType == "GroundPass" or payload.ActionType == "ThroughPass" or payload.ActionType == "LobPass" then
+		AudioController.PlayFootballKick(payload.ActionType)
 	end
 
 	if typeof(payload.TargetPosition) == "Vector3" then

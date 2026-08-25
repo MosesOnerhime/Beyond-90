@@ -18,11 +18,25 @@ local Theme = {
 	StrokeBright = Color3.fromRGB(118, 191, 255),
 	CornerRadius = UDim.new(0, 6),
 	Fonts = {
-		Display = Enum.Font.GothamBlack,
-		Navigation = Enum.Font.GothamBold,
+		Display = Enum.Font.GothamBold,
+		Heading = Enum.Font.GothamBold,
+		Subheading = Enum.Font.GothamSemibold,
+		Navigation = Enum.Font.GothamSemibold,
 		Statistics = Enum.Font.GothamSemibold,
+		HUDNumber = Enum.Font.GothamBold,
+		HUDLabel = Enum.Font.GothamMedium,
 		Body = Enum.Font.Gotham,
-		Caption = Enum.Font.GothamMedium,
+		Caption = Enum.Font.Gotham,
+	},
+	TextSizes = {
+		Display = 32,
+		Heading = 24,
+		Subheading = 18,
+		Navigation = 16,
+		Body = 14,
+		Caption = 11,
+		HUDNumber = 26,
+		HUDLabel = 14,
 	},
 }
 

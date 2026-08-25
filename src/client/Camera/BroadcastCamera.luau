@@ -8,6 +8,7 @@ local BallConfig = require(Shared.Config.BallConfig)
 local BallControlMath = require(Shared.Football.BallControlMath)
 local CameraConfig = require(Shared.Config.CameraConfig)
 local GameConfig = require(Shared.Config.GameConfig)
+local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
 
 local BroadcastCamera = {}
 
@@ -31,6 +32,7 @@ local fadedObstructionParts: { [BasePart]: number } = {}
 local broadcastSideFadeParts: { [BasePart]: number } = {}
 local broadcastSideFadeApplied = false
 local getPitchOffsets
+local joinIntroStartedAt: number? = nil
 
 local function getFootball(): BasePart?
 	local rootFolder = Workspace:FindFirstChild(GameConfig.WorkspaceContainerName)
@@ -273,7 +275,20 @@ local function getBoundedBallInfluence(rootPart: BasePart, ball: BasePart?): Vec
 	return BallControlMath.ClampMagnitude(influence, config.MaxBallInfluence)
 end
 
-local function getMovementLookAhead(rootPart: BasePart, pitchState): Vector3
+local function getAttackingGoalContext(pitchState)
+	local goalId = localPlayer:GetAttribute(FootballTeamConfig.AttackingGoalAttributeName)
+	local stadium = Workspace:FindFirstChild("StadiumDevelopment")
+	local goalBounds = stadium and stadium:FindFirstChild("GoalBounds")
+	local goal = goalBounds and typeof(goalId) == "string" and goalBounds:FindFirstChild(goalId .. "GoalBounds")
+	local goalPosition = if goal and goal:IsA("BasePart") then goal.Position else nil
+	if not goalPosition then
+		return pitchState.LengthAxis, nil, 0
+	end
+	local attackDirection = BallControlMath.SafeUnit(BallControlMath.GetHorizontal(goalPosition - pitchState.Center), pitchState.LengthAxis)
+	return attackDirection, goalPosition, 1
+end
+
+local function getMovementLookAhead(rootPart: BasePart, pitchState, attackingDirection: Vector3): Vector3
 	local horizontalVelocity = BallControlMath.GetHorizontal(rootPart.AssemblyLinearVelocity)
 	local speedAlpha = math.clamp(horizontalVelocity.Magnitude / math.max(config.LookAheadReferenceSpeed, 1), 0, 1)
 
@@ -283,8 +298,8 @@ local function getMovementLookAhead(rootPart: BasePart, pitchState): Vector3
 
 	speedAlpha = speedAlpha * speedAlpha * (3 - 2 * speedAlpha)
 	local direction = BallControlMath.SafeUnit(horizontalVelocity, pitchState.LengthAxis)
-	local attackBias = pitchState.LengthAxis
-		* math.max(0, direction:Dot(pitchState.LengthAxis))
+	local attackBias = attackingDirection
+		* math.max(0, direction:Dot(attackingDirection))
 		* config.AttackingLookAheadDistance
 		* speedAlpha
 
@@ -524,9 +539,24 @@ local function updateCamera(deltaTime: number)
 	local ball = getFootball()
 	local preset = getCurrentPreset()
 	local distanceScale = preset.DistanceScale or 1
+	local attackingDirection, attackingGoalPosition = getAttackingGoalContext(pitchState)
+	local attackingProgress = math.clamp(
+		BallControlMath.GetHorizontal(rootPart.Position - pitchState.Center):Dot(attackingDirection)
+			/ math.max(pitchState.Length / 2, 1),
+		-1,
+		1
+	)
+	local goalBiasAlpha = math.clamp(
+		(attackingProgress - (config.GoalBiasStartProgress or 0))
+			/ math.max((config.GoalBiasFullProgress or 0.82) - (config.GoalBiasStartProgress or 0), 0.01),
+		0,
+		1
+	)
+	goalBiasAlpha = goalBiasAlpha ^ (config.GoalBiasCurveExponent or 1)
 	local framingPoint = rootPart.Position
-		+ getMovementLookAhead(rootPart, pitchState)
+		+ getMovementLookAhead(rootPart, pitchState, attackingDirection)
 		+ getBoundedBallInfluence(rootPart, ball)
+		+ attackingDirection * (config.AttackingGoalTargetBias or 0) * goalBiasAlpha
 
 	framingPoint = clampTargetToPitch(framingPoint, pitchState, distanceScale)
 	local rawFramingPoint = framingPoint
@@ -545,6 +575,10 @@ local function updateCamera(deltaTime: number)
 	local rigPosition = cameraHorizontalPosition
 		+ Vector3.yAxis * (pitchState.GroundY + height - pitchState.Center.Y)
 	local focusTarget = Vector3.new(framingPoint.X, pitchState.GroundY + config.FocusHeight, framingPoint.Z)
+	if attackingGoalPosition and (config.AttackingGoalFocusBlend or 0) > 0 then
+		local goalFocus = Vector3.new(attackingGoalPosition.X, pitchState.GroundY + config.FocusHeight, attackingGoalPosition.Z)
+		focusTarget = focusTarget:Lerp(goalFocus, (config.AttackingGoalFocusBlend or 0) * goalBiasAlpha)
+	end
 	rigPosition = clampCameraToSafeCorridor(rigPosition, pitchState, distanceScale)
 	rigPosition = resolveObstruction(focusTarget, rigPosition, pitchState, distanceScale, ball)
 
@@ -561,26 +595,45 @@ local function updateCamera(deltaTime: number)
 		config.MinFOV,
 		config.MaxFOV
 	)
+	local joinIntro = config.JoinIntro
+	local joinIntroActive = false
+	if joinIntroStartedAt and joinIntro then
+		local progress = math.clamp((os.clock() - joinIntroStartedAt) / joinIntro.Duration, 0, 1)
+		local eased = progress * progress * progress * (progress * (progress * 6 - 15) + 10)
+		rigPosition += Vector3.yAxis * joinIntro.SkyHeight * (1 - eased)
+		targetFOV = joinIntro.StartFOV + (targetFOV - joinIntro.StartFOV) * eased
+		joinIntroActive = true
+		if progress >= 1 then joinIntroStartedAt = nil end
+	end
 
-	smoothedPosition, cameraVelocity = smoothLimitedVector(
-		smoothedPosition,
-		rigPosition,
-		cameraVelocity,
-		config.PositionResponsiveness,
-		config.PositionMaxAcceleration,
-		config.PositionMaxSpeed,
-		deltaTime
-	)
-	smoothedFocus, focusVelocity = smoothLimitedVector(
-		smoothedFocus,
-		focusTarget,
-		focusVelocity,
-		config.FocusResponsiveness,
-		config.FocusMaxAcceleration,
-		config.FocusMaxSpeed,
-		deltaTime
-	)
-	smoothedFOV += (targetFOV - smoothedFOV) * expAlpha(config.ZoomResponsiveness, deltaTime)
+	if joinIntroActive then
+		-- The reveal owns its path so it reaches the live rig with zero positional gap.
+		smoothedPosition = rigPosition
+		smoothedFocus = focusTarget
+		smoothedFOV = targetFOV
+		cameraVelocity = Vector3.zero
+		focusVelocity = Vector3.zero
+	else
+		smoothedPosition, cameraVelocity = smoothLimitedVector(
+			smoothedPosition,
+			rigPosition,
+			cameraVelocity,
+			config.PositionResponsiveness,
+			config.PositionMaxAcceleration,
+			config.PositionMaxSpeed,
+			deltaTime
+		)
+		smoothedFocus, focusVelocity = smoothLimitedVector(
+			smoothedFocus,
+			focusTarget,
+			focusVelocity,
+			config.FocusResponsiveness,
+			config.FocusMaxAcceleration,
+			config.FocusMaxSpeed,
+			deltaTime
+		)
+		smoothedFOV += (targetFOV - smoothedFOV) * expAlpha(config.ZoomResponsiveness, deltaTime)
+	end
 
 	local desiredForward = BallControlMath.SafeUnit((smoothedFocus :: Vector3) - (smoothedPosition :: Vector3), camera.CFrame.LookVector)
 	smoothedForward = smoothVector(smoothedForward, desiredForward, config.OrientationResponsiveness, deltaTime)
@@ -609,6 +662,7 @@ local function updateCamera(deltaTime: number)
 		localPlayer:SetAttribute("Beyond90CameraFollowDelaySeconds", config.FollowDelaySeconds)
 		localPlayer:SetAttribute("Beyond90CameraSafetyCatchup", safetyBlend > 0.01)
 		localPlayer:SetAttribute("Beyond90CameraSafetyCatchupBlend", safetyBlend)
+		localPlayer:SetAttribute("Beyond90CameraAttackingGoalBias", goalBiasAlpha)
 
 		local head = localPlayer.Character and localPlayer.Character:FindFirstChild("Head")
 		if head and head:IsA("BasePart") then
@@ -636,6 +690,16 @@ function BroadcastCamera.Enable()
 	focusVelocity = Vector3.zero
 	restoreSafeDefaultCamera()
 	renderConnection = RunService.RenderStepped:Connect(updateCamera)
+end
+
+function BroadcastCamera.PlayJoinIntro()
+	if active and profileName == "Broadcast1" and config.JoinIntro then
+		joinIntroStartedAt = os.clock()
+		smoothedPosition = nil
+		smoothedFocus = nil
+		smoothedForward = nil
+		smoothedFOV = config.JoinIntro.StartFOV
+	end
 end
 
 function BroadcastCamera.Disable()

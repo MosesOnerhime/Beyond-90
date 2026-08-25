@@ -28,7 +28,6 @@ local passAction: Instance? = nil
 local throughPassAction: Instance? = nil
 local knockOnAction: Instance? = nil
 local shootAction: Instance? = nil
-local sprintButtonGui: ScreenGui? = nil
 local connections: { RBXScriptConnection } = {}
 local pressedKeys: { [Enum.KeyCode]: boolean } = {}
 local actionStartedAt: { [string]: number } = {}
@@ -294,39 +293,6 @@ local function createInputFolder(): Folder
 	return folder
 end
 
-local function createSprintTouchButton(): TextButton?
-	if not UserInputService.TouchEnabled then
-		return nil
-	end
-
-	local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
-
-	if not playerGui then
-		return nil
-	end
-
-	local gui = Instance.new("ScreenGui")
-	gui.Name = "Beyond90InputGui"
-	gui.ResetOnSpawn = false
-	gui.IgnoreGuiInset = true
-	gui.Parent = playerGui
-	sprintButtonGui = gui
-
-	local button = Instance.new("TextButton")
-	button.Name = "SprintButton"
-	button.AnchorPoint = Vector2.new(1, 1)
-	button.Position = inputConfig.SprintTouchButtonPosition
-	button.Size = UDim2.fromOffset(92, 52)
-	button.BackgroundTransparency = 0.25
-	button.BackgroundColor3 = Color3.fromRGB(32, 32, 38)
-	button.Text = "Sprint"
-	button.TextColor3 = Color3.fromRGB(245, 245, 245)
-	button.TextScaled = true
-	button.Parent = gui
-
-	return button
-end
-
 local function addBinding(parent: Instance, name: string, properties: { [string]: any }): Instance?
 	local ok, binding = pcall(function()
 		return Instance.new("InputBinding")
@@ -442,14 +408,6 @@ local function setupInputActions(): boolean
 	addBinding(sprint, "GamepadRightTrigger", {
 		KeyCode = Enum.KeyCode.ButtonR2,
 	})
-
-	local sprintButton = createSprintTouchButton()
-
-	if sprintButton then
-		addBinding(sprint, "TouchButton", {
-			UIButton = sprintButton,
-		})
-	end
 
 	table.insert(connections, sprint.StateChanged:Connect(function(value)
 		if typeof(value) == "boolean" then
@@ -737,6 +695,43 @@ function InputController.GetInputState()
 	}
 end
 
+function InputController.SetTouchMoveVector(moveVector: Vector2)
+	if typeof(moveVector) ~= "Vector2" then
+		return
+	end
+	setMoveVector(moveVector, "TouchHUD")
+end
+
+function InputController.SetTouchSprint(requested: boolean)
+	if typeof(requested) ~= "boolean" then
+		return
+	end
+	setManualSprintRequested(requested, "TouchHUD")
+end
+
+function InputController.SetTouchFootballAction(actionType: string, pressed: boolean)
+	if typeof(actionType) ~= "string" or typeof(pressed) ~= "boolean" then
+		return
+	end
+	if actionType == "GroundPass" then
+		handlePassGesture(pressed)
+	elseif actionType == "ThroughPass" or actionType == "KnockOn" or actionType == "Shoot" then
+		handleBoolFootballAction(actionType, pressed)
+	end
+end
+
+function InputController.ReleaseTouchInputs()
+	setMoveVector(Vector2.zero, "TouchHUD")
+	setManualSprintRequested(false, "TouchHUD")
+	passCommitToken += 1
+	lastPassReleaseAt = -math.huge
+	passSecondTap = false
+	actionStartedAt.GroundPass = nil
+	actionStartedAt.ThroughPass = nil
+	actionStartedAt.KnockOn = nil
+	actionStartedAt.Shoot = nil
+end
+
 function InputController.GetCameraToggleEvent(): BindableEvent
 	return cameraToggleEvent
 end
@@ -828,11 +823,6 @@ function InputController.Destroy()
 	if inputContext then
 		inputContext:Destroy()
 		inputContext = nil
-	end
-
-	if sprintButtonGui then
-		sprintButtonGui:Destroy()
-		sprintButtonGui = nil
 	end
 
 	movementAction = nil

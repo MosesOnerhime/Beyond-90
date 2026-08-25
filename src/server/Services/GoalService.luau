@@ -3,6 +3,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local BallConfig = require(Shared.Config.BallConfig)
 local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local GameConfig = require(Shared.Config.GameConfig)
+local GameModeConfig = require(Shared.Config.GameModeConfig)
 local GoalConfig = require(Shared.Config.GoalConfig)
 local GoalGeometry = require(Shared.Football.GoalGeometry)
 local PitchService = require(script.Parent.PitchService)
@@ -17,6 +18,10 @@ local sampleConnection: RBXScriptConnection? = nil
 local goalScoredEvent = Instance.new("BindableEvent")
 local goalRemote: RemoteEvent? = nil
 local scoredLatch = {}
+local liveBallScored = false
+local scoreFolder: Folder? = nil
+local homeScore = 0
+local awayScore = 0
 
 local function log(message: string)
 	print(string.format("%s[Goal] %s", GameConfig.LogPrefix, message))
@@ -39,16 +44,24 @@ local function getOrCreateGoalRemote(): RemoteEvent
 	return remote
 end
 
+local function publishScore()
+	if scoreFolder then
+		scoreFolder:SetAttribute(GameModeConfig.HomeScoreAttributeName, homeScore)
+		scoreFolder:SetAttribute(GameModeConfig.AwayScoreAttributeName, awayScore)
+	end
+end
+
 local function inspectCrossing(goal, previous: Vector3, current: Vector3)
+	if liveBallScored then
+		return
+	end
+
 	local radius = BallConfig.Radius
 	local previousDistance = (previous - goal.LinePoint):Dot(goal.InwardDirection)
 	local currentDistance = (current - goal.LinePoint):Dot(goal.InwardDirection)
 	local crossingDistance = -radius
 
 	if scoredLatch[goal.Id] then
-		if currentDistance >= GoalConfig.DuplicateResetDistance then
-			scoredLatch[goal.Id] = nil
-		end
 		return
 	end
 	if previousDistance <= crossingDistance or currentDistance > crossingDistance then
@@ -71,12 +84,21 @@ local function inspectCrossing(goal, previous: Vector3, current: Vector3)
 	end
 
 	scoredLatch[goal.Id] = true
+	liveBallScored = true
+	if goal.Id == "Away" then
+		homeScore += 1
+	elseif goal.Id == "Home" then
+		awayScore += 1
+	end
+	publishScore()
 	local payload = {
 		GoalId = goal.Id,
 		EnteredGoal = goal.Id,
 		BallPosition = crossingPosition,
 		LastRelevantPlayerUserId = activeBall and (activeBall:GetAttribute("LastFootballActionPlayerUserId") or 0) or 0,
 		Timestamp = os.clock(),
+		HomeScore = homeScore,
+		AwayScore = awayScore,
 	}
 	log(string.format(
 		"goal=%s ballPosition=%s lineCross=true insideWidth=%s insideHeight=%s scorer=%s",
@@ -98,6 +120,13 @@ function GoalService.Initialize(ball: BasePart, ballSampledEvent: BindableEvent?
 	end
 	initialized = true
 	activeBall = ball
+	scoreFolder = ReplicatedStorage:FindFirstChild(GameModeConfig.ScoreFolderName) :: Folder?
+	if not scoreFolder then
+		scoreFolder = Instance.new("Folder")
+		scoreFolder.Name = GameModeConfig.ScoreFolderName
+		scoreFolder.Parent = ReplicatedStorage
+	end
+	publishScore()
 	goalRemote = getOrCreateGoalRemote()
 	local reason
 	goals, reason = GoalGeometry.ResolveAll(PitchService.GetState())
@@ -128,6 +157,7 @@ function GoalService.Initialize(ball: BasePart, ballSampledEvent: BindableEvent?
 		if isReset then
 			previousPosition = current
 			table.clear(scoredLatch)
+			liveBallScored = false
 			return
 		end
 		if previousPosition then
@@ -146,6 +176,12 @@ end
 
 function GoalService.GetGoalScoredEvent(): BindableEvent
 	return goalScoredEvent
+end
+
+function GoalService.ResetScore()
+	homeScore = 0
+	awayScore = 0
+	publishScore()
 end
 
 return GoalService

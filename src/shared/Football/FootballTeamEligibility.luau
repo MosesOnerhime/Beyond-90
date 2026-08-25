@@ -1,9 +1,12 @@
 local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local FootballTeamConfig = require(ReplicatedStorage.Shared.Config.FootballTeamConfig)
 
 local FootballTeamEligibility = {}
 
 local TEAM_ATTRIBUTE_NAMES = {
-	"Beyond90FootballTeamId",
+	FootballTeamConfig.AttributeName,
 	"Beyond90TeamId",
 }
 

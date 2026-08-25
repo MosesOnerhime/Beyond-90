@@ -55,6 +55,7 @@ function GroundProbe.BuildExclusions(extra: { Instance }?): { Instance }
 	addUnique(exclusions, seen, ballFolder and ballFolder:FindFirstChild(BallConfig.Name))
 	local stadium = Workspace:FindFirstChild("StadiumDevelopment")
 	addUnique(exclusions, seen, stadium and stadium:FindFirstChild("GoalBounds"))
+	addUnique(exclusions, seen, Workspace:FindFirstChild("Backup StarterCharacter"))
 	for _, child in Workspace:GetChildren() do
 		if child:GetAttribute("Beyond90IgnoreGroundProbe") == true
 			or child.Name == "Beyond90LocalPlayerIndicator"

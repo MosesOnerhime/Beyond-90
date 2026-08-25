@@ -10,6 +10,10 @@
         "$path": "src/shared"
       },
 
+      "Packages": {
+        "$path": "Packages"
+      },
+
       "Assets": {
         "$path": "assets/football"
       }

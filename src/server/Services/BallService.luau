@@ -7,6 +7,8 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local BallConfig = require(Shared.Config.BallConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local PitchConfig = require(Shared.Config.PitchConfig)
+local WorldScaleConfig = require(Shared.Config.WorldScaleConfig)
+local FreeBallPhysics = require(Shared.Football.FreeBallPhysics)
 local BallControlService = require(script.Parent.BallControlService)
 local PitchService = require(script.Parent.PitchService)
 
@@ -22,6 +24,8 @@ local warnedMissingFootballVisual = false
 local loggedFootballVisualLoaded = false
 local loggedBallScale = false
 local sessionActive = false
+local previousBallVelocity = Vector3.zero
+local lastBounceAt = -math.huge
 
 local function applySessionVisibility(ball: BasePart, active: boolean)
 	ball.Anchored = not active
@@ -302,12 +306,23 @@ local function getBallSpawnPosition(): Vector3
 	return Vector3.new(PitchConfig.BallCenterPosition.X, BallConfig.SpawnHeight, PitchConfig.BallCenterPosition.Z)
 end
 
-local function resetBall(ball: BasePart)
+local function resetBall(ball: BasePart, keepAnchored: boolean?)
 	BallControlService.Reset(ball)
+	-- Network ownership cannot be changed while the session-hidden ball is anchored.
+	-- Temporarily unanchor it, reset authoritatively, then restore the requested state.
+	ball.Anchored = false
 	ball.AssemblyLinearVelocity = Vector3.zero
 	ball.AssemblyAngularVelocity = Vector3.zero
 	ball.CFrame = CFrame.new(getBallSpawnPosition())
+	ball:SetAttribute("FootballFlightComplete", true)
+	ball:SetAttribute("FootballGrounded", true)
+	ball:SetAttribute("FootballBounceCount", 0)
+	ball:SetAttribute("LastFootballBounceImpactSpeed", 0)
+	ball:SetAttribute("LastFootballBounceReboundSpeed", 0)
+	previousBallVelocity = Vector3.zero
+	lastBounceAt = -math.huge
 	ball:SetNetworkOwner(nil)
+	ball.Anchored = keepAnchored == true
 	ballSampledEvent:Fire(ball, ball.Position, true)
 end
 
@@ -462,7 +477,153 @@ local function validateBallState(ball: BasePart): boolean
 	return true
 end
 
-local function updateBallInteractions(ball: Part, deltaTime: number, allowFreeTouch: boolean)
+local function applyFootballFlightGravity(ball: BasePart, deltaTime: number)
+	local flightConfig = BallConfig.Flight
+	if not flightConfig or flightConfig.Enabled ~= true then
+		return
+	end
+	if ball:GetAttribute("FootballFlightComplete") == true then
+		return
+	end
+
+	local actionName = ball:GetAttribute("LastFootballAction")
+	if typeof(actionName) ~= "string" or flightConfig.Actions[actionName] ~= true then
+		return
+	end
+	local actionTime = ball:GetAttribute("LastFootballActionTime")
+	if typeof(actionTime) ~= "number" or os.clock() - actionTime > flightConfig.MaximumActionDuration then
+		return
+	end
+
+	local pitchState = PitchService.GetState()
+	local groundY = if pitchState then pitchState.GroundY else 0
+	local restingCenterY = groundY + BallConfig.Radius
+	if ball.Position.Y <= restingCenterY + flightConfig.ActivationHeight
+		and ball.AssemblyLinearVelocity.Y <= 0
+	then
+		return
+	end
+
+	local bounceCount = ball:GetAttribute("FootballBounceCount")
+	local effectiveGravity = flightConfig.EffectiveGravity
+	if typeof(bounceCount) == "number" and bounceCount > 0 then
+		effectiveGravity = BallConfig.Bounce.AirborneGravity
+	end
+	local gravityCompensation = Workspace.Gravity - effectiveGravity
+	if gravityCompensation > 0 then
+		ball.AssemblyLinearVelocity += Vector3.yAxis * gravityCompensation * math.max(deltaTime, 0)
+	end
+end
+
+local function probeGround(ball: BasePart, maximumSeparation: number)
+	local bounceConfig = BallConfig.Bounce
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = { ball }
+	raycastParams.RespectCanCollide = true
+	local probeDistance = BallConfig.Radius + maximumSeparation + 0.02
+	local surface = Workspace:Raycast(ball.Position, -Vector3.yAxis * probeDistance, raycastParams)
+	if not surface or surface.Normal:Dot(Vector3.yAxis) < bounceConfig.SurfaceNormalMinUpDot then
+		return nil
+	end
+
+	local separation = (ball.Position - surface.Position):Dot(surface.Normal) - BallConfig.Radius
+	if separation > maximumSeparation then
+		return nil
+	end
+
+	return {
+		Result = surface,
+		Normal = surface.Normal,
+		Separation = separation,
+	}
+end
+
+local function getGroundContact(ball: BasePart)
+	return probeGround(ball, BallConfig.Bounce.ContactTolerance)
+end
+
+local function applyFootballBounce(ball: BasePart, previousVelocity: Vector3, contact)
+	local bounceConfig = BallConfig.Bounce
+	if not bounceConfig or bounceConfig.Enabled ~= true then
+		return false
+	end
+	local now = os.clock()
+	local impactSpeed = -previousVelocity:Dot(contact.Normal)
+	if now - lastBounceAt < bounceConfig.Cooldown or impactSpeed < bounceConfig.MinimumImpactSpeed then
+		return false
+	end
+
+	local response = FreeBallPhysics.ComputeBounce(
+		previousVelocity,
+		ball.AssemblyAngularVelocity,
+		contact.Normal,
+		BallConfig.Radius,
+		bounceConfig
+	)
+	if contact.Separation < 0 then
+		ball.CFrame += contact.Normal * (-contact.Separation + 0.01)
+	end
+	ball.AssemblyLinearVelocity = response.Velocity
+	ball.AssemblyAngularVelocity = response.AngularVelocity
+	ball:SetAttribute("FootballFlightComplete", response.ReboundSpeed == 0)
+	ball:SetAttribute("FootballGrounded", response.ReboundSpeed == 0)
+	ball:SetAttribute("LastFootballBounceImpactSpeed", response.ImpactSpeed)
+	ball:SetAttribute("LastFootballBounceReboundSpeed", response.ReboundSpeed)
+	ball:SetAttribute("FootballBounceCount", (ball:GetAttribute("FootballBounceCount") or 0) + 1)
+	lastBounceAt = now
+
+	if bounceConfig.DiagnosticEnabled == true then
+		print(string.format(
+			"%s[Ball] [Bounce] count=%d impact=%.2fm/s rebound=%.2fm/s tangent=%.2f->%.2fm/s impactFriction=%.2f",
+			GameConfig.LogPrefix,
+			ball:GetAttribute("FootballBounceCount"),
+			WorldScaleConfig.StudsToMeters(response.ImpactSpeed),
+			WorldScaleConfig.StudsToMeters(response.ReboundSpeed),
+			WorldScaleConfig.StudsToMeters(response.IncomingTangentSpeed),
+			WorldScaleConfig.StudsToMeters(response.OutgoingTangentSpeed),
+			response.ImpactFactor
+		))
+	end
+
+	return true
+end
+
+local function applyFootballGroundResponse(ball: BasePart, contact, deltaTime: number)
+	local groundConfig = BallConfig.Ground
+	if not groundConfig or groundConfig.Enabled ~= true then
+		return
+	end
+	if ball.AssemblyLinearVelocity:Dot(contact.Normal) > groundConfig.MaximumUpwardContactSpeed then
+		ball:SetAttribute("FootballGrounded", false)
+		return
+	end
+
+	local grassDepth = math.max(groundConfig.GrassDepth, 1e-5)
+	local grassInfluence = math.clamp(1 - math.max(0, contact.Separation) / grassDepth, 0, 1) ^ 0.7
+	if grassInfluence <= 0 then
+		ball:SetAttribute("FootballGrounded", false)
+		return
+	end
+	local response = FreeBallPhysics.StepGround(
+		ball.AssemblyLinearVelocity,
+		ball.AssemblyAngularVelocity,
+		contact.Normal,
+		BallConfig.Radius,
+		grassInfluence,
+		deltaTime,
+		WorldScaleConfig.MetersPerStud,
+		groundConfig
+	)
+	ball.AssemblyLinearVelocity = response.Velocity
+	ball.AssemblyAngularVelocity = response.AngularVelocity
+	ball:SetAttribute("FootballGrounded", true)
+	if response.Stopped then
+		ball:SetAttribute("FootballFlightComplete", true)
+	end
+end
+
+local function updateBallInteractions(ball: Part, deltaTime: number, allowFreeTouch: boolean, priorVelocity: Vector3)
 	if not validateBallState(ball) then
 		return
 	end
@@ -473,6 +634,26 @@ local function updateBallInteractions(ball: Part, deltaTime: number, allowFreeTo
 		clampBallSpeed(ball)
 		return
 	end
+
+	local groundContact = getGroundContact(ball)
+	local bounced = false
+	local alreadyGrounded = ball:GetAttribute("FootballGrounded") == true
+	if groundContact and not alreadyGrounded then
+		bounced = applyFootballBounce(ball, priorVelocity, groundContact)
+	end
+	if groundContact and not bounced then
+		applyFootballGroundResponse(ball, groundContact, deltaTime)
+	elseif not groundContact then
+		local groundConfig = BallConfig.Ground
+		local wasGrounded = ball:GetAttribute("FootballGrounded") == true
+		local leftGround = not wasGrounded
+			or ball.AssemblyLinearVelocity.Y > groundConfig.GroundedReleaseUpwardSpeed
+			or probeGround(ball, groundConfig.GroundedReleaseDistance) == nil
+		if leftGround then
+			ball:SetAttribute("FootballGrounded", false)
+		end
+	end
+	applyFootballFlightGravity(ball, deltaTime)
 
 	if allowFreeTouch and BallConfig.BasicTouch.Enabled == true then
 		for _, player in Players:GetPlayers() do
@@ -509,7 +690,8 @@ local function startInteractionLoop()
 			accumulatedTime = 0
 		end
 
-		updateBallInteractions(activeBall, deltaTime, allowFreeTouch)
+		updateBallInteractions(activeBall, deltaTime, allowFreeTouch, previousBallVelocity)
+		previousBallVelocity = activeBall.AssemblyLinearVelocity
 	end)
 end
 
@@ -554,6 +736,7 @@ function BallService.Initialize()
 		))
 	end
 	activeBall = ball
+	previousBallVelocity = ball.AssemblyLinearVelocity
 	BallControlService.Initialize(ball)
 	applySessionVisibility(ball, false)
 	startInteractionLoop()
@@ -569,10 +752,10 @@ function BallService.SetSessionActive(active: boolean)
 	if active then
 		applySessionVisibility(activeBall, true)
 		BallControlService.Reset(activeBall)
-		resetBall(activeBall)
+		resetBall(activeBall, false)
 	else
 		BallControlService.Reset(activeBall)
-		resetBall(activeBall)
+		resetBall(activeBall, true)
 		applySessionVisibility(activeBall, false)
 	end
 end

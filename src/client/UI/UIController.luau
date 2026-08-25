@@ -2,72 +2,32 @@ local ContentProvider = game:GetService("ContentProvider")
 local GuiService = game:GetService("GuiService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-local TweenService = game:GetService("TweenService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
+local ReactPackages = require(Shared.ReactPackages)
+local React = ReactPackages.React
+local ReactRoblox = ReactPackages.ReactRoblox
 local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local GoalConfig = require(Shared.Config.GoalConfig)
 local UIAssetConfig = require(Shared.Config.UIAssetConfig)
-local HomeScreen = require(script.Parent.Screens.HomeScreen)
-local TrainingScreen = require(script.Parent.Screens.TrainingScreen)
-local LoadingScreen = require(script.Parent.Screens.LoadingScreen)
 local GameplayHUD = require(script.Parent.Screens.GameplayHUD)
 local GoalNotification = require(script.Parent.Screens.GoalNotification)
+local HomeScreen = require(script.Parent.Screens.HomeScreen)
+local LoadingScreen = require(script.Parent.Screens.LoadingScreen)
+local TrainingScreen = require(script.Parent.Screens.TrainingScreen)
+local TeamSelectionScreen = require(script.Parent.Screens.TeamSelectionScreen)
+local SettingsScreen = require(script.Parent.Screens.SettingsScreen)
 local Theme = require(script.Parent.Theme)
+local ReactUI = require(script.Parent.Components.ReactUI)
 
 local UIController = {}
 local localPlayer = Players.LocalPlayer
-local screenGui: ScreenGui? = nil
-local canvas: Frame? = nil
-local canvasScale: UIScale? = nil
-local homeView
-local modeView
-local loadingView
-local gameplayView
-local toast: TextLabel? = nil
-local rootBackdrop: Frame? = nil
-local scaleConnection: RBXScriptConnection? = nil
-
-local function setSelected(object: GuiObject?)
-	if GuiService.AutoSelectGuiEnabled and object and object.Visible then
-		GuiService.SelectedObject = object
-	end
-end
-
-local function updateScale()
-	if not canvasScale then return end
-	local camera = workspace.CurrentCamera
-	local viewport = if camera then camera.ViewportSize else Vector2.new(1600, 900)
-	canvasScale.Scale = math.max(0.35, math.min(viewport.X / 1600, viewport.Y / 900))
-end
-
-local function setScreen(name: string)
-	if not homeView then return end
-	homeView.Frame.Visible = name == "Home"
-	modeView.Frame.Visible = name == "Modes"
-	loadingView.Frame.Visible = name == "Loading"
-	gameplayView.Frame.Visible = name == "Gameplay"
-	if rootBackdrop then rootBackdrop.Visible = name ~= "Gameplay" end
-	if name == "Home" then
-		setSelected(homeView.DefaultSelection)
-	elseif name == "Modes" then
-		setSelected(modeView.DefaultSelection)
-	else
-		GuiService.SelectedObject = nil
-	end
-end
-
-local function showComingSoon()
-	if not toast then return end
-	toast.TextTransparency = 0
-	toast.BackgroundTransparency = 0.08
-	task.delay(1.2, function()
-		if toast then
-			TweenService:Create(toast, TweenInfo.new(0.18), { TextTransparency = 1, BackgroundTransparency = 1 }):Play()
-		end
-	end)
-end
+local root = nil
+local remoteConnection: RBXScriptConnection? = nil
+local setScreenState = nil
+local setLoadingState = nil
+local setToastState = nil
+local setGoalState = nil
 
 local function preloadMenuAssets()
 	local images = {}
@@ -86,89 +46,187 @@ local function preloadMenuAssets()
 	local ok, failure = pcall(function() ContentProvider:PreloadAsync(images) end)
 	if not ok then warn("[Beyond90][UI] Menu preload failure: " .. tostring(failure)) end
 	for _, image in images do image:Destroy() end
+	localPlayer:SetAttribute("Beyond90MenuAssetsReady", true)
+end
+
+local function App(props)
+	local callbacks = props.Callbacks
+	local function click()
+		if callbacks.PlayClick then callbacks.PlayClick() end
+	end
+	local screen, setScreen = React.useState("Home")
+	local loading, setLoading = React.useState({
+		Variant = "Training", Mode = "TRAINING", Detail = "FREE PRACTICE",
+		Status = "PREPARING TRAINING", Progress = 0.12,
+	})
+	local toast, setToast = React.useState(false)
+	local goalVisible, setGoalVisible = React.useState(false)
+	local selectedTrack, setSelectedTrack = React.useState(callbacks and callbacks.GetMenuTrack and callbacks.GetMenuTrack() or 1)
+
+	setScreenState = setScreen
+	setLoadingState = setLoading
+	setToastState = setToast
+	setGoalState = setGoalVisible
+
+	React.useEffect(function()
+		localPlayer:SetAttribute("Beyond90MenuSurfaceMounted", true)
+		return function()
+			localPlayer:SetAttribute("Beyond90MenuSurfaceMounted", false)
+		end
+	end, {})
+
+	local screenElement
+	if screen == "Home" then
+		screenElement = React.createElement(HomeScreen, {
+			OpenModes = function() click(); setScreen("Modes") end,
+			OpenSettings = function() click(); setScreen("Settings") end,
+			ComingSoon = function()
+				click()
+				setToast(true)
+				task.delay(1.2, function() setToast(false) end)
+			end,
+		})
+	elseif screen == "Modes" then
+		screenElement = React.createElement(TrainingScreen, {
+			GoHome = function() click(); setScreen("Home") end,
+			OpenTeamSelection = function() click(); setScreen("TeamSelect") end,
+			ComingSoon = function()
+				click()
+				setToast(true)
+				task.delay(1.2, function() setToast(false) end)
+			end,
+		})
+	elseif screen == "TeamSelect" then
+		screenElement = React.createElement(TeamSelectionScreen, {
+			GoBack = function() click(); setScreen("Modes") end,
+			Continue = function(teamId) click(); callbacks.EnterTraining(teamId) end,
+		})
+	elseif screen == "Settings" then
+		screenElement = React.createElement(SettingsScreen, {
+			GoHome = function() click(); setScreen("Home") end,
+			SelectedTrack = selectedTrack,
+			SetTrack = function(index)
+				click()
+				setSelectedTrack(index)
+				callbacks.SetMenuTrack(index)
+			end,
+		})
+	elseif screen == "Gameplay" then
+		screenElement = React.createElement(GameplayHUD, {
+			ResetBall = function() click(); callbacks.ResetBall() end,
+			ReturnToMenu = function() click(); callbacks.ReturnToMenu() end,
+		})
+	else
+		screenElement = React.createElement(LoadingScreen, loading)
+	end
+
+	return React.createElement("ScreenGui", {
+		Name = "Beyond90UI",
+		-- HUD geometry explicitly reserves the top-left CoreGui cluster while keeping
+		-- menu and gameplay presentation edge-to-edge.
+		IgnoreGuiInset = true,
+		ResetOnSpawn = false,
+		DisplayOrder = 200,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	}, {
+		Root = React.createElement("Frame", {
+			Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0),
+			BackgroundTransparency = if screen == "Gameplay" then 1 else 0, BorderSizePixel = 0,
+		}, {
+			Screen = screenElement,
+			Toast = toast and React.createElement("Frame", {
+				AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.055),
+				Size = UDim2.fromScale(0.23, 0.082), BackgroundColor3 = Theme.Panel,
+				BackgroundTransparency = 0.02, BorderSizePixel = 0, ZIndex = 300,
+			}, {
+				Corner = ReactUI.Corner(6),
+				Stroke = ReactUI.Stroke(Theme.StrokeBright, 1.25, 0.12),
+				Accent = React.createElement("Frame", { Size = UDim2.fromScale(0.018, 1), BackgroundColor3 = Theme.AccentCyan, BorderSizePixel = 0, ZIndex = 301 }, {
+					Gradient = ReactUI.Gradient(Theme.AccentCyan, Theme.AccentViolet, 90),
+				}),
+				Title = React.createElement("TextLabel", { Position = UDim2.fromScale(0.08, 0.18), Size = UDim2.fromScale(0.84, 0.28), BackgroundTransparency = 1, Font = Theme.Fonts.Navigation, Text = "COMING SOON", TextColor3 = Theme.Text, TextSize = 16, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 301 }),
+				Body = React.createElement("TextLabel", { Position = UDim2.fromScale(0.08, 0.5), Size = UDim2.fromScale(0.84, 0.22), BackgroundTransparency = 1, Font = Theme.Fonts.Caption, Text = "This area is not available in the current milestone.", TextColor3 = Theme.MutedText, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 301 }),
+			}) or nil,
+			Goal = React.createElement(GoalNotification, { Visible = goalVisible }),
+		}),
+	})
 end
 
 function UIController.Initialize(callbacks)
-	if screenGui then return end
+	if root then return end
+	localPlayer:SetAttribute("Beyond90MenuSurfaceMounted", false)
 	local playerGui = localPlayer:WaitForChild("PlayerGui")
-	screenGui = Instance.new("ScreenGui")
-	screenGui.Name = "Beyond90UI"
-	screenGui.IgnoreGuiInset = true
-	screenGui.ResetOnSpawn = false
-	screenGui.DisplayOrder = 200
-	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-	screenGui.Parent = playerGui
-	rootBackdrop = Instance.new("Frame")
-	rootBackdrop.Size = UDim2.fromScale(1, 1)
-	rootBackdrop.BackgroundColor3 = Theme.Background
-	rootBackdrop.BorderSizePixel = 0
-	rootBackdrop.Parent = screenGui
-	canvas = Instance.new("Frame")
-	canvas.Name = "Canvas"
-	canvas.AnchorPoint = Vector2.new(0.5, 0.5)
-	canvas.Position = UDim2.fromScale(0.5, 0.5)
-	canvas.Size = UDim2.fromOffset(1600, 900)
-	canvas.BackgroundTransparency = 1
-	canvas.Parent = screenGui
-	canvasScale = Instance.new("UIScale")
-	canvasScale.Parent = canvas
-	updateScale()
-	scaleConnection = RunService.RenderStepped:Connect(updateScale)
-
-	local uiCallbacks = {
-		OpenHome = function() setScreen("Home") end,
-		OpenModeSelect = function() setScreen("Modes") end,
-		EnterTraining = callbacks.EnterTraining,
-		ReturnToMenu = callbacks.ReturnToMenu,
-		ResetBall = callbacks.ResetBall,
-		ShowComingSoon = showComingSoon,
-	}
-	homeView = HomeScreen.Create(canvas, uiCallbacks)
-	modeView = TrainingScreen.Create(canvas, uiCallbacks)
-	loadingView = LoadingScreen.Create(canvas)
-	gameplayView = GameplayHUD.Create(canvas, uiCallbacks)
-	local goalView = GoalNotification.Create(canvas)
-	toast = Instance.new("TextLabel")
-	toast.AnchorPoint = Vector2.new(0.5, 1)
-	toast.Position = UDim2.new(0.5, 0, 1, -52)
-	toast.Size = UDim2.fromOffset(250, 40)
-	toast.BackgroundColor3 = Theme.Panel
-	toast.BackgroundTransparency = 1
-	toast.Text = "COMING SOON"
-	toast.TextColor3 = Theme.AccentCyan
-	toast.TextTransparency = 1
-	toast.Font = Theme.Fonts.Navigation
-	toast.TextSize = 12
-	toast.ZIndex = 300
-	toast.Parent = canvas
+	root = ReactRoblox.createRoot(playerGui)
+	root:render(React.createElement(App, { Callbacks = callbacks }))
+	task.spawn(preloadMenuAssets)
 	task.spawn(function()
 		local remotes = ReplicatedStorage:WaitForChild(FootballActionConfig.RemotesFolderName, 10)
 		local goalRemote = remotes and remotes:WaitForChild(GoalConfig.GoalScoredRemoteName, 10)
 		if goalRemote and goalRemote:IsA("RemoteEvent") then
-			goalRemote.OnClientEvent:Connect(function(payload) goalView.Play(payload) end)
+			remoteConnection = goalRemote.OnClientEvent:Connect(function()
+				if setGoalState then
+					setGoalState(true)
+					task.delay(1.35, function()
+						if setGoalState then setGoalState(false) end
+					end)
+				end
+			end)
 		end
 	end)
-	preloadMenuAssets()
 end
 
 function UIController.ShowHome()
-	setScreen("Home")
+	if setScreenState then setScreenState("Home") end
+	GuiService.SelectedObject = nil
+end
+
+function UIController.ShowMenuLoading()
+	if setLoadingState then
+		setLoadingState({
+			Variant = "Menu", Mode = "RETURNING TO MENU", Detail = "",
+			Status = "CLOSING TRAINING SESSION", Progress = 0.62,
+		})
+	end
+	if setScreenState then setScreenState("Loading") end
 end
 
 function UIController.ShowModeLoading(mode: string, detail: string)
-	loadingView.SetMode(mode, detail)
-	loadingView.SetStatus("PREPARING TRAINING", 0.12)
-	setScreen("Loading")
+	if setLoadingState then
+		setLoadingState({
+			Variant = "Training", Mode = mode, Detail = detail,
+			Status = "PREPARING TRAINING", Progress = 0.12,
+		})
+	end
+	if setScreenState then setScreenState("Loading") end
 end
 
 function UIController.UpdateModeLoading(status: string, progress: number)
-	if loadingView then loadingView.SetStatus(status, progress) end
+	if setLoadingState then
+		setLoadingState(function(previous)
+			local nextState = table.clone(previous)
+			nextState.Status = status
+			nextState.Progress = progress
+			return nextState
+		end)
+	end
 end
 
 function UIController.ShowGameplay()
-	loadingView.SetStatus("READY", 1)
-	task.wait(0.12)
-	setScreen("Gameplay")
+	UIController.UpdateModeLoading("READY", 1)
+	task.wait(0.65)
+	if setScreenState then setScreenState("Gameplay") end
+end
+
+function UIController.Destroy()
+	if remoteConnection then remoteConnection:Disconnect() end
+	remoteConnection = nil
+	if root then root:unmount() end
+	root = nil
+	setScreenState = nil
+	setLoadingState = nil
+	setToastState = nil
+	setGoalState = nil
+	localPlayer:SetAttribute("Beyond90MenuSurfaceMounted", false)
 end
 
 return UIController

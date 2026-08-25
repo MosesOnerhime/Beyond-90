@@ -1141,6 +1141,13 @@ local function updateControlledBall(deltaTime: number)
 		return
 	end
 
+	local clientServoReadyAt = ball:GetAttribute("ControlClientServoReadyAt")
+	if typeof(clientServoReadyAt) == "number"
+		and Workspace:GetServerTimeNow() < clientServoReadyAt
+	then
+		return
+	end
+
 	local rootPart, humanoid = getRootAndHumanoid()
 
 	if not rootPart or not humanoid then

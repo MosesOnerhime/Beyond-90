@@ -21,6 +21,7 @@ local originalCameraType: Enum.CameraType? = nil
 local originalCameraSubject: Instance? = nil
 local modeTransitionId = 0
 local modeChangedEvent = Instance.new("BindableEvent")
+local joinIntroPlayed = false
 
 local function log(message: string)
 	print(string.format("%s[Client][Camera] %s", GameConfig.LogPrefix, message))
@@ -184,6 +185,16 @@ end
 
 function CameraController.GetActiveMode(): string
 	return activeMode
+end
+
+function CameraController.PlayJoinIntro()
+	if joinIntroPlayed then return end
+	joinIntroPlayed = true
+	if activeMode == "Broadcast1" then
+		BroadcastCamera.PlayJoinIntro()
+		localPlayer:SetAttribute("Beyond90CameraJoinIntroStarted", os.clock())
+		log("Broadcast1 join sky reveal")
+	end
 end
 
 function CameraController.GetModeChangedEvent(): BindableEvent

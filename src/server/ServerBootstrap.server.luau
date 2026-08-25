@@ -1,4 +1,5 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local GameConfig = require(Shared.Config.GameConfig)
 local GoalConfig = require(Shared.Config.GoalConfig)
@@ -15,6 +16,21 @@ local function log(message: string)
 end
 
 log("Initializing...")
+
+local menuCharacter = Workspace:FindFirstChild("menu_character")
+if menuCharacter and menuCharacter:IsA("Model") then
+	local previousReplica = ReplicatedStorage:FindFirstChild("Beyond90MenuCharacter")
+	if previousReplica then previousReplica:Destroy() end
+	local replica = menuCharacter:Clone()
+	replica.Name = "Beyond90MenuCharacter"
+	for _, descendant in replica:GetDescendants() do
+		if descendant:IsA("BaseScript") then descendant:Destroy() end
+	end
+	replica.Parent = ReplicatedStorage
+	log("Workspace.menu_character replicated for the menu ViewportFrame")
+else
+	warn(string.format("%s[Server] Workspace.menu_character is missing", GameConfig.LogPrefix))
+end
 
 local pitchState = PitchService.Initialize()
 log("Pitch initialized")

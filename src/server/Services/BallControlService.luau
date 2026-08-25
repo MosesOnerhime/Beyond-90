@@ -4,6 +4,7 @@ local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local BallConfig = require(Shared.Config.BallConfig)
+local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local BallControlMath = require(Shared.Football.BallControlMath)
 local ReceptionPlanner = require(Shared.Football.ReceptionPlanner)
@@ -31,6 +32,8 @@ local controllerCharacterConnection: RBXScriptConnection? = nil
 local controlEpoch = 0
 local previousFreeBallPosition: Vector3? = nil
 local networkOwnershipHandoffUntil = 0
+local controlAcquiredAt = 0
+local speedViolationStartedAt: number? = nil
 local receptionTransactionByPassId: { [number]: { Player: Player, Time: number, Epoch: number } } = {}
 
 local function log(message: string)
@@ -282,6 +285,24 @@ local function updateControlDirection(player: Player, rootPart: BasePart, moveme
 	return direction
 end
 
+local function resolveControlDirection(ball: BasePart, candidate): Vector3
+	local handoffUntil = ball:GetAttribute("ControlHandoffUntil")
+	local initialDirection = ball:GetAttribute("InitialControlDirection")
+	if typeof(handoffUntil) == "number" and os.clock() < handoffUntil
+		and typeof(initialDirection) == "Vector3" and initialDirection.Magnitude > 0.05
+	then
+		local direction = BallControlMath.SafeUnit(initialDirection, getFacingDirection(candidate.RootPart))
+		lastControlDirectionByPlayer[candidate.Player] = direction
+		return direction
+	end
+	return updateControlDirection(
+		candidate.Player,
+		candidate.RootPart,
+		candidate.MovementDirection,
+		candidate.PlayerSpeed
+	)
+end
+
 local function getControlContext(
 	player: Player,
 	ball: BasePart,
@@ -524,6 +545,7 @@ local function releaseControl(ball: BasePart, reason: string)
 		setServerNetworkOwner(ball)
 		setBallState(ball, CONTROL_STATE_FREE, nil)
 		ball:SetAttribute("LastReleaseReason", reason)
+		ball:SetAttribute("ControlClientServoReadyAt", 0)
 		clearControllerNoCollision()
 		lastAcceptedBallState = nil
 		distanceViolationStartedAt = nil
@@ -535,6 +557,8 @@ local function releaseControl(ball: BasePart, reason: string)
 	setServerNetworkOwner(ball)
 
 	activeController = nil
+	controlAcquiredAt = 0
+	speedViolationStartedAt = nil
 	lastLogicalTouchByPlayer[previousController] = nil
 	logicalTouchCountByPlayer[previousController] = nil
 	lastControlDirectionByPlayer[previousController] = nil
@@ -546,6 +570,7 @@ local function releaseControl(ball: BasePart, reason: string)
 	clearControllerNoCollision()
 	setBallState(ball, CONTROL_STATE_FREE, nil)
 	ball:SetAttribute("LastReleaseReason", reason)
+	ball:SetAttribute("ControlClientServoReadyAt", 0)
 end
 
 local function acquireControl(ball: BasePart, player: Player, receptionContext)
@@ -554,6 +579,18 @@ local function acquireControl(ball: BasePart, player: Player, receptionContext)
 	end
 
 	local previousController = activeController
+	if ball:GetAttribute("FootballControlPhase") == "KnockOnReleased"
+		and ball:GetAttribute("LastFootballActionPlayerUserId") == player.UserId
+	then
+		local releasedAt = ball:GetAttribute("KnockOnReleasedAt")
+		local duration = if typeof(releasedAt) == "number" then os.clock() - releasedAt else 0
+		log(string.format(
+			"[KnockOnRecontact] player=%s maxSeparation=%.1f recontactTime=%.2f",
+			player.Name,
+			ball:GetAttribute("KnockOnMaxSeparation") or 0,
+			duration
+		))
+	end
 	local character = player.Character
 
 	if previousController then
@@ -594,11 +631,14 @@ local function acquireControl(ball: BasePart, player: Player, receptionContext)
 	end
 
 	activeController = player
+	controlAcquiredAt = os.clock()
+	speedViolationStartedAt = nil
 	lastLogicalTouchByPlayer[player] = nil
 	logicalTouchCountByPlayer[player] = 0
 	lastLeadDiagnosticByPlayer[player] = nil
 	leadDiagnosticSampleIdByPlayer[player] = 0
 	setBallState(ball, CONTROL_STATE_CONTROLLED, player)
+	ball:SetAttribute("FootballControlPhase", "Controlled")
 	clearLegacyDiagnostics(ball)
 	ball:SetAttribute("LastReleaseReason", "")
 	ball:SetAttribute("LastControlTouchTime", -1)
@@ -627,6 +667,12 @@ local function acquireControl(ball: BasePart, player: Player, receptionContext)
 	ball:SetAttribute("LastReceptionPlayerUserId", if receptionContext then receptionContext.Player.UserId else 0)
 	ball:SetAttribute("LastReceptionType", if receptionContext then receptionContext.FirstTouchType else "")
 	ball:SetAttribute("ControlEpoch", epoch)
+	local clientServoReadyAt = Workspace:GetServerTimeNow()
+	if isPlayerOwnedMode() and receptionContext then
+		clientServoReadyAt += BallConfig.Reception.NetworkOwnershipHandoffDelay
+			+ BallConfig.Reception.ClientServoOwnershipBuffer
+	end
+	ball:SetAttribute("ControlClientServoReadyAt", clientServoReadyAt)
 
 	if character then
 		setControllerNoCollision(ball, character)
@@ -691,13 +737,26 @@ local function getControllerInvalidReason(ball: BasePart): string?
 		return "ball too high"
 	end
 
-	if ball.AssemblyLinearVelocity.Magnitude > controlConfig.ControlRetentionMaxSpeed then
-		return "ball too fast"
+	local horizontalSpeed = BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity).Magnitude
+	local speedLimit = if os.clock() - controlAcquiredAt < controlConfig.ControlAcquisitionSpeedGrace
+		then ownershipConfig.MaxControlledSpeed
+		else controlConfig.ControlRetentionMaxSpeed
+	if horizontalSpeed > speedLimit then
+		local now = os.clock()
+		speedViolationStartedAt = speedViolationStartedAt or now
+		if now - speedViolationStartedAt >= controlConfig.ControlRetentionSpeedViolationGrace then
+			return string.format("ball too fast (horizontal=%.1f limit=%.1f)", horizontalSpeed, speedLimit)
+		end
+	else
+		speedViolationStartedAt = nil
 	end
 
 	local horizontalDistance = BallControlMath.GetHorizontal(ball.Position - rootPart.Position).Magnitude
+	local retentionDistance = if isPlayerOwnedMode()
+		then ownershipConfig.MaxControlledDistance
+		else controlConfig.HardControlDistance
 
-	if horizontalDistance > controlConfig.HardControlDistance then
+	if horizontalDistance > retentionDistance then
 		return "hard distance exceeded"
 	end
 
@@ -760,6 +819,9 @@ end
 local function applyPlannedContact(ball: BasePart, candidate, controlDirection: Vector3): boolean
 	local now = os.clock()
 	local lastLogicalTouch = lastLogicalTouchByPlayer[candidate.Player]
+	if now - controlAcquiredAt < controlConfig.HandoffNoTouchDuration then
+		return false
+	end
 
 	if lastLogicalTouch and now - lastLogicalTouch < controlConfig.LogicalTouchInterval then
 		return false
@@ -953,7 +1015,7 @@ local function validatePlayerOwnedControl(ball: BasePart, candidate): boolean
 	end
 
 	local velocity = ball.AssemblyLinearVelocity
-	local speed = velocity.Magnitude
+	local speed = BallControlMath.GetHorizontal(velocity).Magnitude
 
 	if speed > ownershipConfig.MaxControlledSpeed then
 		log(string.format(
@@ -1007,12 +1069,7 @@ end
 
 local function applyCoupledPossessionControl(ball: BasePart, candidate, deltaTime: number)
 	local isStationary = candidate.PlayerSpeed < controlConfig.StationaryPlayerSpeed
-	local controlDirection = updateControlDirection(
-		candidate.Player,
-		candidate.RootPart,
-		candidate.MovementDirection,
-		candidate.PlayerSpeed
-	)
+	local controlDirection = resolveControlDirection(ball, candidate)
 
 	local touched = false
 
@@ -1036,6 +1093,8 @@ end
 function BallControlService.Initialize(ball: BasePart)
 	previousFreeBallPosition = ball.Position
 	activeController = nil
+	controlAcquiredAt = 0
+	speedViolationStartedAt = nil
 	table.clear(lastLogicalTouchByPlayer)
 	table.clear(logicalTouchCountByPlayer)
 	table.clear(lastControlDirectionByPlayer)
@@ -1048,6 +1107,8 @@ function BallControlService.Initialize(ball: BasePart)
 	distanceViolationStartedAt = nil
 	lastAcceptedBallState = nil
 	networkOwnershipHandoffUntil = 0
+	controlAcquiredAt = 0
+	speedViolationStartedAt = nil
 	clearControllerNoCollision()
 	setServerNetworkOwner(ball)
 	setBallState(ball, CONTROL_STATE_FREE, nil)
@@ -1092,6 +1153,11 @@ function BallControlService.Initialize(ball: BasePart)
 	ball:SetAttribute("LastFootballActionPredictedCatchTime", 0)
 	ball:SetAttribute("LastFootballActionPeakSeparation", 0)
 	ball:SetAttribute("LastFootballActionGoalId", "")
+	ball:SetAttribute("FootballFlightComplete", true)
+	ball:SetAttribute("FootballGrounded", true)
+	ball:SetAttribute("FootballBounceCount", 0)
+	ball:SetAttribute("LastFootballBounceImpactSpeed", 0)
+	ball:SetAttribute("LastFootballBounceReboundSpeed", 0)
 	ball:SetAttribute("LastReceptionPlayerUserId", 0)
 	ball:SetAttribute("LastReceptionPlayerName", "")
 	ball:SetAttribute("LastReceptionType", "")
@@ -1169,6 +1235,11 @@ function BallControlService.Reset(ball: BasePart)
 	ball:SetAttribute("LastFootballActionPredictedCatchTime", 0)
 	ball:SetAttribute("LastFootballActionPeakSeparation", 0)
 	ball:SetAttribute("LastFootballActionGoalId", "")
+	ball:SetAttribute("FootballFlightComplete", true)
+	ball:SetAttribute("FootballGrounded", true)
+	ball:SetAttribute("FootballBounceCount", 0)
+	ball:SetAttribute("LastFootballBounceImpactSpeed", 0)
+	ball:SetAttribute("LastFootballBounceReboundSpeed", 0)
 	ball:SetAttribute("LastReceptionPlayerUserId", 0)
 	ball:SetAttribute("LastReceptionPlayerName", "")
 	ball:SetAttribute("LastReceptionType", "")
@@ -1201,6 +1272,8 @@ function BallControlService.CleanupPlayer(player: Player, ball: BasePart?)
 			releaseControl(ball, "controller left")
 		else
 			activeController = nil
+			controlAcquiredAt = 0
+			speedViolationStartedAt = nil
 			clearControllerNoCollision()
 		end
 	end
@@ -1256,7 +1329,11 @@ function BallControlService.ReleaseForFootballAction(
 	BallControlService.SuppressAcquisition(player, reacquireSuppression or 0.1, reacquireExitDistance)
 	releaseControl(ball, string.format("%s by %s", actionName, player.Name))
 	ball.AssemblyLinearVelocity = launchVelocity
-	ball.AssemblyAngularVelocity = Vector3.new(-launchVelocity.Z, 0, launchVelocity.X) * 1.2
+	local horizontalLaunchVelocity = Vector3.new(launchVelocity.X, 0, launchVelocity.Z)
+	local rollingAngularVelocity = Vector3.yAxis:Cross(horizontalLaunchVelocity) / math.max(BallConfig.Radius, 1e-5)
+	-- A kicked football is not immediately in a no-slip roll. Start with moderate
+	-- forward spin so ground contact can visibly finish the rolling transition.
+	ball.AssemblyAngularVelocity = rollingAngularVelocity * 0.38
 	ball:SetAttribute("LastFootballAction", actionName)
 	ball:SetAttribute("LastFootballActionPlayerUserId", player.UserId)
 	ball:SetAttribute("LastFootballActionTime", os.clock())
@@ -1269,11 +1346,49 @@ function BallControlService.ReleaseForFootballAction(
 	ball:SetAttribute("LastFootballActionPredictedCatchTime", actionContext and actionContext.PredictedCatchTime or 0)
 	ball:SetAttribute("LastFootballActionPeakSeparation", actionContext and actionContext.PeakSeparation or 0)
 	ball:SetAttribute("LastFootballActionGoalId", actionContext and actionContext.GoalId or "")
+	ball:SetAttribute("FootballFlightComplete", false)
+	ball:SetAttribute("FootballGrounded", false)
+	ball:SetAttribute("FootballBounceCount", 0)
+	ball:SetAttribute("LastFootballBounceImpactSpeed", 0)
+	ball:SetAttribute("LastFootballBounceReboundSpeed", 0)
+	if actionName == "KnockOn" then
+		ball:SetAttribute("FootballControlPhase", "KnockOnReleased")
+		ball:SetAttribute("KnockOnReleasedAt", os.clock())
+		ball:SetAttribute("KnockOnMaxSeparation", 0)
+	else
+		ball:SetAttribute("FootballControlPhase", "Loose")
+	end
 	return true
 end
 
 function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
 	local sampledBallPosition = ball.Position
+	if ball:GetAttribute("FootballControlPhase") == "KnockOnReleased" then
+		local knockOnConfig = FootballActionConfig.KnockOn
+		local horizontalVelocity = BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity)
+		local horizontalSpeed = horizontalVelocity.Magnitude
+		local stepDeltaTime = math.max(deltaTime or BallConfig.BasicTouch.CheckInterval, 1 / 240)
+		if horizontalSpeed > 0 then
+			local nextSpeed = math.max(0, horizontalSpeed - knockOnConfig.ReleasedHorizontalDeceleration * stepDeltaTime)
+			ball.AssemblyLinearVelocity = horizontalVelocity.Unit * nextSpeed + Vector3.new(0, ball.AssemblyLinearVelocity.Y, 0)
+		end
+
+		local initiatorUserId = ball:GetAttribute("LastFootballActionPlayerUserId")
+		for _, player in Players:GetPlayers() do
+			if player.UserId == initiatorUserId then
+				local _character, rootPart = getCharacterParts(player)
+				if rootPart then
+					local separation = BallControlMath.GetHorizontal(ball.Position - rootPart.Position).Magnitude
+					ball:SetAttribute("KnockOnMaxSeparation", math.max(ball:GetAttribute("KnockOnMaxSeparation") or 0, separation))
+				end
+				break
+			end
+		end
+		local releasedAt = ball:GetAttribute("KnockOnReleasedAt")
+		if typeof(releasedAt) == "number" and os.clock() - releasedAt >= knockOnConfig.MaximumReleasedDuration then
+			ball:SetAttribute("FootballControlPhase", "Loose")
+		end
+	end
 	local stepDeltaTime = math.max(deltaTime or BallConfig.BasicTouch.CheckInterval, 1 / 240)
 
 	if activeController then
@@ -1336,6 +1451,11 @@ function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
 	local activeCandidate = getActiveControllerContext(activeController, ball)
 
 	if not activeCandidate then
+		-- Distance/speed violations are handled above with their configured grace period.
+		-- Do not bypass that grace while the ownership handoff is reconciling.
+		if getControllerInvalidReason(ball) then
+			return false
+		end
 		releaseControl(ball, "movement state invalid")
 		return false
 	end
@@ -1343,12 +1463,7 @@ function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
 	if isPlayerOwnedMode() and os.clock() < networkOwnershipHandoffUntil then
 		applyCoupledPossessionControl(ball, activeCandidate, stepDeltaTime)
 	elseif isPlayerOwnedMode() then
-		local controlDirection = updateControlDirection(
-			activeCandidate.Player,
-			activeCandidate.RootPart,
-			activeCandidate.MovementDirection,
-			activeCandidate.PlayerSpeed
-		)
+		local controlDirection = resolveControlDirection(ball, activeCandidate)
 		updateLeadDiagnostics(ball, activeCandidate, controlDirection)
 
 		if not validatePlayerOwnedControl(ball, activeCandidate) then

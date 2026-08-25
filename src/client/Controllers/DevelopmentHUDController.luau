@@ -14,6 +14,8 @@ local DevelopmentHUDController = {}
 local localPlayer = Players.LocalPlayer
 local initialized = false
 local gui: ScreenGui? = nil
+local toolsPanel: ScrollingFrame? = nil
+local toolsToggle: TextButton? = nil
 local autoSprintButton: TextButton? = nil
 local cameraButton: TextButton? = nil
 local cameraDistanceButton: TextButton? = nil
@@ -327,22 +329,56 @@ local function createGui()
 	local screenGui = Instance.new("ScreenGui")
 	screenGui.Name = "Beyond90DevelopmentHUD"
 	screenGui.ResetOnSpawn = false
-	screenGui.IgnoreGuiInset = false
-	screenGui.DisplayOrder = 20
+	screenGui.IgnoreGuiInset = true
+	screenGui.DisplayOrder = 400
 	screenGui.Parent = playerGui
 	gui = screenGui
 
-	autoSprintButton = createButton(screenGui, "AutoSprintButton", UDim2.fromOffset(16, 16))
-	cameraButton = createButton(screenGui, "CameraModeButton", UDim2.fromOffset(16, 58))
-	cameraDistanceButton = createButton(screenGui, "CameraDistanceButton", UDim2.fromOffset(16, 100))
-	createIntensityMeter(screenGui, "GroundPass", "PASS INTENSITY", UDim2.fromOffset(16, 148))
-	createIntensityMeter(screenGui, "ThroughPass", "THROUGH INTENSITY", UDim2.fromOffset(16, 200))
-	createIntensityMeter(screenGui, "KnockOn", "KNOCK-ON INTENSITY", UDim2.fromOffset(16, 252))
-	createJogRateControl(screenGui, UDim2.fromOffset(16, 304))
-	createShootingSkillControl(screenGui, UDim2.fromOffset(16, 394))
+	local panel = Instance.new("ScrollingFrame")
+	panel.Name = "ToolsPanel"
+	panel.AnchorPoint = Vector2.new(0, 0.5)
+	panel.Position = UDim2.new(0, 76, 0.5, 0)
+	panel.Size = UDim2.fromOffset(326, 360)
+	panel.CanvasSize = UDim2.fromOffset(0, 470)
+	panel.ScrollBarThickness = 4
+	panel.ScrollBarImageColor3 = Color3.fromRGB(67, 218, 255)
+	panel.BackgroundColor3 = Color3.fromRGB(6, 10, 24)
+	panel.BackgroundTransparency = 0.06
+	panel.BorderSizePixel = 0
+	panel.Visible = false
+	panel.Parent = screenGui
+	toolsPanel = panel
+
+	local toggle = Instance.new("TextButton")
+	toggle.Name = "ToolsToggle"
+	toggle.AnchorPoint = Vector2.new(0, 0.5)
+	toggle.Position = UDim2.new(0, 12, 0.5, 0)
+	toggle.Size = UDim2.fromOffset(54, 38)
+	toggle.BackgroundColor3 = Color3.fromRGB(11, 19, 42)
+	toggle.BackgroundTransparency = 0.05
+	toggle.BorderSizePixel = 0
+	toggle.Font = Enum.Font.GothamBold
+	toggle.Text = "DEV"
+	toggle.TextColor3 = Color3.fromRGB(67, 218, 255)
+	toggle.TextSize = 12
+	toggle.Parent = screenGui
+	toolsToggle = toggle
+
+	autoSprintButton = createButton(panel, "AutoSprintButton", UDim2.fromOffset(16, 16))
+	cameraButton = createButton(panel, "CameraModeButton", UDim2.fromOffset(16, 58))
+	cameraDistanceButton = createButton(panel, "CameraDistanceButton", UDim2.fromOffset(16, 100))
+	createIntensityMeter(panel, "GroundPass", "PASS INTENSITY", UDim2.fromOffset(16, 148))
+	createIntensityMeter(panel, "ThroughPass", "THROUGH INTENSITY", UDim2.fromOffset(16, 200))
+	createIntensityMeter(panel, "KnockOn", "KNOCK-ON INTENSITY", UDim2.fromOffset(16, 252))
+	createJogRateControl(panel, UDim2.fromOffset(16, 304))
+	createShootingSkillControl(panel, UDim2.fromOffset(16, 394))
 	local remotes = ReplicatedStorage:FindFirstChild(FootballActionConfig.RemotesFolderName)
 	shootingSkillRemote = remotes and remotes:FindFirstChild(FootballActionConfig.DevelopmentShootingSkillRemoteName) :: RemoteEvent?
 
+	table.insert(connections, toggle.Activated:Connect(function()
+		panel.Visible = not panel.Visible
+		toggle.Text = if panel.Visible then "CLOSE" else "DEV"
+	end))
 	table.insert(connections, autoSprintButton.Activated:Connect(function()
 		InputController.ToggleAutoSprint()
 	end))
@@ -410,6 +446,8 @@ function DevelopmentHUDController.Destroy()
 		gui:Destroy()
 		gui = nil
 	end
+	toolsPanel = nil
+	toolsToggle = nil
 
 	autoSprintButton = nil
 	cameraButton = nil

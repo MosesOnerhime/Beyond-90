@@ -54,6 +54,13 @@ local function getFirstTouchType(ballSpeed: number, relativeSpeed: number, playe
 		return "TakeInStride"
 	end
 
+	-- A fast player collecting a slow loose ball should carry momentum through
+	-- the contact. Classifying this by relative speed alone brakes the football
+	-- and leaves it behind a sprinting receiver during network handoff.
+	if ballSpeed <= config.SlowPickupSpeed and playerSpeed >= config.TakeInStridePlayerSpeed then
+		return "TakeInStride"
+	end
+
 	if relativeSpeed >= config.CaptureRelativeSpeed then
 		return "Capture"
 	end

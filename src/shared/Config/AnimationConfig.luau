@@ -147,9 +147,9 @@ local AnimationConfig = {
 	},
 
 	AirbornePresentation = {
-		EnterDelay = 0.2,
+		EnterDelay = 0.28,
 		GroundedVerticalSpeedTolerance = 1.5,
-		MinimumFallSpeed = 2.25,
+		MinimumFallSpeed = 3,
 		ClearGroundDistancePadding = 1.5,
 	},
 

@@ -26,6 +26,11 @@ local CameraConfig = {
 		LookAheadDistance = 18,
 		LookAheadReferenceSpeed = 30,
 		AttackingLookAheadDistance = 6,
+		GoalBiasStartProgress = 0,
+		GoalBiasFullProgress = 0.52,
+		GoalBiasCurveExponent = 0.62,
+		AttackingGoalTargetBias = 27,
+		AttackingGoalFocusBlend = 0.07,
 		BallSeparationZoomScale = 0.18,
 		BallSeparationZoomDeadzone = 5,
 		OpenPlayFOVBoost = 0,
@@ -71,6 +76,11 @@ local CameraConfig = {
 		BroadcastSideFadeInfieldMargin = 8,
 		MinimumObstructionDistance = 20,
 		AttributeSampleInterval = 0.35,
+		JoinIntro = {
+			Duration = 2.6,
+			SkyHeight = 155,
+			StartFOV = 46,
+		},
 	},
 
 	ThirdPerson = {
@@ -109,6 +119,8 @@ CameraConfig.Broadcast2.PlayerBallWeightControlled = 0.9
 CameraConfig.Broadcast2.PlayerBallWeightFree = 0.72
 CameraConfig.Broadcast2.LookAheadDistance = 22
 CameraConfig.Broadcast2.AttackingLookAheadDistance = 10
+CameraConfig.Broadcast2.AttackingGoalTargetBias = 36
+CameraConfig.Broadcast2.AttackingGoalFocusBlend = 0.2
 CameraConfig.Broadcast2.MaxBallInfluence = 16
 CameraConfig.Broadcast2.FollowDeadZoneLength = 7
 CameraConfig.Broadcast2.FollowDeadZoneWidth = 5

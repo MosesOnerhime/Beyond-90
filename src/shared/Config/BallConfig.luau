@@ -16,10 +16,63 @@ local BallConfig = {
 
 	PhysicalProperties = {
 		Density = 0.7,
-		Friction = 0.35,
-		Elasticity = 0.45,
-		FrictionWeight = 1,
-		ElasticityWeight = 1,
+		-- Free-ball ground response is modeled explicitly below. Keep Roblox's
+		-- contact material quiet so it does not add a second, competing bounce.
+		Friction = 0,
+		Elasticity = 0,
+		FrictionWeight = 100,
+		ElasticityWeight = 100,
+	},
+
+	Bounce = {
+		Enabled = true,
+		-- Long balls should produce one readable arcade bounce, then settle
+		-- into a roll instead of beginning another high aerial phase.
+		Restitution = 0.32,
+		AirborneGravity = WorldScaleConfig.MetersToStuds(9.81),
+		LinearBounceLoss = WorldScaleConfig.MetersToStuds(0.3),
+		MinimumImpactSpeed = WorldScaleConfig.MetersToStuds(0.7),
+		SettleReboundSpeed = WorldScaleConfig.MetersToStuds(0.9),
+		MaximumReboundSpeed = WorldScaleConfig.MetersToStuds(3.6),
+		ContactTolerance = 0.18,
+		SurfaceNormalMinUpDot = 0.65,
+		Cooldown = 0.045,
+		ImpactFrictionStartSpeed = WorldScaleConfig.MetersToStuds(0.5),
+		ImpactFrictionFullSpeed = WorldScaleConfig.MetersToStuds(12),
+		ImpactSpinCoupling = 0.5,
+		ImpactAngularCoupling = 0.72,
+		ImpactTangentLoss = 0.08,
+		NormalSpinRetention = 0.82,
+		MaximumSpinSurfaceSpeedRatio = 1.35,
+		DiagnosticEnabled = true,
+	},
+
+	Ground = {
+		Enabled = true,
+		GrassDepth = WorldScaleConfig.MetersToStuds(0.025),
+		QuadraticFriction = 0.04,
+		LinearFriction = 1.6,
+		RollingVelocityCoupling = 1.15,
+		RollingSpinResponse = 7.5,
+		NormalSpinDamping = 1.8,
+		StopSpeed = WorldScaleConfig.MetersToStuds(0.18),
+		MaximumUpwardContactSpeed = WorldScaleConfig.MetersToStuds(0.05),
+		GroundedReleaseDistance = WorldScaleConfig.MetersToStuds(0.2),
+		GroundedReleaseUpwardSpeed = WorldScaleConfig.MetersToStuds(0.3),
+	},
+
+	Flight = {
+		Enabled = true,
+		-- Roblox's default gravity is too strong relative to the 3.33 studs-per-metre pitch scale.
+		EffectiveGravity = 72,
+		ActivationHeight = 0.12,
+		MaximumActionDuration = 5,
+		Actions = {
+			Shoot = true,
+			Clearance = true,
+			ThroughPass = true,
+			LobPass = true,
+		},
 	},
 
 	BasicTouch = {
@@ -44,6 +97,8 @@ local BallConfig = {
 		MaximumControllableBallSpeed = 36,
 		ControlHeightTolerance = 1.25,
 		ControlRetentionMaxSpeed = 68,
+		ControlRetentionSpeedViolationGrace = 0.22,
+		ControlAcquisitionSpeedGrace = 0.75,
 		ControlRetentionHeightTolerance = 1.8,
 		AcquireMinPlayerSpeed = 2,
 		AcquireMinTowardBallDot = 0.12,
@@ -123,10 +178,12 @@ local BallConfig = {
 		HandoffNoTouchDuration = 0.9,
 		HandoffMinForwardLead = 1.65,
 		HandoffTargetLead = 2.55,
-		HandoffPositionGain = 24,
-		HandoffVelocityDamping = 3.2,
-		HandoffMaxDeltaSpeedPerSecond = 320,
-		HandoffImmediateRescueEnabled = false,
+		HandoffPositionGain = 7,
+		HandoffVelocityDamping = 2.4,
+		HandoffMaxDeltaSpeedPerSecond = 90,
+		-- Reconcile the first player-owned frame when local character prediction
+		-- has advanced well beyond the authoritative server ball handoff.
+		HandoffImmediateRescueEnabled = true,
 		HandoffImmediateRescueMinLead = 1.15,
 		HandoffImmediateRescueServerLead = 1.75,
 		HandoffImmediateRescueLeadError = 1.25,
@@ -236,7 +293,8 @@ local BallConfig = {
 		IntendedReceiverMaxCenterHeight = 4.25,
 		IntendedReceiverLateralTolerance = 4.25,
 		IntendedReceiverWindowSeconds = 5,
-		NetworkOwnershipHandoffDelay = 0.28,
+		NetworkOwnershipHandoffDelay = 0.1,
+		ClientServoOwnershipBuffer = 0.03,
 		DuplicateReceptionGuardSeconds = 1.5,
 		SlowPickupSpeed = 6,
 		CaptureRelativeSpeed = 22,
@@ -253,7 +311,9 @@ local BallConfig = {
 		TakeInStrideMaxSpeed = 29,
 		CaptureLeadDistance = 2.45,
 		CaptureForwardSpeed = 4,
-		CaptureMaxSpeed = 16,
+		-- A capture must not brake a full-sprint receiver so sharply that the
+		-- football falls behind before client ownership becomes active.
+		CaptureMaxSpeed = 30,
 		FirstTouchPositionGain = 2.4,
 		MaxFirstTouchCorrectionSpeed = 12,
 		MaxFirstTouchOutputSpeed = 30,

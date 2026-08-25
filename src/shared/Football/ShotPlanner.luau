@@ -1,6 +1,7 @@
 local Workspace = game:GetService("Workspace")
 
 local BallControlMath = require(script.Parent.BallControlMath)
+local BallConfig = require(script.Parent.Parent.Config.BallConfig)
 
 local ShotPlanner = {}
 
@@ -25,7 +26,7 @@ function ShotPlanner.ResolveAttackingGoal(origin: Vector3, aimDirection: Vector3
 	return bestGoal, bestScore
 end
 
-function ShotPlanner.Plan(origin: Vector3, aimDirection: Vector3, goal, ballRadius: number, config, shootingSkill: number?)
+function ShotPlanner.Plan(origin: Vector3, aimDirection: Vector3, goal, ballRadius: number, config, shootingSkill: number?, bodyFacingDirection: Vector3?)
 	if not goal then
 		return nil, "goal-unavailable"
 	end
@@ -59,8 +60,24 @@ function ShotPlanner.Plan(origin: Vector3, aimDirection: Vector3, goal, ballRadi
 		intendedTarget.Z
 	)
 	local errorScale = math.pow(1 - skill, skillConfig.ErrorExponent or 1)
-	local lateralError = (math.random() * 2 - 1) * skillConfig.MaximumLateralErrorStuds * errorScale
-	local verticalError = (math.random() * 2 - 1) * skillConfig.MaximumVerticalErrorStuds * errorScale
+	local skillLateralError = (math.random() * 2 - 1) * skillConfig.MaximumLateralErrorStuds * errorScale
+	local skillVerticalError = (math.random() * 2 - 1) * skillConfig.MaximumVerticalErrorStuds * errorScale
+	local alignmentConfig = config.Alignment or {}
+	local bodyFacing = BallControlMath.SafeUnit(horizontal(bodyFacingDirection or aim), centerDirection)
+	local bodyAlignment = math.clamp(bodyFacing:Dot(centerDirection), -1, 1)
+	local alignmentErrorAlpha = math.clamp(
+		((alignmentConfig.FullAccuracyDot or 0.92) - bodyAlignment)
+			/ math.max((alignmentConfig.FullAccuracyDot or 0.92) - (alignmentConfig.MaximumErrorDot or -0.65), 0.01),
+		0,
+		1
+	)
+	alignmentErrorAlpha = math.pow(alignmentErrorAlpha, alignmentConfig.ErrorExponent or 1)
+	local alignmentLateralError = (math.random() * 2 - 1)
+		* (alignmentConfig.MaximumLateralErrorStuds or 0) * alignmentErrorAlpha
+	local alignmentVerticalError = (math.random() * 2 - 1)
+		* (alignmentConfig.MaximumVerticalErrorStuds or 0) * alignmentErrorAlpha
+	local lateralError = skillLateralError + alignmentLateralError
+	local verticalError = skillVerticalError + alignmentVerticalError
 	local target = intendedTarget + goal.WidthAxis * lateralError + Vector3.yAxis * verticalError
 	local finalLateralOffset = (target - goal.MouthCenter):Dot(goal.WidthAxis)
 	local onTarget = math.abs(finalLateralOffset) <= goal.Width / 2 - ballRadius
@@ -68,9 +85,13 @@ function ShotPlanner.Plan(origin: Vector3, aimDirection: Vector3, goal, ballRadi
 		and target.Y <= goal.TopY - ballRadius
 
 	local speedAlpha = math.clamp(distance / math.max(config.ReferenceDistance, 1), 0, 1)
-	local horizontalSpeed = config.MinLaunchSpeed + (config.MaxLaunchSpeed - config.MinLaunchSpeed) * math.sqrt(speedAlpha)
-	local travelTime = math.clamp(distance / math.max(horizontalSpeed, 1), config.MinTravelTime, config.MaxTravelTime)
-	local verticalSpeed = (target.Y - origin.Y + 0.5 * Workspace.Gravity * travelTime * travelTime) / travelTime
+	local baseHorizontalSpeed = config.MinLaunchSpeed + (config.MaxLaunchSpeed - config.MinLaunchSpeed) * math.sqrt(speedAlpha)
+	-- Vertical launch must use the same physical arrival time as horizontal travel.
+	-- Clamping this independently made long shots arrive below their selected goal point.
+	local travelTime = distance / math.max(baseHorizontalSpeed, 1) * (config.FlightTimeScale or 1)
+	local horizontalSpeed = distance / math.max(travelTime, 0.01)
+	local flightGravity = BallConfig.Flight and BallConfig.Flight.EffectiveGravity or Workspace.Gravity
+	local verticalSpeed = (target.Y - origin.Y + 0.5 * flightGravity * travelTime * travelTime) / travelTime
 	local launchDirection = BallControlMath.SafeUnit(horizontal(target - origin), centerDirection)
 	local launchVelocity = launchDirection * horizontalSpeed + Vector3.yAxis * verticalSpeed
 
@@ -83,6 +104,12 @@ function ShotPlanner.Plan(origin: Vector3, aimDirection: Vector3, goal, ballRadi
 		FinalGoalTarget = target,
 		HorizontalError = lateralError,
 		VerticalError = verticalError,
+		SkillHorizontalError = skillLateralError,
+		SkillVerticalError = skillVerticalError,
+		AlignmentHorizontalError = alignmentLateralError,
+		AlignmentVerticalError = alignmentVerticalError,
+		BodyAlignment = bodyAlignment,
+		AlignmentErrorAlpha = alignmentErrorAlpha,
 		Result = if onTarget then "OnTarget" else "OffTarget",
 		LaunchVelocity = launchVelocity,
 		LaunchSpeed = launchVelocity.Magnitude,
@@ -97,21 +124,30 @@ function ShotPlanner.Plan(origin: Vector3, aimDirection: Vector3, goal, ballRadi
 	}, nil
 end
 
-function ShotPlanner.PlanClearance(origin: Vector3, aimDirection: Vector3, config)
-	local direction = BallControlMath.SafeUnit(horizontal(aimDirection), Vector3.new(0, 0, -1))
+function ShotPlanner.PlanClearance(origin: Vector3, aimDirection: Vector3, attackingDirection: Vector3, config)
 	local clearance = config.Clearance
-	local launchVelocity = direction * clearance.HorizontalSpeed + Vector3.yAxis * clearance.VerticalSpeed
+	local forward = BallControlMath.SafeUnit(horizontal(attackingDirection), Vector3.new(0, 0, -1))
+	local aim = BallControlMath.SafeUnit(horizontal(aimDirection), forward)
+	local lateralAxis = Vector3.yAxis:Cross(forward).Unit
+	local aimLateral = math.clamp(aim:Dot(lateralAxis), -1, 1) * (clearance.AimLateralInfluence or 0)
+	local randomLateral = (math.random() * 2 - 1) * (clearance.RandomLateralSpread or 0)
+	local direction = BallControlMath.SafeUnit(forward + lateralAxis * (aimLateral + randomLateral), forward)
+	local flightTime = math.max(clearance.FlightTime or 0, 0)
+	local flightGravity = BallConfig.Flight and BallConfig.Flight.EffectiveGravity or Workspace.Gravity
+	local horizontalSpeed = if flightTime > 0 then clearance.TargetDistance / flightTime else clearance.HorizontalSpeed
+	local verticalSpeed = if flightTime > 0 then 0.5 * flightGravity * flightTime else clearance.VerticalSpeed
+	local launchVelocity = direction * horizontalSpeed + Vector3.yAxis * verticalSpeed
 	return {
 		ActionType = "Clearance",
 		GoalId = "",
 		TargetPosition = origin + direction * clearance.TargetDistance,
 		LaunchVelocity = launchVelocity,
 		LaunchSpeed = launchVelocity.Magnitude,
-		HorizontalLaunchSpeed = clearance.HorizontalSpeed,
-		VerticalLaunchSpeed = clearance.VerticalSpeed,
+		HorizontalLaunchSpeed = horizontalSpeed,
+		VerticalLaunchSpeed = verticalSpeed,
 		Distance = clearance.TargetDistance,
-		PredictedArrivalTime = clearance.TargetDistance / clearance.HorizontalSpeed,
-		PredictedArrivalSpeed = clearance.HorizontalSpeed,
+		PredictedArrivalTime = if flightTime > 0 then flightTime else clearance.TargetDistance / horizontalSpeed,
+		PredictedArrivalSpeed = horizontalSpeed,
 		Intensity = 1,
 		Score = 0,
 		ShootingSkill = 0,

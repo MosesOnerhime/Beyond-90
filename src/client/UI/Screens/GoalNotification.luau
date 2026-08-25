@@ -1,89 +1,33 @@
-local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
+local React = require(ReplicatedStorage.Shared.ReactPackages).React
 local Theme = require(script.Parent.Parent.Theme)
+local ReactUI = require(script.Parent.Parent.Components.ReactUI)
 
-local GoalNotification = {}
-
-function GoalNotification.Create(parent: Instance)
-	local frame = Instance.new("Frame")
-	frame.Name = "GoalNotification"
-	frame.Size = UDim2.fromScale(1, 1)
-	frame.BackgroundTransparency = 1
-	frame.Visible = false
-	frame.ZIndex = 40
-	frame.Parent = parent
-
-	local text = Instance.new("TextLabel")
-	text.Name = "GoalText"
-	text.AnchorPoint = Vector2.new(0.5, 0.5)
-	text.Position = UDim2.fromScale(0.5, 0.38)
-	text.Size = UDim2.fromOffset(520, 112)
-	text.BackgroundTransparency = 1
-	text.Font = Enum.Font.GothamBlack
-	text.Text = "GOAL"
-	text.TextColor3 = Theme.Text
-	text.TextSize = 82
-	text.TextTransparency = 1
-	text.ZIndex = 41
-	text.Parent = frame
-	local scale = Instance.new("UIScale")
-	scale.Scale = 0.72
-	scale.Parent = text
-
-	local accent = Instance.new("Frame")
-	accent.Name = "Accent"
-	accent.AnchorPoint = Vector2.new(0.5, 0.5)
-	accent.Position = UDim2.fromScale(0.5, 0.445)
-	accent.Size = UDim2.fromOffset(0, 5)
-	accent.BackgroundColor3 = Theme.Accent
-	accent.BorderSizePixel = 0
-	accent.ZIndex = 41
-	accent.Parent = frame
-
-	local sequence = 0
-	return {
-		Frame = frame,
-		Play = function(payload)
-			sequence += 1
-			local currentSequence = sequence
-			frame.Visible = true
-			text.TextTransparency = 1
-			text.Position = UDim2.fromScale(0.5, 0.4)
-			scale.Scale = 0.72
-			accent.BackgroundTransparency = 0
-			accent.Size = UDim2.fromOffset(0, 5)
-
-			TweenService:Create(text, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-				TextTransparency = 0,
-				Position = UDim2.fromScale(0.5, 0.38),
-			}):Play()
-			TweenService:Create(scale, TweenInfo.new(0.22, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-				Scale = 1,
-			}):Play()
-			TweenService:Create(accent, TweenInfo.new(0.24, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
-				Size = UDim2.fromOffset(300, 5),
-			}):Play()
-
-			task.delay(1, function()
-				if sequence ~= currentSequence or not frame.Parent then
-					return
-				end
-				TweenService:Create(text, TweenInfo.new(0.28, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
-					TextTransparency = 1,
-					Position = UDim2.fromScale(0.5, 0.35),
-				}):Play()
-				local accentFade = TweenService:Create(accent, TweenInfo.new(0.24), {
-					BackgroundTransparency = 1,
-					Size = UDim2.fromOffset(360, 5),
-				})
-				accentFade:Play()
-				accentFade.Completed:Wait()
-				if sequence == currentSequence then
-					frame.Visible = false
-				end
-			end)
-		end,
-	}
+local function GoalNotification(props)
+	if not props.Visible then return nil end
+	return React.createElement("Frame", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 100,
+	}, {
+		Panel = React.createElement("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.37),
+			Size = UDim2.fromScale(0.28, 0.13), BackgroundColor3 = Theme.Panel,
+			BackgroundTransparency = 0.08, BorderSizePixel = 0, ZIndex = 101,
+		}, {
+			Corner = ReactUI.Corner(8), Stroke = ReactUI.Stroke(Theme.AccentCyan, 2, 0.05),
+			Gradient = ReactUI.Gradient(Color3.fromRGB(17, 17, 55), Color3.fromRGB(7, 31, 63)),
+			Title = React.createElement("TextLabel", {
+				Position = UDim2.fromScale(0.08, 0.12), Size = UDim2.fromScale(0.84, 0.5),
+				BackgroundTransparency = 1, Font = Theme.Fonts.Display, Text = "GOAL",
+				TextColor3 = Theme.Text, TextScaled = true, ZIndex = 102,
+			}),
+			Caption = React.createElement("TextLabel", {
+				Position = UDim2.fromScale(0.12, 0.66), Size = UDim2.fromScale(0.76, 0.17),
+				BackgroundTransparency = 1, Font = Theme.Fonts.Navigation,
+				Text = "BEYOND 90 TRAINING", TextColor3 = Theme.AccentCyan, TextScaled = true, ZIndex = 102,
+			}),
+		}),
+	})
 end
 
 return GoalNotification

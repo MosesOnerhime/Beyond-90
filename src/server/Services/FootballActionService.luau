@@ -7,8 +7,8 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local BallConfig = require(Shared.Config.BallConfig)
 local BallControlMath = require(Shared.Football.BallControlMath)
 local FootballActionConfig = require(Shared.Config.FootballActionConfig)
+local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
 local GameConfig = require(Shared.Config.GameConfig)
-local GoalConfig = require(Shared.Config.GoalConfig)
 local PlayerConfig = require(Shared.Config.PlayerConfig)
 local FootballTeamEligibility = require(Shared.Football.FootballTeamEligibility)
 local PassPlanner = require(Shared.Football.PassPlanner)
@@ -183,6 +183,8 @@ local function sendFeedback(player: Player, accepted: boolean, reason: string?, 
 		HorizontalError = plan and plan.HorizontalError or 0,
 		VerticalError = plan and plan.VerticalError or 0,
 		Result = plan and plan.Result or "",
+		BodyAlignment = plan and plan.BodyAlignment or 0,
+		AlignmentErrorAlpha = plan and plan.AlignmentErrorAlpha or 0,
 	})
 end
 
@@ -364,6 +366,12 @@ local function releasePreparedShot(player: Player, clientActionId: string, relea
 	end
 	local ball = prepared.Ball
 	local plan = prepared.Plan
+	if plan.ActionType == "Shoot"
+		and player:GetAttribute(FootballTeamConfig.AttackingGoalAttributeName) ~= plan.GoalId
+	then
+		sendFeedback(player, false, "attacking-goal-changed", plan, "Shoot")
+		return
+	end
 	if not ball.Parent or not BallControlService.IsControlledBy(player, ball) then
 		sendFeedback(player, false, "shooter-no-possession", plan, "Shoot")
 		return
@@ -388,7 +396,7 @@ local function releasePreparedShot(player: Player, clientActionId: string, relea
 		return
 	end
 	log(string.format(
-		"[Shot] player=%s type=%s goal=%s distance=%.1f intended=%s final=%s horizontalError=%.2f verticalError=%.2f launchSpeed=%.1f verticalSpeed=%.1f skill=%.0f result=%s contact=%s",
+		"[Shot] player=%s type=%s goal=%s distance=%.1f intended=%s final=%s horizontalError=%.2f verticalError=%.2f bodyAlignment=%.2f alignmentError=%.2f launchSpeed=%.1f verticalSpeed=%.1f skill=%.0f result=%s contact=%s",
 		player.Name,
 		plan.ActionType,
 		plan.GoalId,
@@ -397,6 +405,8 @@ local function releasePreparedShot(player: Player, clientActionId: string, relea
 		tostring(plan.FinalGoalTarget or plan.TargetPosition),
 		plan.HorizontalError or 0,
 		plan.VerticalError or 0,
+		plan.BodyAlignment or 0,
+		plan.AlignmentErrorAlpha or 0,
 		plan.LaunchSpeed,
 		plan.VerticalLaunchSpeed,
 		(plan.ShootingSkill or 0) * 100,
@@ -424,7 +434,8 @@ local function handleShoot(player: Player, payload)
 		sendFeedback(player, false, "shooter-no-possession", nil, "Shoot")
 		return
 	end
-	if BallControlMath.GetHorizontal(ball.Position - rootPart.Position).Magnitude > FootballActionConfig.Shoot.ControlDistance then
+	local actionBallDistance = BallControlMath.GetHorizontal(ball.Position - rootPart.Position).Magnitude
+	if actionBallDistance > math.max(FootballActionConfig.Shoot.ControlDistance, FootballActionConfig.Shoot.ControlledTouchAllowance or 0) then
 		sendFeedback(player, false, "controlled-ball-out-of-range", nil, "Shoot")
 		return
 	end
@@ -435,10 +446,14 @@ local function handleShoot(player: Player, payload)
 
 	local goals = GoalService.GetGoals()
 	local aimDirection = getAimDirection(player, payload)
-	local configuredGoalId = player:GetAttribute("Beyond90AttackingGoalId")
-	local goalId = if typeof(configuredGoalId) == "string" and configuredGoalId ~= ""
-		then configuredGoalId
-		else GoalConfig.TrainingAttackingGoalId
+	local teamId = FootballTeamConfig.Normalize(player:GetAttribute(FootballTeamConfig.AttributeName))
+	local mapping = FootballTeamConfig.GetGoalMapping(teamId)
+	local configuredGoalId = player:GetAttribute(FootballTeamConfig.AttackingGoalAttributeName)
+	local goalId = if mapping and configuredGoalId == mapping.AttackingGoalId then configuredGoalId else nil
+	if not goalId then
+		sendFeedback(player, false, "attacking-goal-unassigned", nil, "Shoot")
+		return
+	end
 	local goal = goals[goalId]
 	if not goal then
 		sendFeedback(player, false, "goal-unavailable", nil, "Shoot")
@@ -447,9 +462,20 @@ local function handleShoot(player: Player, payload)
 	local goalDistance = if goal
 		then BallControlMath.GetHorizontal(goal.MouthCenter - ball.Position).Magnitude
 		else math.huge
+	local defendedGoal = goals[mapping.DefendedGoalId]
+	local attackingDirection = if defendedGoal
+		then BallControlMath.SafeUnit(
+			BallControlMath.GetHorizontal(goal.MouthCenter - defendedGoal.MouthCenter),
+			BallControlMath.GetHorizontal(goal.MouthCenter - ball.Position)
+		)
+		else BallControlMath.SafeUnit(BallControlMath.GetHorizontal(goal.MouthCenter - ball.Position), aimDirection)
+	local pitchCenter = if defendedGoal then (goal.MouthCenter + defendedGoal.MouthCenter) * 0.5 else goal.MouthCenter
+	local attackingHalfProgress = BallControlMath.GetHorizontal(ball.Position - pitchCenter):Dot(attackingDirection)
 	local plan, reason
-	if goalDistance > FootballActionConfig.Shoot.MaximumAttackingDistance then
-		plan = ShotPlanner.PlanClearance(ball.Position, aimDirection, FootballActionConfig.Shoot)
+	if attackingHalfProgress < (FootballActionConfig.Shoot.MinimumShotProgressStuds or 0)
+		or goalDistance > FootballActionConfig.Shoot.MaximumAttackingDistance
+	then
+		plan = ShotPlanner.PlanClearance(ball.Position, aimDirection, attackingDirection, FootballActionConfig.Shoot)
 		reason = nil
 	else
 		plan, reason = ShotPlanner.Plan(
@@ -458,7 +484,8 @@ local function handleShoot(player: Player, payload)
 			goal,
 			BallConfig.Radius,
 			FootballActionConfig.Shoot,
-			getShootingSkill(player)
+			getShootingSkill(player),
+			rootPart.CFrame.LookVector
 		)
 	end
 	if not plan then
@@ -505,7 +532,7 @@ local function handleKnockOn(player: Player, payload)
 
 	local ballDistance = BallControlMath.GetHorizontal(ball.Position - rootPart.Position).Magnitude
 
-	if ballDistance > actionConfig.ControlDistance then
+	if ballDistance > math.max(actionConfig.ControlDistance, actionConfig.ControlledTouchAllowance or 0) then
 		sendFeedback(player, false, "ball too far", nil)
 		return
 	end
@@ -514,9 +541,12 @@ local function handleKnockOn(player: Player, payload)
 	local requestedAimDirection = getAimDirection(player, payload)
 	local intensity = getHoldIntensity(actionConfig, holdDuration)
 	local playerHorizontalVelocity = BallControlMath.GetHorizontal(rootPart.AssemblyLinearVelocity)
-	local sprinting = rootPart.Parent
+	local sprintRequested = rootPart.Parent
 		and rootPart.Parent:FindFirstChildOfClass("Humanoid")
 		and (rootPart.Parent:FindFirstChildOfClass("Humanoid") :: Humanoid):GetAttribute("SprintRequested") == true
+	local sprintSpeedThreshold = PlayerConfig.Movement.BaseSpeed
+		+ (PlayerConfig.Movement.SprintSpeed - PlayerConfig.Movement.BaseSpeed) * 0.35
+	local sprinting = sprintRequested or playerHorizontalVelocity.Magnitude >= sprintSpeedThreshold
 	local predictionTime = if sprinting then actionConfig.SprintPredictionTime else actionConfig.JogPredictionTime
 	local additionalLead = (if sprinting then actionConfig.SprintAdditionalLead else actionConfig.JogAdditionalLead) * intensity
 	local targetSpeed = if sprinting then PlayerConfig.Movement.SprintSpeed else PlayerConfig.Movement.BaseSpeed

@@ -192,11 +192,8 @@ function PassTargetResolver.ConsumeSelection(actionType: string)
 		return nil
 	end
 	local selected = currentPlan
-	task.defer(function()
-		if currentPlan == selected then
-			setPlan(nil)
-		end
-	end)
+	-- The release path owns cleanup after the request has consumed this exact
+	-- receiver. Clearing here caused a one-frame line/receiver loss before send.
 	return selected
 end
 

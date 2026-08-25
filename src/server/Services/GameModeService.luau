@@ -1,10 +1,13 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local GameConfig = require(Shared.Config.GameConfig)
 local GameModeConfig = require(Shared.Config.GameModeConfig)
+local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
 local BallService = require(script.Parent.BallService)
+local GoalService = require(script.Parent.GoalService)
 
 local GameModeService = {}
 
@@ -20,6 +23,17 @@ local function getOrCreateRemote(name: string): RemoteEvent
 		return existing
 	end
 	local remote = Instance.new("RemoteEvent")
+	remote.Name = name
+	remote.Parent = modeFolder
+	return remote
+end
+
+local function getOrCreateRemoteFunction(name: string): RemoteFunction
+	local existing = modeFolder and modeFolder:FindFirstChild(name)
+	if existing and existing:IsA("RemoteFunction") then
+		return existing
+	end
+	local remote = Instance.new("RemoteFunction")
 	remote.Name = name
 	remote.Parent = modeFolder
 	return remote
@@ -46,16 +60,40 @@ function GameModeService.Initialize()
 	local requestRemote = getOrCreateRemote(GameModeConfig.RequestRemoteName)
 	local exitRemote = getOrCreateRemote(GameModeConfig.ExitRemoteName)
 	local resetRemote = getOrCreateRemote(GameModeConfig.ResetBallRemoteName)
-	requestRemote.OnServerEvent:Connect(function(player, requestedMode)
+	local pingRemote = getOrCreateRemoteFunction(GameModeConfig.PingRemoteName)
+	pingRemote.OnServerInvoke = function()
+		return Workspace:GetServerTimeNow()
+	end
+	requestRemote.OnServerEvent:Connect(function(player, request)
+		local requestedMode = if typeof(request) == "table" then request.Mode else request
+		local requestedTeam = if typeof(request) == "table" then FootballTeamConfig.Normalize(request.TeamId) else nil
 		local definition = typeof(requestedMode) == "string" and GameModeConfig.Modes[requestedMode] or nil
-		if not definition or definition.Enabled ~= true then
+		if not definition or definition.Enabled ~= true or requestedMode == "TrainingFree" and not requestedTeam then
 			return
 		end
+		local mapping = FootballTeamConfig.GetGoalMapping(requestedTeam)
+		if requestedMode == "TrainingFree" and not mapping then
+			return
+		end
+		local startingSession = next(activeTrainingPlayers) == nil
+		if startingSession then
+			GoalService.ResetScore()
+		end
+		player:SetAttribute(FootballTeamConfig.AttributeName, requestedTeam)
+		player:SetAttribute(FootballTeamConfig.AttackingGoalAttributeName, mapping and mapping.AttackingGoalId or nil)
+		player:SetAttribute(FootballTeamConfig.DefendedGoalAttributeName, mapping and mapping.DefendedGoalId or nil)
 		player:SetAttribute("Beyond90SelectedGameMode", requestedMode)
 		player:SetAttribute("Beyond90ExperienceState", "ModeLoading")
 		activeTrainingPlayers[player] = true
+		print(string.format("%s[GameMode] player=%s team=%s attacks=%s defends=%s", GameConfig.LogPrefix, player.Name, tostring(requestedTeam), tostring(mapping and mapping.AttackingGoalId), tostring(mapping and mapping.DefendedGoalId)))
 		BallService.SetSessionActive(true)
-		if not player.Character then
+		local existingCharacter = player.Character
+		if existingCharacter and (not existingCharacter.Parent or not existingCharacter:FindFirstChildOfClass("Humanoid")) then
+			player.Character = nil
+			existingCharacter:Destroy()
+			existingCharacter = nil
+		end
+		if not existingCharacter then
 			player:LoadCharacter()
 		end
 		task.spawn(function()
@@ -73,8 +111,13 @@ function GameModeService.Initialize()
 		activeTrainingPlayers[player] = nil
 		player:SetAttribute("Beyond90ExperienceState", "Menu")
 		player:SetAttribute("Beyond90SelectedGameMode", "Development")
+		player:SetAttribute(FootballTeamConfig.AttributeName, nil)
+		player:SetAttribute(FootballTeamConfig.AttackingGoalAttributeName, nil)
+		player:SetAttribute(FootballTeamConfig.DefendedGoalAttributeName, nil)
 		if player.Character then
-			player.Character:Destroy()
+			local character = player.Character
+			player.Character = nil
+			character:Destroy()
 		end
 		if next(activeTrainingPlayers) == nil then
 			BallService.SetSessionActive(false)

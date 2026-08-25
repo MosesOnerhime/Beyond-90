@@ -43,6 +43,10 @@ local lastReceptionAssistDiagnostic = 0
 local lastReceptionAssistPhase = ""
 local receptionFacingActive = false
 local receptionFacingDirection: Vector3? = nil
+local receptionFacingHoldUntil = 0
+local lastReceptionFacingDiagnosticAt = 0
+local actionFacingDirection: Vector3? = nil
+local actionFacingUntil = 0
 local jumpForce: VectorForce? = nil
 local jumpAttachment: Attachment? = nil
 local jumpStartedAt = 0
@@ -483,6 +487,9 @@ local function getReceptionAssist(
 	if passId ~= observedPassId then
 		observedPassId = passId
 		observedPassAt = now
+		receptionFacingDirection = nil
+		receptionFacingActive = false
+		receptionFacingHoldUntil = 0
 	end
 
 	local expiry = (if typeof(estimatedArrival) == "number" then estimatedArrival else 0) + config.ExpiryGraceTime
@@ -568,6 +575,16 @@ local function getLooseBallAssist(manualDirection: Vector3, manualMagnitude: num
 	if not config or config.Enabled ~= true or not currentRootPart or not ball or ball:GetAttribute("State") ~= "Free" then
 		return manualDirection, manualMagnitude, "", 0
 	end
+	if ball:GetAttribute("FootballControlPhase") == "KnockOnReleased"
+		and ball:GetAttribute("LastFootballActionPlayerUserId") == localPlayer.UserId
+	then
+		return manualDirection, manualMagnitude, "", 0
+	end
+	-- Assistance refines a chase the player has chosen. It must never create
+	-- movement from rest, which reads as the rolling ball pulling the footballer.
+	if manualMagnitude < (config.MinimumManualMagnitude or 0.08) then
+		return manualDirection, manualMagnitude, "", 0
+	end
 
 	local predictedBall = ball.Position
 		+ BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity) * config.PredictionTime
@@ -594,27 +611,51 @@ end
 local function updateReceptionFacing(deltaTime: number, phase: string)
 	local ball = getFootball()
 	local config = locomotionConfig.ReceptionAssist
-	local shouldFaceBall = (phase == "Brake" or phase == "Receive")
+	local shouldFaceBall = (phase == "Approach" or phase == "Brake" or phase == "Receive")
 		and currentRootPart ~= nil
 		and ball ~= nil
 		and BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity).Magnitude >= config.FacingMinimumBallSpeed
 
-	if not shouldFaceBall then
+	local now = os.clock()
+	if not shouldFaceBall and not (receptionFacingActive and now < receptionFacingHoldUntil) then
 		if receptionFacingActive and currentHumanoid then
 			currentHumanoid.AutoRotate = movementConfig.AutoRotate
 		end
 		receptionFacingActive = false
 		receptionFacingDirection = nil
+		receptionFacingHoldUntil = 0
 		return
 	end
 
 	local rootPart = currentRootPart :: BasePart
-	local incoming = BallControlMath.SafeUnit(
-		-BallControlMath.GetHorizontal((ball :: BasePart).AssemblyLinearVelocity),
-		BallControlMath.GetHorizontal(rootPart.CFrame.LookVector)
+	local incomingVelocity = BallControlMath.GetHorizontal((ball :: BasePart).AssemblyLinearVelocity)
+	local receiverToBall = BallControlMath.GetHorizontal((ball :: BasePart).Position - rootPart.Position)
+	local sourceDirection = BallControlMath.SafeUnit(
+		-incomingVelocity,
+		BallControlMath.SafeUnit(receiverToBall, BallControlMath.GetHorizontal(rootPart.CFrame.LookVector))
 	)
+	local receiverDirection = BallControlMath.SafeUnit(receiverToBall, sourceDirection)
+	-- Lock toward the source of the pass before the ball reaches the receiver. If a
+	-- replicated sample is already beyond the contact plane, velocity still preserves
+	-- the correct incoming side and prevents the previous 178-180 degree reversal.
+	local incoming = if receiverToBall.Magnitude > 0.15 and receiverDirection:Dot(sourceDirection) > 0.15
+		then BallControlMath.SafeUnit(sourceDirection:Lerp(receiverDirection, 0.35), sourceDirection)
+		else sourceDirection
+	if shouldFaceBall then
+		receptionFacingHoldUntil = now + (config.PostContactFacingHold or 0.3)
+	end
 	if not receptionFacingDirection then
 		receptionFacingDirection = incoming
+		if now - lastReceptionFacingDiagnosticAt >= (config.FacingDiagnosticInterval or 0.75) then
+			lastReceptionFacingDiagnosticAt = now
+			local currentFacing = BallControlMath.SafeUnit(BallControlMath.GetHorizontal(rootPart.CFrame.LookVector), incoming)
+			local facingDot = math.clamp(currentFacing:Dot(incoming), -1, 1)
+			log(string.format(
+				"[ReceptionFacing] incomingVelocity=%s receiverToBall=%s desiredReceptionFacing=%s currentFacing=%s facingDot=%.3f facingAngle=%.1f",
+				tostring(incomingVelocity), tostring(receiverToBall), tostring(incoming), tostring(currentFacing),
+				facingDot, math.deg(math.acos(facingDot))
+			))
+		end
 	elseif phase == "Brake" then
 		local dot = math.clamp((receptionFacingDirection :: Vector3):Dot(incoming), -1, 1)
 		if math.deg(math.acos(dot)) >= (config.FacingRelockAngle or 35) then
@@ -630,6 +671,30 @@ local function updateReceptionFacing(deltaTime: number, phase: string)
 	end
 	rootPart.CFrame = CFrame.lookAt(rootPart.Position, rootPart.Position + facing, Vector3.yAxis)
 	receptionFacingActive = true
+end
+
+local function updateActionFacing(deltaTime: number)
+	local now = os.clock()
+	local rootPart = currentRootPart
+	local desired = actionFacingDirection
+	if not rootPart or not desired or now >= actionFacingUntil then
+		if desired and now >= actionFacingUntil then
+			actionFacingDirection = nil
+			actionFacingUntil = 0
+			if currentHumanoid and not receptionFacingActive then
+				currentHumanoid.AutoRotate = movementConfig.AutoRotate
+			end
+		end
+		return
+	end
+
+	local current = BallControlMath.SafeUnit(BallControlMath.GetHorizontal(rootPart.CFrame.LookVector), desired)
+	local alpha = 1 - math.exp(-20 * deltaTime)
+	local facing = BallControlMath.SafeUnit(current:Lerp(desired, alpha), desired)
+	if currentHumanoid then
+		currentHumanoid.AutoRotate = false
+	end
+	rootPart.CFrame = CFrame.lookAt(rootPart.Position, rootPart.Position + facing, Vector3.yAxis)
 end
 
 local function updateLocomotion(deltaTime: number)
@@ -658,6 +723,7 @@ local function updateLocomotion(deltaTime: number)
 		rawDirection, rawMagnitude, receptionPhase, receptionWeight = getLooseBallAssist(rawDirection, rawMagnitude)
 	end
 	updateReceptionFacing(deltaTime, receptionPhase)
+	updateActionFacing(deltaTime)
 	if localPlayer:GetAttribute("Beyond90MenuOpen") == true then
 		inputDirection = Vector3.zero
 		inputMagnitude = 0
@@ -889,6 +955,15 @@ function MovementController.GetLocomotionState()
 	}
 end
 
+function MovementController.FaceActionDirection(direction: Vector3, duration: number?)
+	local horizontal = BallControlMath.GetHorizontal(direction)
+	if horizontal.Magnitude <= 0.05 then
+		return
+	end
+	actionFacingDirection = horizontal.Unit
+	actionFacingUntil = os.clock() + math.max(duration or 0.38, 0.05)
+end
+
 function MovementController.BeginActionMovement(profileName: string): boolean
 	local profile = locomotionConfig.ActionMovement[profileName]
 
@@ -922,6 +997,8 @@ function MovementController.CancelActionMovement(profileName: string?)
 	actionBrakeEnd = 0
 	actionLockEnd = 0
 	actionExitEnd = 0
+	actionFacingDirection = nil
+	actionFacingUntil = 0
 	movementMode = "Normal"
 end
 
