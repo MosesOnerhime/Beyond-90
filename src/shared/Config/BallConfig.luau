@@ -26,14 +26,14 @@ local BallConfig = {
 
 	Bounce = {
 		Enabled = true,
-		-- Long balls should produce one readable arcade bounce, then settle
-		-- into a roll instead of beginning another high aerial phase.
-		Restitution = 0.32,
+		-- Grass retains believable energy without allowing a hard clearance to
+		-- begin another high aerial phase after its first bounce.
+		Restitution = 0.48,
 		AirborneGravity = WorldScaleConfig.MetersToStuds(9.81),
-		LinearBounceLoss = WorldScaleConfig.MetersToStuds(0.3),
-		MinimumImpactSpeed = WorldScaleConfig.MetersToStuds(0.7),
-		SettleReboundSpeed = WorldScaleConfig.MetersToStuds(0.9),
-		MaximumReboundSpeed = WorldScaleConfig.MetersToStuds(3.6),
+		LinearBounceLoss = WorldScaleConfig.MetersToStuds(0.4),
+		MinimumImpactSpeed = WorldScaleConfig.MetersToStuds(0.65),
+		SettleReboundSpeed = WorldScaleConfig.MetersToStuds(0.7),
+		MaximumReboundSpeed = WorldScaleConfig.MetersToStuds(4.8),
 		ContactTolerance = 0.18,
 		SurfaceNormalMinUpDot = 0.65,
 		Cooldown = 0.045,

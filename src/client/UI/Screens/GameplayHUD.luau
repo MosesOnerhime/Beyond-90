@@ -161,12 +161,12 @@ local function Minimap()
 	end
 	return panel({
 		AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromScale(0.5, 0.965),
-		Size = UDim2.fromScale(if mobile then 0.135 else 0.11, if mobile then 0.205 else 0.145),
+		Size = UDim2.fromScale(if mobile then 0.16 else 0.125, if mobile then 0.23 else 0.16),
 		BackgroundColor3 = Color3.fromRGB(3, 10, 18),
 		BackgroundTransparency = 0.3,
 	}, {
 		AspectRatio = React.createElement("UIAspectRatioConstraint", {
-			AspectRatio = 1.4,
+			AspectRatio = 1.5,
 			DominantAxis = Enum.DominantAxis.Height,
 		}),
 		Pitch = React.createElement("Frame", {
@@ -240,10 +240,17 @@ local function TouchActionButton(props)
 end
 
 local function MobileTouchControls()
+	local touchpadDiameter = 118
+	local knobDiameter = 46
+	local movementRadius = touchpadDiameter * 0.58
+	local joystickExtent = movementRadius + knobDiameter * 0.5
+	local rootRef = React.useRef(nil)
 	local padRef = React.useRef(nil)
+	local padCenterRef = React.useRef(nil)
 	local activeTouchRef = React.useRef(nil)
 	local hideVersionRef = React.useRef(0)
 	local padTweenRef = React.useRef(nil)
+	local padPosition, setPadPosition = React.useState(UDim2.fromScale(0.13, 0.6))
 	local knobOffset, setKnobOffset = React.useState(Vector2.zero)
 	local function fadePad(visible: boolean)
 		local pad = padRef.current
@@ -273,12 +280,28 @@ local function MobileTouchControls()
 	local function updateTouch(position: Vector3)
 		local pad = padRef.current
 		if not pad then return end
-		local center = pad.AbsolutePosition + pad.AbsoluteSize * 0.5
-		local radius = math.max(math.min(pad.AbsoluteSize.X, pad.AbsoluteSize.Y) * 0.37, 1)
+		local center = padCenterRef.current or (pad.AbsolutePosition + pad.AbsoluteSize * 0.5)
+		local radius = math.max(movementRadius, 1)
 		local delta = Vector2.new(position.X, position.Y) - center
 		if delta.Magnitude > radius then delta = delta.Unit * radius end
 		setKnobOffset(delta)
 		InputController.SetTouchMoveVector(Vector2.new(delta.X / radius, -delta.Y / radius))
+	end
+	local function beginTouch(input)
+		if input.UserInputType ~= Enum.UserInputType.Touch or activeTouchRef.current then return end
+		local root = rootRef.current
+		if not root then return end
+		local localTouch = Vector2.new(input.Position.X, input.Position.Y) - root.AbsolutePosition
+		local center = Vector2.new(
+			math.clamp(localTouch.X, joystickExtent, math.max(joystickExtent, root.AbsoluteSize.X * 0.5 - joystickExtent)),
+			math.clamp(localTouch.Y, joystickExtent, math.max(joystickExtent, root.AbsoluteSize.Y - joystickExtent))
+		)
+		padCenterRef.current = root.AbsolutePosition + center
+		setPadPosition(UDim2.fromOffset(center.X, center.Y))
+		setKnobOffset(Vector2.zero)
+		InputController.SetTouchMoveVector(Vector2.zero)
+		showPad()
+		activeTouchRef.current = input
 	end
 	React.useEffect(function()
 		schedulePadHide()
@@ -298,21 +321,27 @@ local function MobileTouchControls()
 			changed:Disconnect()
 			ended:Disconnect()
 			activeTouchRef.current = nil
+			padCenterRef.current = nil
 			InputController.ReleaseTouchInputs()
 		end
 	end, {})
 	return React.createElement("Frame", {
-		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 30,
+		ref = rootRef, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 30,
 	}, {
-		Touchpad = React.createElement("CanvasGroup", {
-			ref = padRef, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.13, 0.60),
-			Size = UDim2.fromOffset(118, 118), BackgroundColor3 = Color3.fromRGB(4, 13, 29),
-			BackgroundTransparency = 0.35, BorderSizePixel = 0, Active = true, GroupTransparency = 0, ZIndex = 31,
+		LeftTouchCapture = React.createElement("Frame", {
+			Size = UDim2.fromScale(0.5, 1), BackgroundTransparency = 1,
+			BorderSizePixel = 0, Active = true, ZIndex = 30,
 			[React.Event.InputBegan] = function(_, input)
-				if input.UserInputType ~= Enum.UserInputType.Touch or activeTouchRef.current then return end
-				showPad()
-				activeTouchRef.current = input
-				updateTouch(input.Position)
+				beginTouch(input)
+			end,
+		}),
+		Touchpad = React.createElement("CanvasGroup", {
+			ref = padRef, AnchorPoint = Vector2.new(0.5, 0.5), Position = padPosition,
+			Size = UDim2.fromOffset(touchpadDiameter, touchpadDiameter), BackgroundColor3 = Color3.fromRGB(4, 13, 29),
+			BackgroundTransparency = 0.35, BorderSizePixel = 0, Active = true,
+			ClipsDescendants = false, GroupTransparency = 0, ZIndex = 31,
+			[React.Event.InputBegan] = function(_, input)
+				beginTouch(input)
 			end,
 		}, {
 			Corner = ReactUI.Corner(100),
@@ -323,15 +352,20 @@ local function MobileTouchControls()
 			}, { Corner = ReactUI.Corner(100), Stroke = ReactUI.Stroke(Color3.fromRGB(97, 128, 169), 1, 0.58) }),
 			Knob = React.createElement("Frame", {
 				AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, knobOffset.X, 0.5, knobOffset.Y),
-				Size = UDim2.fromOffset(48, 48), BackgroundColor3 = Color3.fromRGB(31, 81, 133),
+				Size = UDim2.fromOffset(knobDiameter, knobDiameter), BackgroundColor3 = Color3.fromRGB(31, 81, 133),
 				BackgroundTransparency = 0.08, BorderSizePixel = 0, ZIndex = 32,
 			}, { Corner = ReactUI.Corner(100), Stroke = ReactUI.Stroke(Theme.AccentCyan, 1.5, 0.24) }),
 		}),
-		Shoot = React.createElement(TouchActionButton, { Position = UDim2.fromScale(0.94, 0.73), Size = UDim2.fromOffset(82, 82), Text = "SHOOT", TextSize = 12, OnChanged = function(value) InputController.SetTouchFootballAction("Shoot", value) end }),
-		Pass = React.createElement(TouchActionButton, { Position = UDim2.fromScale(0.84, 0.84), Size = UDim2.fromOffset(72, 72), Text = "PASS", OnChanged = function(value) InputController.SetTouchFootballAction("GroundPass", value) end }),
-		Through = React.createElement(TouchActionButton, { Position = UDim2.fromScale(0.95, 0.89), Size = UDim2.fromOffset(66, 66), Text = "THRU", OnChanged = function(value) InputController.SetTouchFootballAction("ThroughPass", value) end }),
-		KnockOn = React.createElement(TouchActionButton, { Position = UDim2.fromScale(0.76, 0.72), Size = UDim2.fromOffset(62, 62), Text = "PUSH", OnChanged = function(value) InputController.SetTouchFootballAction("KnockOn", value) end }),
-		Sprint = React.createElement(TouchActionButton, { Position = UDim2.fromScale(0.7, 0.87), Size = UDim2.fromOffset(78, 58), Text = "SPRINT", OnChanged = InputController.SetTouchSprint }),
+		ActionCluster = React.createElement("Frame", {
+			AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -12, 1, -12),
+			Size = UDim2.fromOffset(230, 220), BackgroundTransparency = 1, ZIndex = 31,
+		}, {
+			Through = React.createElement(TouchActionButton, { Position = UDim2.fromOffset(72, 76), Size = UDim2.fromOffset(66, 66), Text = "THROUGH", TextSize = 9, OnChanged = function(value) InputController.SetTouchFootballAction("ThroughPass", value) end }),
+			Shoot = React.createElement(TouchActionButton, { Position = UDim2.fromOffset(174, 50), Size = UDim2.fromOffset(76, 76), Text = "SHOOT", TextSize = 12, OnChanged = function(value) InputController.SetTouchFootballAction("Shoot", value) end }),
+			Pass = React.createElement(TouchActionButton, { Position = UDim2.fromOffset(72, 162), Size = UDim2.fromOffset(72, 72), Text = "PASS", OnChanged = function(value) InputController.SetTouchFootballAction("GroundPass", value) end }),
+			Sprint = React.createElement(TouchActionButton, { Position = UDim2.fromOffset(174, 148), Size = UDim2.fromOffset(82, 72), Text = "DASH", OnChanged = InputController.SetTouchSprint }),
+			KnockOn = React.createElement(TouchActionButton, { Position = UDim2.fromOffset(8, 126), Size = UDim2.fromOffset(58, 58), Text = "PUSH", TextSize = 9, OnChanged = function(value) InputController.SetTouchFootballAction("KnockOn", value) end }),
+		}),
 	})
 end
 
@@ -422,7 +456,8 @@ local function GameplayHUD(props)
 		BackgroundTransparency = 1,
 	}, {
 		Scoreboard = React.createElement("Frame", {
-			Position = UDim2.fromScale(0.115, 0.018), Size = UDim2.fromScale(0.255, 0.068),
+			Position = UDim2.fromScale(if mobile then 0.2 else 0.115, if mobile then 0.025 else 0.018),
+			Size = UDim2.fromScale(if mobile then 0.36 else 0.255, if mobile then 0.075 else 0.068),
 			BackgroundTransparency = 1,
 		}, {
 			BrandClock = panel({ Size = UDim2.fromScale(0.24, 1) }, {
@@ -486,20 +521,38 @@ local function GameplayHUD(props)
 			Slot2 = React.createElement("ImageLabel", { LayoutOrder = 2, Size = UDim2.fromScale(0.24, 0.72), BackgroundTransparency = 1, Image = Assets.HUD.Locks[2], ScaleType = Enum.ScaleType.Fit }),
 			Slot3 = React.createElement("ImageLabel", { LayoutOrder = 3, Size = UDim2.fromScale(0.24, 0.72), BackgroundTransparency = 1, Image = Assets.HUD.Locks[3], ScaleType = Enum.ScaleType.Fit }),
 		}),
-		Reset = React.createElement("TextButton", {
+		Reset = not mobile and React.createElement("TextButton", {
 			AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(0.885, 0.071),
 			Size = UDim2.fromScale(0.078, 0.037), BackgroundColor3 = Color3.fromRGB(10, 17, 35),
 			BackgroundTransparency = 0.08, BorderSizePixel = 0, Font = Enum.Font.GothamMedium,
 			Text = "RESET BALL", TextColor3 = Color3.fromRGB(220, 227, 242), TextSize = 11,
 			[React.Event.Activated] = props.ResetBall,
 		}, { Corner = ReactUI.Corner(4), Stroke = ReactUI.Stroke(Color3.fromRGB(74, 88, 122), 1, 0.5) }),
-		Return = React.createElement("TextButton", {
+		Return = not mobile and React.createElement("TextButton", {
 			AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(0.982, 0.071),
 			Size = UDim2.fromScale(0.09, 0.037), BackgroundColor3 = Color3.fromRGB(10, 17, 35),
 			BackgroundTransparency = 0.08, BorderSizePixel = 0, Font = Enum.Font.GothamMedium,
 			Text = "RETURN TO MENU", TextColor3 = Color3.fromRGB(220, 227, 242), TextSize = 11,
 			[React.Event.Activated] = props.ReturnToMenu,
 		}, { Corner = ReactUI.Corner(4), Stroke = ReactUI.Stroke(Color3.fromRGB(74, 88, 122), 1, 0.5) }),
+		MobileUtilities = mobile and React.createElement("Frame", {
+			AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 60),
+			Size = UDim2.fromOffset(214, 36), BackgroundTransparency = 1,
+		}, {
+			Reset = React.createElement("TextButton", {
+				Size = UDim2.fromOffset(98, 36), BackgroundColor3 = Color3.fromRGB(7, 17, 35),
+				BackgroundTransparency = 0.12, BorderSizePixel = 0, AutoButtonColor = false,
+				Font = Theme.Fonts.Navigation, Text = "RESET BALL", TextColor3 = Color3.fromRGB(226, 235, 249),
+				TextSize = 10, [React.Event.Activated] = props.ResetBall,
+			}, { Corner = ReactUI.Corner(5), Stroke = ReactUI.Stroke(Color3.fromRGB(83, 113, 153), 1, 0.38) }),
+			Return = React.createElement("TextButton", {
+				AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(1, 0), Size = UDim2.fromOffset(108, 36),
+				BackgroundColor3 = Color3.fromRGB(7, 17, 35), BackgroundTransparency = 0.12,
+				BorderSizePixel = 0, AutoButtonColor = false, Font = Theme.Fonts.Navigation,
+				Text = "RETURN TO MENU", TextColor3 = Color3.fromRGB(226, 235, 249), TextSize = 9,
+				[React.Event.Activated] = props.ReturnToMenu,
+			}, { Corner = ReactUI.Corner(5), Stroke = ReactUI.Stroke(Color3.fromRGB(83, 113, 153), 1, 0.38) }),
+		}),
 		MobileControls = mobile and React.createElement(MobileTouchControls) or nil,
 	})
 end

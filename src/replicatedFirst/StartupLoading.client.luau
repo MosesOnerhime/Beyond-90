@@ -96,6 +96,8 @@ logo.Position = UDim2.fromScale(0.5, 0.48)
 logo.Size = UDim2.new(0.46, 0, 0.3, 0)
 logo.BackgroundTransparency = 1
 logo.GroupTransparency = 1
+logo.ClipsDescendants = true
+logo.Visible = false
 logo.Parent = background
 
 -- Roblox serves this 1536x1024 source at 1024x683. Split the logo into two
@@ -223,6 +225,10 @@ tween(brand, 0.9, { TextTransparency = 1 }, Enum.EasingStyle.Quad)
 tween(presents, 0.8, { TextTransparency = 1 }, Enum.EasingStyle.Quad)
 tween(accent, 0.8, { Size = UDim2.fromOffset(0, 2), BackgroundTransparency = 1 }, Enum.EasingStyle.Quad)
 task.wait(1.05)
+brand.Visible = false
+presents.Visible = false
+accent.Visible = false
+task.wait(0.3)
 
 if sting then
 	sting.TimePosition = 0
@@ -234,6 +240,7 @@ print(string.format(
 	tostring(sting ~= nil and sting.Playing),
 	if sting then sting.Volume else 0
 ))
+logo.Visible = true
 tween(logo, 1.35, { GroupTransparency = 0 }, Enum.EasingStyle.Sine)
 tween(logoScale, 2.8, { Scale = 1 }, Enum.EasingStyle.Sine)
 task.wait(3.75)

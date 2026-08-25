@@ -1,4 +1,5 @@
 local Players = game:GetService("Players")
+local GuiService = game:GetService("GuiService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
@@ -277,6 +278,8 @@ local function HomeScreen(props)
 	local selectedNavigation, setSelectedNavigation = React.useState(1)
 	local rootRef = React.useRef(nil)
 	local mobile = UserInputService.TouchEnabled
+	local topLeftInset = GuiService:GetGuiInset()
+	local footerInset = if mobile then topLeftInset.Y else 0
 	React.useEffect(function()
 		task.spawn(function()
 			local headOk, headImage = pcall(function()
@@ -480,20 +483,27 @@ local function HomeScreen(props)
 			}),
 		}),
 		Navigation = React.createElement("Frame", {
-			AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromScale(0.5, if mobile then 0.88 else 0.875),
+			AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromScale(0.5, if mobile then 0.86 else 0.875),
 			Size = UDim2.fromScale(if mobile then 0.95 else 0.9, if mobile then 0.15 else 0.135), BackgroundTransparency = 1, ZIndex = 5,
 		}, navChildren),
 		FooterFade = React.createElement("Frame", {
-			AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, if mobile then 0.89 else 0.9), Size = UDim2.fromScale(1, if mobile then 0.2 else 0.18),
+			AnchorPoint = Vector2.new(0, 1),
+			Position = UDim2.new(0, 0, if mobile then 1 else 0.9, footerInset),
+			Size = UDim2.new(1, 0, if mobile then 0.3 else 0.18, footerInset),
 			BackgroundColor3 = Color3.fromRGB(1, 5, 17), BorderSizePixel = 0, ZIndex = 2,
 		}, {
-			Gradient = React.createElement("UIGradient", { Rotation = 90, Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0.72), NumberSequenceKeypoint.new(1, 0.04) }) }),
+			Gradient = React.createElement("UIGradient", { Rotation = 90, Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.42, 0.76), NumberSequenceKeypoint.new(0.72, 0.3), NumberSequenceKeypoint.new(1, 0.04) }) }),
 		}),
 		Footer = React.createElement("Frame", {
-			Position = UDim2.fromScale(0, if mobile then 0.87 else 0.9), Size = UDim2.fromScale(1, if mobile then 0.13 else 0.1),
+			AnchorPoint = if mobile then Vector2.new(0, 1) else Vector2.zero,
+			Position = UDim2.new(0, 0, if mobile then 1 else 0.9, footerInset),
+			Size = UDim2.new(1, 0, if mobile then 0.14 else 0.1, footerInset),
 			BackgroundColor3 = Color3.fromRGB(1, 5, 17), BackgroundTransparency = 0.02,
 			BorderSizePixel = 0, ZIndex = 6,
 		}, {
+			Content = React.createElement("Frame", {
+				Size = UDim2.new(1, 0, 1, -footerInset), BackgroundTransparency = 1,
+			}, {
 			SelectGlyph = React.createElement("ImageLabel", { Position = UDim2.fromScale(if mobile then 0.025 else 0.035, if mobile then 0.24 else 0.2), Size = UDim2.fromOffset(if mobile then 22 else 28, if mobile then 22 else 28), BackgroundTransparency = 1, Image = Assets.Menu.Select, ScaleType = Enum.ScaleType.Fit }),
 			Select = not mobile and text({ Position = UDim2.fromScale(0.06, 0.22), Size = UDim2.fromScale(0.06, 0.5), Font = Enum.Font.GothamMedium, Text = "SELECT", TextColor3 = Theme.MutedText, TextSize = 11 }) or nil,
 			OpenMenuIcon = Assets.Menu.OpenMenu ~= "" and React.createElement("ImageLabel", { Position = UDim2.fromScale(if mobile then 0.075 else 0.118, if mobile then 0.27 else 0.27), Size = UDim2.fromOffset(20, 20), BackgroundTransparency = 1, Image = Assets.Menu.OpenMenu, ScaleType = Enum.ScaleType.Fit }) or panel({ Position = UDim2.fromScale(if mobile then 0.075 else 0.118, 0.27), Size = UDim2.fromOffset(20, 20), BackgroundTransparency = 0.2 }, {
@@ -511,6 +521,7 @@ local function HomeScreen(props)
 			}),
 			Network = panel({ Position = UDim2.fromScale(if mobile then 0.92 else 0.937, 0.16), Size = UDim2.fromScale(if mobile then 0.065 else 0.047, 0.64), BackgroundColor3 = Color3.fromRGB(2, 8, 26), BackgroundTransparency = 0.02 }, {
 				Icon = React.createElement("ImageLabel", { Position = UDim2.fromScale(0.13, 0.13), Size = UDim2.fromScale(0.74, 0.74), BackgroundTransparency = 1, Image = Assets.Social.Network, ScaleType = Enum.ScaleType.Fit }),
+			}),
 			}),
 		}),
 	})

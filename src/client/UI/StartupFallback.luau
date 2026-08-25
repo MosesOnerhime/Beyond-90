@@ -93,6 +93,8 @@ function StartupFallback.Run()
 	logo.Size = UDim2.new(0.46, 0, 0.3, 0)
 	logo.BackgroundTransparency = 1
 	logo.GroupTransparency = 1
+	logo.ClipsDescendants = true
+	logo.Visible = false
 	logo.Parent = background
 	local logoBeyond = Instance.new("ImageLabel")
 	logoBeyond.Position = UDim2.fromScale(0.01, 0.31)
@@ -159,6 +161,9 @@ function StartupFallback.Run()
 	tween(brand, 0.9, { TextTransparency = 1 }, Enum.EasingStyle.Quad)
 	tween(presents, 0.8, { TextTransparency = 1 }, Enum.EasingStyle.Quad)
 	task.wait(1.05)
+	brand.Visible = false
+	presents.Visible = false
+	task.wait(0.3)
 
 	if sting then
 		sting.TimePosition = 0
@@ -169,6 +174,7 @@ function StartupFallback.Run()
 		if sting then sting.SoundId else "unavailable",
 		tostring(sting ~= nil and sting.Playing)
 	))
+	logo.Visible = true
 	tween(logo, 1.35, { GroupTransparency = 0 }, Enum.EasingStyle.Sine)
 	tween(logoScale, 2.8, { Scale = 1 }, Enum.EasingStyle.Sine)
 	task.wait(3.75)

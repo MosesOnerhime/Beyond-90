@@ -36,10 +36,10 @@ function PitchCoordinateTransform.Project(
 ): Vector2
 	local attackSign = PitchCoordinateTransform.GetAttackSign(transform, defendingGoalPosition, attackingGoalPosition)
 	local offset = BallControlMath.GetHorizontal(worldPosition - transform.Center)
-	-- Keep the controlled team's attacking goal on the left, matching the
-	-- broadcast camera orientation. Both axes rotate together when teams swap.
+	-- Keep the attacking goal on the left while preserving the stadium's width
+	-- orientation. The broadcast camera remains on the same sideline.
 	local lengthCoordinate = offset:Dot(transform.LengthAxis) / transform.Length * attackSign
-	local widthCoordinate = offset:Dot(transform.WidthAxis) / transform.Width * attackSign
+	local widthCoordinate = offset:Dot(transform.WidthAxis) / transform.Width
 	return Vector2.new(
 		math.clamp(0.5 - lengthCoordinate, 0.025, 0.975),
 		math.clamp(0.5 + widthCoordinate, 0.04, 0.96)

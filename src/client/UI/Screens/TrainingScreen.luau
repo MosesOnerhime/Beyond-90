@@ -1,3 +1,4 @@
+local GuiService = game:GetService("GuiService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 
@@ -48,6 +49,8 @@ end
 local function TrainingScreen(props)
 	local selected, setSelected = React.useState(false)
 	local mobile = UserInputService.TouchEnabled
+	local topLeftInset = GuiService:GetGuiInset()
+	local footerInset = if mobile then topLeftInset.Y else 0
 	local cards = {
 		{ "TRAINING", "Free Practice", Assets.Navigation.Training, true },
 		{ "QUICK 3V3", "Fast competitive football", Assets.Navigation.Play, false },
@@ -124,21 +127,27 @@ local function TrainingScreen(props)
 			}),
 		}) or nil,
 		FooterFade = React.createElement("Frame", {
-			AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, if mobile then 0.85 else 0.87), Size = UDim2.fromScale(1, if mobile then 0.25 else 0.22),
+			AnchorPoint = Vector2.new(0, 1),
+			Position = UDim2.new(0, 0, if mobile then 1 else 0.87, footerInset),
+			Size = UDim2.new(1, 0, if mobile then 0.3 else 0.22, footerInset),
 			BackgroundColor3 = Color3.fromRGB(1, 5, 17), BorderSizePixel = 0, ZIndex = 1,
 		}, {
-			Gradient = React.createElement("UIGradient", { Rotation = 90, Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0.72), NumberSequenceKeypoint.new(1, 0.04) }) }),
+			Gradient = React.createElement("UIGradient", { Rotation = 90, Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.42, 0.76), NumberSequenceKeypoint.new(0.72, 0.3), NumberSequenceKeypoint.new(1, 0.04) }) }),
 		}),
 		Footer = React.createElement("Frame", {
-			Position = UDim2.fromScale(0, if mobile then 0.85 else 0.87), Size = UDim2.fromScale(1, if mobile then 0.15 else 0.13),
+			AnchorPoint = if mobile then Vector2.new(0, 1) else Vector2.zero,
+			Position = UDim2.new(0, 0, if mobile then 1 else 0.87, footerInset),
+			Size = UDim2.new(1, 0, if mobile then 0.14 else 0.13, footerInset),
 			BackgroundColor3 = Color3.fromRGB(1, 5, 17), BackgroundTransparency = 0.02,
 			BorderSizePixel = 0, ZIndex = 6,
 		}, {
-			Back = React.createElement("TextButton", {
-				Position = UDim2.fromScale(0.035, if mobile then 0.13 else 0.18), Size = UDim2.fromScale(if mobile then 0.2 else 0.1, if mobile then 0.7 else 0.58),
-				BackgroundTransparency = 1, Font = Theme.Fonts.Navigation, Text = "<  BACK",
-				TextColor3 = Theme.MutedText, TextSize = if mobile then 12 else 13, ZIndex = 7,
-				[React.Event.Activated] = props.GoHome,
+			Content = React.createElement("Frame", { Size = UDim2.new(1, 0, 1, -footerInset), BackgroundTransparency = 1 }, {
+				Back = React.createElement("TextButton", {
+					Position = UDim2.fromScale(0.035, if mobile then 0.13 else 0.18), Size = UDim2.fromScale(if mobile then 0.2 else 0.1, if mobile then 0.7 else 0.58),
+					BackgroundTransparency = 1, Font = Theme.Fonts.Navigation, Text = "<  BACK",
+					TextColor3 = Theme.MutedText, TextSize = if mobile then 12 else 13, ZIndex = 7,
+					[React.Event.Activated] = props.GoHome,
+				}),
 			}),
 		}),
 	})
