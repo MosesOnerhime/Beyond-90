@@ -1,3 +1,6 @@
 ref/
 temp/GameplayFootball/
 Packages/
+
+# Local visual-QA captures (never committed, never uploaded)
+scratchpad/

@@ -3,6 +3,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
+local DevToolsConfig = require(Shared.Config.DevToolsConfig)
 local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local AnimationController = require(script.Parent:WaitForChild("AnimationController"))
@@ -29,6 +30,97 @@ local shootingSkillRemote: RemoteEvent? = nil
 local connections: { RBXScriptConnection } = {}
 local heldActions: { [string]: number } = {}
 local meters = {}
+local devToolsRemote: RemoteEvent? = nil
+local aiCountLabels: { [string]: TextLabel } = {}
+local goalkeeperLabels: { [string]: TextLabel } = {}
+local matchDiagnosticsLabel: TextLabel? = nil
+local dribblingSkillLabel: TextLabel? = nil
+
+local function sendDevRequest(action: string, extra: { [string]: any }?)
+	if not devToolsRemote then
+		return
+	end
+	local payload = { Action = action }
+	if extra then
+		for key, value in extra do
+			payload[key] = value
+		end
+	end
+	devToolsRemote:FireServer(payload)
+end
+
+-- Compact section header so the panel stays readable as tools are added.
+local function createSectionHeader(parent: Instance, text: string, position: UDim2): TextLabel
+	local header = Instance.new("TextLabel")
+	header.Name = text .. "Header"
+	header.Position = position
+	header.Size = UDim2.fromOffset(290, 18)
+	header.BackgroundTransparency = 1
+	header.Font = Enum.Font.GothamBold
+	header.Text = text
+	header.TextColor3 = Color3.fromRGB(67, 218, 255)
+	header.TextSize = 11
+	header.TextXAlignment = Enum.TextXAlignment.Left
+	header.Parent = parent
+	return header
+end
+
+-- [-] value [+] row, used for AI counts and Dribbling Skill.
+local function createStepperRow(
+	parent: Instance,
+	name: string,
+	title: string,
+	position: UDim2,
+	onDelta: (number) -> ()
+): TextLabel
+	local container = Instance.new("Frame")
+	container.Name = name
+	container.Position = position
+	container.Size = UDim2.fromOffset(290, 32)
+	container.BackgroundColor3 = Color3.fromRGB(24, 28, 34)
+	container.BackgroundTransparency = 0.12
+	container.BorderSizePixel = 0
+	container.Parent = parent
+
+	local minus = Instance.new("TextButton")
+	minus.Name = "Minus"
+	minus.Position = UDim2.fromOffset(6, 4)
+	minus.Size = UDim2.fromOffset(30, 24)
+	minus.BackgroundColor3 = Color3.fromRGB(12, 18, 33)
+	minus.BorderSizePixel = 0
+	minus.Font = Enum.Font.GothamBold
+	minus.Text = "-"
+	minus.TextColor3 = Color3.fromRGB(240, 240, 240)
+	minus.TextSize = 16
+	minus.Parent = container
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.Position = UDim2.fromOffset(42, 4)
+	label.Size = UDim2.fromOffset(206, 24)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamSemibold
+	label.Text = title
+	label.TextColor3 = Color3.fromRGB(240, 240, 240)
+	label.TextSize = 13
+	label.Parent = container
+
+	local plus = Instance.new("TextButton")
+	plus.Name = "Plus"
+	plus.Position = UDim2.fromOffset(254, 4)
+	plus.Size = UDim2.fromOffset(30, 24)
+	plus.BackgroundColor3 = Color3.fromRGB(12, 18, 33)
+	plus.BorderSizePixel = 0
+	plus.Font = Enum.Font.GothamBold
+	plus.Text = "+"
+	plus.TextColor3 = Color3.fromRGB(240, 240, 240)
+	plus.TextSize = 16
+	plus.Parent = container
+
+	minus.Activated:Connect(function() onDelta(-1) end)
+	plus.Activated:Connect(function() onDelta(1) end)
+	return label
+end
 
 local function createButton(parent: Instance, name: string, position: UDim2): TextButton
 	local button = Instance.new("TextButton")
@@ -304,8 +396,9 @@ local function updateCameraButton()
 	end
 
 	local mode = CameraController.GetActiveMode()
+	-- User-facing name only; the internal mode id stays "ThirdPerson" (§22).
 	local displayMode = if mode == "ThirdPerson"
-		then "THIRD PERSON"
+		then "PRO CAMERA"
 		else string.upper(mode)
 	cameraButton.Text = string.format("CAMERA: %s", displayMode)
 end
@@ -364,16 +457,231 @@ local function createGui()
 	toggle.Parent = screenGui
 	toolsToggle = toggle
 
-	autoSprintButton = createButton(panel, "AutoSprintButton", UDim2.fromOffset(16, 16))
-	cameraButton = createButton(panel, "CameraModeButton", UDim2.fromOffset(16, 58))
-	cameraDistanceButton = createButton(panel, "CameraDistanceButton", UDim2.fromOffset(16, 100))
-	createIntensityMeter(panel, "GroundPass", "PASS INTENSITY", UDim2.fromOffset(16, 148))
-	createIntensityMeter(panel, "ThroughPass", "THROUGH INTENSITY", UDim2.fromOffset(16, 200))
-	createIntensityMeter(panel, "KnockOn", "KNOCK-ON INTENSITY", UDim2.fromOffset(16, 252))
-	createJogRateControl(panel, UDim2.fromOffset(16, 304))
-	createShootingSkillControl(panel, UDim2.fromOffset(16, 394))
+	-- MATCH -----------------------------------------------------------------
+	createSectionHeader(panel, "MATCH", UDim2.fromOffset(16, 10))
+	aiCountLabels.Home = createStepperRow(panel, "HomeAIRow", "HOME AI  0", UDim2.fromOffset(16, 30), function(delta)
+		sendDevRequest(
+			if delta > 0 then DevToolsConfig.Actions.AddAI else DevToolsConfig.Actions.RemoveAI,
+			{ TeamId = "Home" }
+		)
+	end)
+	aiCountLabels.Away = createStepperRow(panel, "AwayAIRow", "AWAY AI  0", UDim2.fromOffset(16, 66), function(delta)
+		sendDevRequest(
+			if delta > 0 then DevToolsConfig.Actions.AddAI else DevToolsConfig.Actions.RemoveAI,
+			{ TeamId = "Away" }
+		)
+	end)
+	--[[
+		Goalkeepers occupy a separate slot from the three outfield AI, so they get
+		their own controls. Being able to remove the keeper you are shooting at is
+		the whole point of this in Training.
+	]]
+	goalkeeperLabels.Home = createStepperRow(panel, "HomeGKRow", "HOME GK  --", UDim2.fromOffset(16, 102), function(delta)
+		sendDevRequest(
+			if delta > 0 then DevToolsConfig.Actions.AddGoalkeeper else DevToolsConfig.Actions.RemoveGoalkeeper,
+			{ TeamId = "Home" }
+		)
+	end)
+	goalkeeperLabels.Away = createStepperRow(panel, "AwayGKRow", "AWAY GK  --", UDim2.fromOffset(16, 138), function(delta)
+		sendDevRequest(
+			if delta > 0 then DevToolsConfig.Actions.AddGoalkeeper else DevToolsConfig.Actions.RemoveGoalkeeper,
+			{ TeamId = "Away" }
+		)
+	end)
+
+	local resetPlayerButton = createButton(panel, "ResetPlayerButton", UDim2.fromOffset(16, 174))
+	resetPlayerButton.Text = "RESET PLAYER"
+	resetPlayerButton.Size = UDim2.fromOffset(290, 32)
+
+	-- BALL ------------------------------------------------------------------
+	createSectionHeader(panel, "BALL", UDim2.fromOffset(16, 216))
+	local resetBallButton = createButton(panel, "ResetBallButton", UDim2.fromOffset(16, 236))
+	resetBallButton.Text = "RESET BALL"
+	resetBallButton.Size = UDim2.fromOffset(290, 32)
+	dribblingSkillLabel = createStepperRow(panel, "DribblingSkillRow", "DRIBBLING  --", UDim2.fromOffset(16, 272), function(delta)
+		local config = DevToolsConfig.DribblingSkill
+		local current = localPlayer:GetAttribute(config.AttributeName)
+		current = if typeof(current) == "number" then current else config.Default
+		sendDevRequest(DevToolsConfig.Actions.SetDribblingSkill, {
+			Value = math.clamp(current + delta * config.Step, config.Minimum, config.Maximum),
+		})
+	end)
+
+	-- DIAGNOSTICS -----------------------------------------------------------
+	createSectionHeader(panel, "DIAGNOSTICS", UDim2.fromOffset(16, 316))
+	autoSprintButton = createButton(panel, "AutoSprintButton", UDim2.fromOffset(16, 336))
+	autoSprintButton.Size = UDim2.fromOffset(290, 32)
+	cameraButton = createButton(panel, "CameraModeButton", UDim2.fromOffset(16, 372))
+	cameraButton.Size = UDim2.fromOffset(290, 32)
+	cameraDistanceButton = createButton(panel, "CameraDistanceButton", UDim2.fromOffset(16, 408))
+	cameraDistanceButton.Size = UDim2.fromOffset(290, 32)
+	createIntensityMeter(panel, "GroundPass", "PASS INTENSITY", UDim2.fromOffset(16, 448))
+	createIntensityMeter(panel, "ThroughPass", "THROUGH INTENSITY", UDim2.fromOffset(16, 500))
+	createIntensityMeter(panel, "KnockOn", "KNOCK-ON INTENSITY", UDim2.fromOffset(16, 552))
+	createJogRateControl(panel, UDim2.fromOffset(16, 604))
+	createShootingSkillControl(panel, UDim2.fromOffset(16, 694))
+	--[[
+		MATCH RULES (§80, §81).
+
+		Development-only: a compact read-out of the referee's state, and buttons
+		that force each restart so every rule path can be exercised deliberately
+		rather than waiting for a match to produce one by chance.
+	]]
+	createSectionHeader(panel, "MATCH RULES", UDim2.fromOffset(16, 742))
+
+	matchDiagnosticsLabel = Instance.new("TextLabel")
+	matchDiagnosticsLabel.Name = "MatchDiagnostics"
+	matchDiagnosticsLabel.Position = UDim2.fromOffset(16, 762)
+	matchDiagnosticsLabel.Size = UDim2.fromOffset(290, 58)
+	matchDiagnosticsLabel.BackgroundTransparency = 1
+	matchDiagnosticsLabel.Font = Enum.Font.Code
+	matchDiagnosticsLabel.Text = "phase=--"
+	matchDiagnosticsLabel.TextColor3 = Color3.fromRGB(198, 208, 224)
+	matchDiagnosticsLabel.TextSize = 11
+	matchDiagnosticsLabel.TextXAlignment = Enum.TextXAlignment.Left
+	matchDiagnosticsLabel.TextYAlignment = Enum.TextYAlignment.Top
+	matchDiagnosticsLabel.Parent = panel
+
+	local forcedRestarts = {
+		{ Label = "FORCE THROW-IN", Restart = "ThrowIn" },
+		{ Label = "FORCE CORNER", Restart = "CornerKick" },
+		{ Label = "FORCE GOAL KICK", Restart = "GoalKick" },
+		{ Label = "FORCE FREE KICK", Restart = "FreeKick" },
+		{ Label = "FORCE PENALTY", Restart = "Penalty" },
+	}
+	for index, entry in forcedRestarts do
+		local button = createButton(panel, "Force" .. entry.Restart, UDim2.fromOffset(16, 826 + (index - 1) * 34))
+		button.Text = entry.Label
+		button.Size = UDim2.fromOffset(290, 30)
+		button.TextSize = 12
+		table.insert(connections, button.Activated:Connect(function()
+			sendDevRequest(DevToolsConfig.Actions.ForceRestart, { Restart = entry.Restart })
+		end))
+	end
+
+	local injuryButton = createButton(panel, "ForceInjury", UDim2.fromOffset(16, 826 + #forcedRestarts * 34))
+	injuryButton.Text = "FORCE INJURY (SELF)"
+	injuryButton.Size = UDim2.fromOffset(290, 30)
+	injuryButton.TextSize = 12
+	table.insert(connections, injuryButton.Activated:Connect(function()
+		sendDevRequest(DevToolsConfig.Actions.ForceInjury, {})
+	end))
+
+	--[[
+		TEST PARAMETERS (§18, §52).
+
+		Shot Intensity and Goalkeeper Skill are deliberately adjacent and
+		deliberately distinct. Shooting Skill (above) is accuracy; Shot Intensity
+		is raw power; Goalkeeper Skill is the opposition. §70 requires shooting and
+		goalkeeping to be balanced against each other, which needs all three to be
+		independently settable.
+	]]
+	local testBase = 826 + (#forcedRestarts + 1) * 34
+	createSectionHeader(panel, "TEST PARAMETERS", UDim2.fromOffset(16, testBase + 8))
+
+	shotIntensityLabel = createStepperRow(
+		panel,
+		"ShotIntensityRow",
+		"SHOT INTENSITY  --",
+		UDim2.fromOffset(16, testBase + 28),
+		function(delta)
+			local config = FootballActionConfig.DevelopmentShotIntensity
+			local current = localPlayer:GetAttribute(config.AttributeName)
+			current = if typeof(current) == "number" then current else config.Default
+			sendDevRequest(DevToolsConfig.Actions.SetShotIntensity, {
+				Value = math.clamp(current + delta * config.Step, config.Minimum, config.Maximum),
+			})
+		end
+	)
+
+	goalkeeperSkillLabel = createStepperRow(
+		panel,
+		"GoalkeeperSkillRow",
+		"GK SKILL  --",
+		UDim2.fromOffset(16, testBase + 64),
+		function(delta)
+			local config = DevToolsConfig.GoalkeeperSkill
+			local current = localPlayer:GetAttribute(config.AttributeName)
+			current = if typeof(current) == "number" then current else config.Default
+			sendDevRequest(DevToolsConfig.Actions.SetGoalkeeperSkill, {
+				Value = math.clamp(current + delta * config.Step, config.Minimum, config.Maximum),
+			})
+		end
+	)
+
+	panel.CanvasSize = UDim2.fromOffset(0, testBase + 130)
+
 	local remotes = ReplicatedStorage:FindFirstChild(FootballActionConfig.RemotesFolderName)
 	shootingSkillRemote = remotes and remotes:FindFirstChild(FootballActionConfig.DevelopmentShootingSkillRemoteName) :: RemoteEvent?
+	devToolsRemote = remotes and remotes:FindFirstChild(DevToolsConfig.RemoteName) :: RemoteEvent?
+
+	table.insert(connections, resetPlayerButton.Activated:Connect(function()
+		sendDevRequest(DevToolsConfig.Actions.ResetPlayer)
+	end))
+	table.insert(connections, resetBallButton.Activated:Connect(function()
+		sendDevRequest(DevToolsConfig.Actions.ResetBall)
+	end))
+
+	-- Reflect authoritative AI counts and skill back into the panel.
+	local feedback = remotes and remotes:FindFirstChild(DevToolsConfig.FeedbackRemoteName)
+	if feedback and feedback:IsA("RemoteEvent") then
+		table.insert(connections, feedback.OnClientEvent:Connect(function(payload)
+			if typeof(payload) ~= "table" then return end
+			if aiCountLabels.Home and typeof(payload.HomeAI) == "number" then
+				aiCountLabels.Home.Text = string.format("HOME AI  %d", payload.HomeAI)
+			end
+			if matchDiagnosticsLabel then
+				matchDiagnosticsLabel.Text = table.concat({
+					string.format("phase=%s  period=%s", tostring(payload.MatchPhase), tostring(payload.MatchPeriod)),
+					string.format("clock=%ss  restart=%s", tostring(payload.MatchClock), tostring(payload.RestartType)),
+					string.format("lastTouch=%s", tostring(payload.LastTouch)),
+				}, "\n")
+			end
+			if goalkeeperLabels.Home and typeof(payload.HomeGoalkeeper) == "boolean" then
+				goalkeeperLabels.Home.Text = "HOME GK  " .. (if payload.HomeGoalkeeper then "ON" else "OFF")
+			end
+			if goalkeeperLabels.Away and typeof(payload.AwayGoalkeeper) == "boolean" then
+				goalkeeperLabels.Away.Text = "AWAY GK  " .. (if payload.AwayGoalkeeper then "ON" else "OFF")
+			end
+			if aiCountLabels.Away and typeof(payload.AwayAI) == "number" then
+				aiCountLabels.Away.Text = string.format("AWAY AI  %d", payload.AwayAI)
+			end
+		end))
+	end
+	local function refreshTestParameters()
+		local intensityConfig = FootballActionConfig.DevelopmentShotIntensity
+		if shotIntensityLabel then
+			local value = localPlayer:GetAttribute(intensityConfig.AttributeName)
+			value = if typeof(value) == "number" then value else intensityConfig.Default
+			shotIntensityLabel.Text = string.format("SHOT INTENSITY  %d", value)
+		end
+		local gkConfig = DevToolsConfig.GoalkeeperSkill
+		if goalkeeperSkillLabel then
+			local value = localPlayer:GetAttribute(gkConfig.AttributeName)
+			value = if typeof(value) == "number" then value else gkConfig.Default
+			goalkeeperSkillLabel.Text = string.format("GK SKILL  %d", value)
+		end
+	end
+	refreshTestParameters()
+	table.insert(connections, localPlayer:GetAttributeChangedSignal(
+		FootballActionConfig.DevelopmentShotIntensity.AttributeName
+	):Connect(refreshTestParameters))
+	table.insert(connections, localPlayer:GetAttributeChangedSignal(
+		DevToolsConfig.GoalkeeperSkill.AttributeName
+	):Connect(refreshTestParameters))
+
+	local function refreshDribblingSkill()
+		if not dribblingSkillLabel then return end
+		local value = localPlayer:GetAttribute(DevToolsConfig.DribblingSkill.AttributeName)
+		dribblingSkillLabel.Text = string.format(
+			"DRIBBLING  %s",
+			if typeof(value) == "number" then tostring(math.floor(value)) else "--"
+		)
+	end
+	refreshDribblingSkill()
+	table.insert(connections, localPlayer:GetAttributeChangedSignal(
+		DevToolsConfig.DribblingSkill.AttributeName
+	):Connect(refreshDribblingSkill))
 
 	table.insert(connections, toggle.Activated:Connect(function()
 		panel.Visible = not panel.Visible

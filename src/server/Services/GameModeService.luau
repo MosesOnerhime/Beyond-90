@@ -6,7 +6,11 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local GameConfig = require(Shared.Config.GameConfig)
 local GameModeConfig = require(Shared.Config.GameModeConfig)
 local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
+local MatchConfig = require(Shared.Config.MatchConfig)
 local BallService = require(script.Parent.BallService)
+local AIService = require(script.Parent.AIService)
+local MatchAssemblyService = require(script.Parent.MatchAssemblyService)
+local MatchService = require(script.Parent.MatchService)
 local GoalService = require(script.Parent.GoalService)
 
 local GameModeService = {}
@@ -15,7 +19,16 @@ local initialized = false
 local currentMode = GameModeConfig.DefaultMode
 local modeFolder: Folder? = nil
 local lastResetAtByPlayer = {}
-local activeTrainingPlayers: { [Player]: boolean } = {}
+local activeSessionPlayers: { [Player]: string } = {}
+
+local function hasActiveMode(modeId: string): boolean
+	for _, activeMode in activeSessionPlayers do
+		if activeMode == modeId then
+			return true
+		end
+	end
+	return false
+end
 
 local function getOrCreateRemote(name: string): RemoteEvent
 	local existing = modeFolder and modeFolder:FindFirstChild(name)
@@ -68,14 +81,15 @@ function GameModeService.Initialize()
 		local requestedMode = if typeof(request) == "table" then request.Mode else request
 		local requestedTeam = if typeof(request) == "table" then FootballTeamConfig.Normalize(request.TeamId) else nil
 		local definition = typeof(requestedMode) == "string" and GameModeConfig.Modes[requestedMode] or nil
-		if not definition or definition.Enabled ~= true or requestedMode == "TrainingFree" and not requestedTeam then
+		local needsTeam = requestedMode == "TrainingFree" or requestedMode == "Quick3v3"
+		if not definition or definition.Enabled ~= true or needsTeam and not requestedTeam then
 			return
 		end
 		local mapping = FootballTeamConfig.GetGoalMapping(requestedTeam)
-		if requestedMode == "TrainingFree" and not mapping then
+		if needsTeam and not mapping then
 			return
 		end
-		local startingSession = next(activeTrainingPlayers) == nil
+		local startingSession = next(activeSessionPlayers) == nil
 		if startingSession then
 			GoalService.ResetScore()
 		end
@@ -84,7 +98,10 @@ function GameModeService.Initialize()
 		player:SetAttribute(FootballTeamConfig.DefendedGoalAttributeName, mapping and mapping.DefendedGoalId or nil)
 		player:SetAttribute("Beyond90SelectedGameMode", requestedMode)
 		player:SetAttribute("Beyond90ExperienceState", "ModeLoading")
-		activeTrainingPlayers[player] = true
+		activeSessionPlayers[player] = requestedMode
+		-- Arm the match gate before anything spawns, so AI cannot act while this
+		-- player is still inside ModeLoading.
+		MatchService.AddParticipant(player, requestedMode)
 		print(string.format("%s[GameMode] player=%s team=%s attacks=%s defends=%s", GameConfig.LogPrefix, player.Name, tostring(requestedTeam), tostring(mapping and mapping.AttackingGoalId), tostring(mapping and mapping.DefendedGoalId)))
 		BallService.SetSessionActive(true)
 		local existingCharacter = player.Character
@@ -102,13 +119,53 @@ function GameModeService.Initialize()
 			while character.Parent and character:GetAttribute("Beyond90CharacterReady") ~= true and os.clock() - startedAt < 15 do
 				task.wait()
 			end
-			if player.Parent then
-				player:SetAttribute("Beyond90ExperienceState", "Gameplay")
+			if not player.Parent then
+				return
 			end
+
+			--[[
+				ASSEMBLE THE FIELD BEFORE REVEALING IT (§23, §24, §82).
+
+				This used to set ExperienceState to Gameplay first and spawn the AI
+				afterwards, so the player watched their opponents, both goalkeepers
+				and the referee appear one by one on an already-visible pitch. The
+				reveal now waits for the complete match, and the ModeLoading
+				presentation stays up until then.
+			]]
+			MatchAssemblyService.SetPlayerFieldReady(player, false)
+
+			if requestedMode ~= "Quick3v3" and not hasActiveMode("Quick3v3") then
+				AIService.Stop()
+			end
+
+			local ready, missing = MatchAssemblyService.Assemble(requestedMode)
+			if not player.Parent then
+				return
+			end
+			if not ready then
+				--[[
+					Assembly failed. The player is still let onto the pitch rather
+					than being stranded on a loading screen -- an incomplete match
+					is worse than a complete one, but it is far better than a
+					session that never starts -- and the missing actor is named.
+				]]
+				warn(string.format(
+					"%s[GameMode] Field assembly incomplete for %s (missing %s); revealing anyway",
+					GameConfig.LogPrefix,
+					player.Name,
+					tostring(missing)
+				))
+			end
+
+			MatchAssemblyService.SetPlayerFieldReady(player, true)
+			player:SetAttribute("Beyond90ExperienceState", "Gameplay")
 		end)
 	end)
 	exitRemote.OnServerEvent:Connect(function(player)
-		activeTrainingPlayers[player] = nil
+		local previousMode = activeSessionPlayers[player]
+		activeSessionPlayers[player] = nil
+		MatchService.RemoveParticipant(player)
+		player:SetAttribute(MatchConfig.FieldReadyAttributeName, nil)
 		player:SetAttribute("Beyond90ExperienceState", "Menu")
 		player:SetAttribute("Beyond90SelectedGameMode", "Development")
 		player:SetAttribute(FootballTeamConfig.AttributeName, nil)
@@ -119,7 +176,14 @@ function GameModeService.Initialize()
 			player.Character = nil
 			character:Destroy()
 		end
-		if next(activeTrainingPlayers) == nil then
+		if previousMode == "Quick3v3" then
+			if hasActiveMode("Quick3v3") then
+				AIService.Refresh3v3()
+			else
+				AIService.Stop()
+			end
+		end
+		if next(activeSessionPlayers) == nil then
 			BallService.SetSessionActive(false)
 		end
 	end)
@@ -144,8 +208,18 @@ function GameModeService.Initialize()
 		player:SetAttribute("Beyond90ExperienceState", "Menu")
 	end)
 	Players.PlayerRemoving:Connect(function(player)
-		activeTrainingPlayers[player] = nil
-		if next(activeTrainingPlayers) == nil then
+		local previousMode = activeSessionPlayers[player]
+		activeSessionPlayers[player] = nil
+		if previousMode == "Quick3v3" then
+			task.defer(function()
+				if hasActiveMode("Quick3v3") then
+					AIService.Refresh3v3()
+				else
+					AIService.Stop()
+				end
+			end)
+		end
+		if next(activeSessionPlayers) == nil then
 			BallService.SetSessionActive(false)
 		end
 	end)

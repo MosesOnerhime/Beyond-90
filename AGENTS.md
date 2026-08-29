@@ -702,6 +702,30 @@ Before modifying code:
 9. Explain significant architectural decisions.
 10. Prefer incremental, testable changes.
 
+For any task that creates, modifies, reviews, audits or makes design decisions
+about player-facing UI / UX, the agent must also use the dedicated Beyond 90 UI
+guidance under:
+
+    docs/ui/
+
+Read:
+
+    docs/ui/README_UI_AGENT.md
+    docs/ui/UI_AGENT_DECISION_RULES.md
+    docs/ui/UI_DESIGN_SYSTEM.md
+
+and then the task-relevant files described by the UI README.
+
+Do not require the full UI documentation set for tasks that have no UI / UX
+impact.
+
+`AGENTS.md` remains authoritative for project-wide architecture, gameplay,
+networking, milestone scope, safety, moderation and asset-upload rules.
+
+Within a UI / UX task, the dedicated `docs/ui/` documents are the authoritative
+specialized guidance unless they conflict with this file or an explicit current
+user instruction.
+
 Do not rewrite large parts of the project merely because another architecture
 is aesthetically preferable.
 
@@ -766,6 +790,14 @@ For any significant feature, AI should first identify:
 - Does it need networking?
 - Does it need configuration?
 - Does it need UI?
+- If it needs UI, what must the player understand first?
+- If it needs UI, what is the primary player action and what is secondary?
+- If it needs UI, which existing Beyond 90 component / pattern already owns
+  most of the interaction?
+- If it needs UI, what changes across keyboard/mouse, controller and touch?
+- If it needs UI, how does the layout adapt to small landscape screens,
+  console / TV viewing distance and safe areas?
+- If it needs UI, which `docs/ui/` files apply to the task?
 - Does it affect multiple game modes?
 - Does it need to work across PC/mobile/console?
 - Does it affect the Broadcast Camera?
@@ -861,6 +893,33 @@ For camera changes specifically, test:
 - Different pitch sizes
 
 ---
+
+
+For UI / UX changes specifically, testing should also evaluate where applicable:
+
+- Visual hierarchy and primary-action clarity
+- Beyond 90 football identity and visual restraint
+- 1920×1080 or equivalent large landscape layout
+- A smaller landscape viewport
+- Phone / touch landscape
+- Console / TV readability
+- Roblox safe-area behavior
+- Keyboard / mouse interaction
+- Controller focus order, confirm and back behavior
+- Touch target size and overlap with gameplay controls
+- Preferred-input prompt changes
+- Long usernames / club names / translated strings
+- Default, hover, focus, pressed, selected and disabled states
+- Loading, empty and error states where relevant
+- Reduced-motion / transparency preferences where supported
+- UI performance and unnecessary continuous work
+
+For major UI screens, apply the quality gate defined in:
+
+    docs/ui/UI_AGENT_DECISION_RULES.md
+
+A UI task is not complete merely because it looks correct in one desktop
+screenshot.
 
 # 23. Design Principle
 
@@ -2332,41 +2391,200 @@ later without requiring complete mechanic rewrites.
 
 # 40. UI / UX Reference Strategy
 
+Beyond 90 has a dedicated UI guidance package under:
+
+    docs/ui/
+
+This package exists so AI agents do not improvise the product's visual language
+from vague instructions such as "modern", "premium", "football" or "blue".
+
+The approved Beyond 90 UI direction is:
+
+> A premium contemporary football game presented with modern sports-broadcast
+> clarity and Roblox-native usability.
+
+It is NOT intended to become a sci-fi, cyberpunk or hyper-futuristic interface.
+
+## UI Documentation Read Order
+
+For any substantial UI / UX task, first read:
+
+    docs/ui/README_UI_AGENT.md
+    docs/ui/UI_AGENT_DECISION_RULES.md
+    docs/ui/UI_DESIGN_SYSTEM.md
+
+Then read the relevant task-specific guidance:
+
+    docs/ui/UI_COMPONENTS_AND_PATTERNS.md
+        → menus, HUD, scorebug, player cards, clubs, squad, settings,
+          post-match, modals, toasts, loading / empty / error states
+
+    docs/ui/UI_RESPONSIVE_INPUT.md
+        → PC, console / TV, controller, touch, mobile, safe areas,
+          responsive behavior and input adaptation
+
+    docs/ui/UI_ACCESSIBILITY_LOCALIZATION.md
+        → readability, contrast, focus, reduced motion / transparency,
+          color use and localization
+
+    docs/ui/UI_ROBLOX_IMPLEMENTATION.md
+        → Roblox implementation, layout systems, constraints, input,
+          reusable styling, performance and validation
+
+Use:
+
+    docs/ui/UI_RESEARCH_SOURCES.md
+
+when the external rationale, platform documentation or research trail needs to
+be checked. It does not need to be reread for every small UI edit.
+
+## UI Authority
+
+For UI-specific decisions, use this authority order:
+
+    explicit current user instruction
+            ↓
+    AGENTS.md project-wide constraints
+            ↓
+    existing valid Beyond 90 production UI architecture / reusable components
+            ↓
+    docs/ui/UI_AGENT_DECISION_RULES.md
+            ↓
+    other task-relevant docs/ui/ files
+            ↓
+    external reference games and generic UI conventions
+
+Do not create a parallel design system merely because a new component is faster
+to implement in isolation.
+
+Do not override gameplay, networking, milestone, moderation or asset-upload
+rules from this `AGENTS.md` using a UI reference document.
+
+## Approved Beyond 90 Visual Identity
+
+The intended UI character is:
+
+- Athletic
+- Confident
+- Competitive
+- Premium
+- Modern
+- Clean
+- Stadium-lit
+- Broadcast-oriented
+- Football-first
+
+The football identity should come primarily from:
+
+- Players
+- Kits and shirt numbers
+- Club crests
+- Footballs and pitches
+- Match clocks and scorelines
+- Formations and positions
+- Player cards
+- Statistics
+- Divisions / seasons / trophies
+- Stadium imagery
+- Broadcast-style match events
+
+Do NOT make the football identity depend on generic futuristic decoration.
+
+Avoid using these as the default visual language:
+
+- Holographic panels
+- Circuit-board patterns
+- Sci-fi grids
+- Scanlines
+- Chromatic aberration
+- Glowing borders on every card
+- Transparent glass everywhere
+- Excessive cyan / purple gradients
+- Excessive pill-shaped controls
+- Random hexagonal UI
+- Floating techno glyphs
+- Constant parallax
+- Continuous decorative particles
+- Cyberpunk / techno typography
+- Thin unreadable fonts
+
+Use glow, transparency, violet and cyan selectively rather than everywhere.
+
+When uncertain, use the test defined in the UI decision rules:
+
+> If the football content were removed, would this look like a spaceship,
+> cyberpunk terminal, crypto dashboard or generic futuristic game menu?
+
+If yes, simplify the technology styling and strengthen football-specific
+presentation instead.
+
+## Approved Mockup Direction
+
+The approved Beyond 90 main-menu mockup should be treated as the current visual
+north star unless a later approved direction replaces it.
+
+Important traits include:
+
+- Dark nighttime stadium atmosphere
+- Deep navy / charcoal UI surfaces
+- Bright white primary typography
+- Restrained electric-blue interaction / selection states
+- Limited violet for ranked, progression or special reward emphasis
+- Large football-player imagery
+- Strong rectangular navigation cards
+- Clear information hierarchy
+- Controlled glow rather than glow everywhere
+- Premium sports presentation rather than sci-fi presentation
+
+Do not copy one screenshot mechanically into every screen.
+
+Preserve the visual principles while adapting layout and information hierarchy
+to the task.
+
 ## Modern EA SPORTS FC
 
-Use primarily for visual polish and football-information presentation:
+Use primarily for:
 
+- Football-information hierarchy
 - Player profiles
 - Player cards
 - Club pages
-- Season screens
-- Divisions
+- Season / division presentation
 - Lineups
 - Statistics
 - Match HUD
 - Post-match presentation
 - Rewards
+- Broadcast polish
 
-Do not inherit Ultimate Team-style menu complexity.
+Do not inherit Ultimate Team-style menu complexity merely because it appears
+premium.
 
 Beyond 90 should aim for:
 
     EA FC-quality football presentation
                 +
     Roblox-level speed and clarity
+                +
+    Beyond 90's own identity
 
-A future top-level structure may resemble:
+EA FC is a reference, not a template.
 
-    PLAY
-    CLUB
-    PLAYER
-    SEASON
-    CUSTOMIZE
-    STORE
+## FIFA 17
 
-when those systems actually exist.
+Use primarily for:
 
-## Roblox Experiences
+- Clean football presentation
+- Broadcast overlays
+- Match-event graphics
+- Score / clock presentation
+- Stadium context
+- Restrained sports framing
+
+It may be especially useful when Beyond 90 needs a cleaner reference than a
+more content-dense modern football-game menu.
+
+## Leading Roblox Experiences
 
 Study leading Roblox experiences for:
 
@@ -2374,21 +2592,193 @@ Study leading Roblox experiences for:
 - Low-friction onboarding
 - Mobile usability
 - Controller navigation
-- Responsive UI
-- Clear purchase flows
+- Responsive layout
+- Clear interaction states
 - Social UI
 - Platform-native conventions
+- Purchase-flow clarity where monetization is relevant
+
+Do not copy generic Roblox simulator UI conventions that weaken Beyond 90's
+premium football identity.
 
 ## FC Mobile
 
-Use additionally for:
+Use primarily for:
 
 - Compact layouts
 - Touch targets
 - Small-screen hierarchy
 - Mobile HUD readability
+- Information reduction on constrained screens
 
----
+Mobile should adapt the information architecture, not simply shrink the desktop
+screen.
+
+## Contextual Gameplay UI
+
+Match UI should show what the player needs now.
+
+Prefer contextual football prompts over permanently displaying every possible
+control.
+
+Conceptually:
+
+    PLAYER CONTEXT
+          ↓
+    RELEVANT ACTIONS
+          ↓
+    CURRENT HUD / PROMPTS
+
+For example:
+
+- In possession → relevant attacking actions
+- Out of possession → relevant defensive actions
+- Set piece → set-piece controls
+- Goalkeeper state → goalkeeper-relevant actions
+
+Do not allow control-prompt density to obscure the pitch.
+
+## Broadcast Camera Readability
+
+Because Beyond 90 uses a broadcast-style camera, gameplay UI must remain useful
+when the controlled footballer is visually small and the camera is pulled back.
+
+Therefore:
+
+- Critical match information must read quickly
+- Controlled-player indicators must remain distinguishable
+- Minimap information must be clear
+- Text must survive stadium lighting and grass backgrounds
+- Persistent HUD should remain sparse
+- Large opaque panels must not block active play
+- Mobile HUD density should be lower than desktop where necessary
+
+The UI and Broadcast Camera should be designed as cooperating systems.
+
+## Cross-Platform Requirement
+
+A significant UI task is not complete after one desktop screenshot.
+
+Where applicable, define and test behavior for:
+
+- Keyboard / mouse
+- Controller / gamepad
+- Touch
+- Phone landscape
+- Tablet / medium landscape
+- Desktop
+- Console / TV
+
+The same hierarchy does not require the same physical arrangement on every
+device.
+
+It is acceptable and often preferable to:
+
+- Stack panels
+- Hide tertiary information
+- Convert side panels into tabs / drawers
+- Shorten non-critical copy
+- Increase touch targets
+- Reposition controls away from thumb zones
+- Reduce HUD density
+
+Do not shrink the entire desktop UI proportionally until it becomes unreadable.
+
+## Existing UI First
+
+Before creating a UI component, inspect the repository for:
+
+- Existing shared components
+- Existing design tokens / theme values
+- Existing navigation patterns
+- Existing input-aware behavior
+- Existing responsive helpers
+- Existing animation helpers
+- Existing modal / toast / state patterns
+
+Prefer:
+
+    REUSE
+        ↓
+    EXTEND
+        ↓
+    ADD VARIANT
+        ↓
+    CREATE NEW
+
+in that order when practical.
+
+Do not create duplicate button, panel, modal, card, tab, focus or input systems.
+
+## UI Decision Workflow
+
+For a substantial UI task:
+
+    1. Read the required docs/ui guidance.
+
+    2. Inspect the existing Beyond 90 UI architecture.
+
+    3. Identify the player's primary task.
+
+    4. Identify the information hierarchy.
+
+    5. Identify existing reusable components.
+
+    6. Determine desktop / controller / touch behavior.
+
+    7. Determine responsive changes for constrained screens.
+
+    8. Determine loading / empty / error / disabled states.
+
+    9. Implement the smallest coherent change.
+
+    10. Test in Roblox Studio where practical.
+
+    11. Apply the UI quality gate.
+
+    12. Stop before unrelated redesign or the next milestone.
+
+Do not "improve" unrelated screens during a focused UI task unless explicitly
+requested.
+
+## UI Quality Gate
+
+For major UI screens, use the rubric in:
+
+    docs/ui/UI_AGENT_DECISION_RULES.md
+
+At minimum, review:
+
+- Primary task clarity
+- Information hierarchy
+- Football identity
+- Beyond 90 brand fit
+- Readability
+- Gamepad usability
+- Touch usability
+- Responsiveness
+- Accessibility
+- Visual restraint
+
+A screen that looks visually polished but fails controller, touch, readability
+or hierarchy is not complete.
+
+## UI Asset Safety
+
+All UI work remains subject to the Roblox asset moderation and upload rules in
+Section 57 of this file.
+
+External screenshots, football-game references and UI inspiration images are
+development references only.
+
+Do not import external reference screenshots into Roblox merely to compare
+visuals.
+
+Do not create Roblox-hosted screenshots / visual-QA assets unless the artifact
+itself is intentionally meant to become a real production asset.
+
+Use local-first visual QA.
+
 
 # 41. Progression And Competitive Integrity
 
@@ -3830,6 +4220,10 @@ Visual reference:
 - FIFA 17
 - Leading Roblox experiences
 
+All work in this milestone must also follow the dedicated guidance under:
+
+    docs/ui/
+
 Do not copy Ultimate Team menu complexity.
 
 ## Milestone 6.5 — Mobile And Controller Production Pass
@@ -4173,3 +4567,240 @@ and broader match/team integration is planned for:
 
 If future playtesting changes milestone dependencies, update this document
 explicitly rather than silently drifting from the roadmap.
+
+---
+
+# 57. Roblox Asset Moderation, Upload Safety And Visual QA
+
+Beyond 90 development must avoid creating unnecessary Roblox-hosted assets during
+visual testing and must proactively prevent moderation violations caused by UI
+images, screenshots, temporary mockups or other uploaded media.
+
+This section applies to AI coding agents, developers, visual-QA workflows and any
+automation that can create or upload Roblox assets.
+
+## Local-First Visual QA
+
+For development screenshots, UI comparisons and visual verification:
+
+- Prefer **local operating-system screenshots or local video captures**.
+- Prefer Luau geometry/runtime assertions where visual proof can be obtained
+  without an upload.
+- Prefer Roblox Studio inspection through supported tooling when it does not
+  create a persistent Roblox-hosted asset.
+- Do **not** use Roblox Studio capture/upload integrations for routine QA when
+  they may create persistent uploaded assets.
+- Until the user explicitly confirms that a Studio capture workflow is safe,
+  assume Studio-generated capture uploads are **not approved for Beyond 90 QA**.
+- Keep temporary visual-test artifacts local and out of Roblox moderation
+  pipelines.
+
+A screenshot should not be uploaded merely because it is convenient for an AI
+agent to inspect later.
+
+## Pre-Upload Image Inspection
+
+Before any production image is uploaded to Roblox, inspect the actual final
+local file first.
+
+Check for:
+
+- URLs or URL-like text
+- QR codes
+- Email addresses
+- Social-media handles
+- Discord branding or invite references
+- YouTube branding or channel references
+- X / Twitter branding or handles
+- Twitch branding or handles
+- Other off-platform service branding or destinations
+- Text that OCR could reasonably misread as a link or off-platform destination
+- Watermarks or unrelated creator branding
+- External-reference screenshots or artwork accidentally embedded in the asset
+- Development notes, debug text or temporary labels that should not ship
+
+If there is uncertainty about whether visible text or imagery could trigger
+moderation, do not upload it until it has been reviewed and cleaned.
+
+## External References Must Stay Outside Roblox
+
+External reference material is for development research only.
+
+Examples include:
+
+- eFootball screenshots
+- FIFA / EA SPORTS FC screenshots
+- Other Roblox game screenshots
+- UI inspiration boards
+- External website captures
+- Third-party mockups
+- Reference videos and frame grabs
+
+These should remain in local/reference storage and must **not** be imported into
+Roblox Studio merely for comparison.
+
+Do not include reference material inside:
+
+- Roblox image assets
+- uploaded screenshots
+- production UI textures
+- decals
+- thumbnails
+- temporary Studio captures that may persist as uploaded assets
+
+When comparing Beyond 90 against a reference, keep the reference outside Roblox
+and compare locally.
+
+## Upload Only Finalized Production Assets
+
+Roblox should receive only assets that are intentionally meant to exist on the
+platform.
+
+Do not upload:
+
+- temporary mockups
+- WIP screenshots
+- visual-QA captures
+- debugging captures
+- reference composites
+- placeholder screenshots
+- iteration snapshots
+
+unless the user explicitly requests that the specific asset be uploaded.
+
+Before upload, the asset should be:
+
+1. Final or intentionally production-ready.
+2. Cropped correctly.
+3. Free from unrelated reference material.
+4. Checked for prohibited/off-platform text and branding.
+5. Associated with a clear Beyond 90 purpose.
+
+## Roblox Asset Manifest
+
+Maintain a traceable manifest for Roblox-hosted production assets.
+
+If an existing asset manifest is present, update it rather than creating a
+competing manifest.
+
+If no manifest exists when production uploads begin, create an appropriate
+project document such as:
+
+    docs/assets/roblox-asset-manifest.md
+
+For each uploaded production asset, record at minimum:
+
+- Roblox asset ID
+- Local source filename
+- Asset type
+- Purpose / where it is used
+- Upload date
+- Roblox owner/group where relevant
+- Moderation status
+- Date moderation approval was confirmed
+- Config/module that references the asset ID
+
+This allows any future moderation notice to be traced quickly to the exact
+source asset and usage.
+
+## Moderation Approval Before Runtime Configuration
+
+Do not immediately place a newly uploaded asset ID into production configuration.
+
+For new image/audio/media uploads:
+
+    local final asset
+        ↓
+    inspect locally
+        ↓
+    upload intentionally
+        ↓
+    wait for Roblox moderation / processing
+        ↓
+    confirm approved / usable state
+        ↓
+    record in asset manifest
+        ↓
+    add asset ID to production configuration
+
+For UI images specifically, do not add the ID to `UIAssetConfig` or an
+equivalent production registry before its approved/usable status is confirmed.
+
+If the moderation state cannot be verified, mark the asset:
+
+    UNVERIFIED
+
+and do not treat it as production-ready.
+
+## Off-Platform Destinations And Social Links
+
+Do not place genuine off-platform destinations inside Beyond 90 UI images,
+ordinary in-game text, screenshots or decorative assets.
+
+This includes destinations or identifiers for services such as:
+
+- Discord
+- YouTube
+- X / Twitter
+- Twitch
+- external websites
+- email destinations
+- other social platforms
+
+Where Beyond 90 legitimately needs an external destination, use Roblox's
+supported **Social Links / Social Networks configuration** and any applicable
+Roblox-supported policy mechanism rather than embedding the destination inside
+ordinary UI or image assets.
+
+Current Roblox Community Standards should be treated as the governing platform
+policy and re-checked when moderation/upload behavior changes:
+
+    https://en.help.roblox.com/hc/en-us/articles/203313410-Roblox-Community-Standards
+
+Do not assume that an off-platform reference is permitted merely because it is:
+
+- only visible during development;
+- intended for testing;
+- inside a private/unpublished experience;
+- embedded in an image rather than plain text;
+- temporary;
+- created by an AI agent.
+
+## AI-Agent Upload Rule
+
+AI coding agents such as Codex or Claude must not create Roblox-hosted visual QA
+captures merely to prove that a UI change worked.
+
+Preferred verification order:
+
+    runtime / geometry checks
+            ↓
+    Studio inspection
+            ↓
+    local OS screenshot / local recording
+            ↓
+    user visual review
+
+Only use a Roblox upload when the artifact itself is intended to become a real
+production asset.
+
+If a tool or integration may silently create a Roblox-hosted asset, treat that
+operation as an upload and avoid it unless explicitly required.
+
+## Moderation-Safety Rule
+
+When there is a conflict between development convenience and avoiding an
+unnecessary moderation risk:
+
+    KEEP THE ARTIFACT LOCAL
+
+is the default decision.
+
+Visual QA does not require a Roblox-hosted asset.
+
+Reference material does not require a Roblox-hosted asset.
+
+Temporary development work does not require a Roblox-hosted asset.
+
+Only intentional, inspected and approved production assets should enter the
+Roblox asset pipeline.

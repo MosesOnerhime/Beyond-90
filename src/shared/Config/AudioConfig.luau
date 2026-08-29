@@ -33,13 +33,22 @@ local AudioConfig = {
 		Base = {
 			AssetId = "7378338223",
 			LocalSource = "assets/audio/sfx/stadium crowd.mp3",
-			Volume = 0.48,
+			-- Raised so the stadium reads as occupied. Kept below the whistle
+			-- (0.85) and goal audio so match events still cut through.
+			Volume = 0.6,
+		},
+	},
+	Match = {
+		StartWhistle = {
+			AssetId = "9125967307",
+			Volume = 0.85,
+			PlaybackSpeed = 1,
 		},
 	},
 	Gameplay = {
 		DribbleTouch = {
 			AssetId = "4458219865",
-			Volume = 0.32,
+			Volume = 0.2,
 			PlaybackSpeed = 1.04,
 		},
 		Pass = {

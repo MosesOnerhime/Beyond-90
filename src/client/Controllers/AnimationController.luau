@@ -5,6 +5,7 @@ local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local AnimationConfig = require(Shared.Config.AnimationConfig)
+local GoalkeeperConfig = require(Shared.Config.GoalkeeperConfig)
 local BallConfig = require(Shared.Config.BallConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local PlayerConfig = require(Shared.Config.PlayerConfig)
@@ -27,8 +28,20 @@ local passConfig = AnimationConfig.Pass
 local shootConfig = AnimationConfig.Shoot
 local receptionConfig = AnimationConfig.Reception
 local stopTrapConfig = AnimationConfig.StopTrap
+local transitionConfig = AnimationConfig.Transitions or {}
 local groundingConfig = PlayerConfig.Appearance.Grounding or {}
 local assets = AnimationConfig.Assets
+local transitionAssets = (assets.Locomotion and assets.Locomotion.Transitions) or {}
+local lastTransitionAt = {}
+local reversalCandidateAt = 0
+local reverseStartCandidateAt = 0
+local drivenRotationTarget: Vector3? = nil
+local drivenRotationUntil = 0
+local drivenRotationRate = 540
+local drivenRotationSign = 1
+local drivenRotationRemaining = 0
+local previousAutoRotate: boolean? = nil
+local previousMovingDirection = Vector3.zero
 
 local initialized = false
 local currentCharacter: Model? = nil
@@ -89,6 +102,12 @@ local diagnostics = {
 	JogWeights = {},
 }
 
+-- Which keeper clip is currently driving the rig, and whether the keeper set
+-- owns the body at all. Kept out of the outfield state so neither can stomp the
+-- other's bookkeeping.
+local keeperPresentationActive = false
+local currentKeeperClip = ""
+
 local function log(message: string)
 	if AnimationConfig.DebugEnabled then
 		print(string.format("%s[Client][Animation] %s", GameConfig.LogPrefix, message))
@@ -107,6 +126,13 @@ end
 
 local function getHorizontal(vector: Vector3): Vector3
 	return Vector3.new(vector.X, 0, vector.Z)
+end
+
+local function angleBetweenDegrees(a: Vector3, b: Vector3): number
+	if a.Magnitude <= 1e-3 or b.Magnitude <= 1e-3 then
+		return 0
+	end
+	return math.deg(math.acos(math.clamp(a.Unit:Dot(b.Unit), -1, 1)))
 end
 
 local function getFootball(): BasePart?
@@ -138,16 +164,36 @@ local function createGroundingBucket()
 	return { StartedAt = 0, Count = 0, Min = math.huge, Max = -math.huge, Sum = 0, Reported = false }
 end
 
+local GROUNDING_BUCKETS = {
+	"Idle",
+	"Jog",
+	"Sprint",
+	"IdleToSprint",
+	"IdleToSprint180",
+	"DirectionChange180",
+}
+
 local function resetGroundingDiagnostics()
 	table.clear(groundingSamples)
-	groundingSamples.Idle = createGroundingBucket()
-	groundingSamples.Jog = createGroundingBucket()
+	for _, key in GROUNDING_BUCKETS do
+		groundingSamples[key] = createGroundingBucket()
+	end
 	previousFootSample = nil
 end
 
 local function getGroundingStateKey(state: string): string?
 	if state == "Idle" then
 		return "Idle"
+	end
+
+	-- Transition clips are measured in their own buckets so a single bad source
+	-- animation cannot be hidden inside the jog average.
+	if groundingSamples[state] then
+		return state
+	end
+
+	if string.find(state, "Sprint", 1, true) then
+		return "Sprint"
 	end
 
 	if string.find(state, "Jog", 1, true) then
@@ -200,7 +246,7 @@ local function reportGroundingBucket(stateKey: string, bucket)
 	local average = bucket.Sum / bucket.Count
 	local target = groundingConfig.TargetFootClearanceStuds or 0
 	local result = if bucket.Min < -0.02 then "penetrating" else "accepted"
-	local prefix = if stateKey == "Idle" then "Beyond90GroundingIdle" else "Beyond90GroundingJog"
+	local prefix = "Beyond90Grounding" .. stateKey
 	localPlayer:SetAttribute(prefix .. "MinContactClearance", bucket.Min)
 	localPlayer:SetAttribute(prefix .. "AverageContactClearance", average)
 	localPlayer:SetAttribute(prefix .. "MaxContactClearance", bucket.Max)
@@ -429,6 +475,45 @@ local function isAirborne(humanoid: Humanoid): boolean
 
 	local config = AnimationConfig.AirbornePresentation or {}
 	local rootPart = currentRootPart
+
+	--[[
+		YOU CANNOT BE FALLING AT ZERO STUDS PER SECOND.
+
+		The runtime log is full of a footballer standing perfectly still and
+		flicking into the airborne fallback for about a tenth of a second every
+		few seconds:
+
+			State -> AirborneFallback ... speed=0.0 playback=0.00
+			State -> Idle             ... speed=0.0
+
+		The cause is that the Humanoid intermittently reports Freefall with
+		FloorMaterial = Air. That is plausible here rather than a fluke: this
+		character deliberately has a non-collidable root and non-collidable feet
+		(PlayerService sets collidableParts = Head, LowerTorso, UpperTorso), so
+		Roblox's own floor detection has little underneath it to find and drops
+		the floor for a frame. The raycast guard below was meant to catch that,
+		but it only rejects the case where the ray FINDS ground -- when the cast
+		returns nothing, the code concludes "clearly above ground" and, after
+		EnterDelay, plays the fallback.
+
+		Vertical speed settles it without having to trust either signal. A
+		footballer whose vertical velocity is essentially zero is resting on
+		something, whatever the Humanoid believes.
+		`GroundedVerticalSpeedTolerance` was already in the config for exactly
+		this and had never been read by anything.
+
+		A real jump is exempt, because a jump genuinely does pass through zero
+		vertical speed at its apex and must not drop out of the airborne
+		presentation for that frame.
+	]]
+	if rootPart and localPlayer:GetAttribute("Beyond90JumpAssistActive") ~= true then
+		local verticalSpeed = math.abs(rootPart.AssemblyLinearVelocity.Y)
+		if verticalSpeed <= (config.GroundedVerticalSpeedTolerance or 1.5) then
+			airborneCandidateAt = 0
+			return false
+		end
+	end
+
 	if rootPart then
 		local ground = GroundProbe.Raycast(rootPart.Position, 8, { currentCharacter :: Instance })
 		local nearGround = ground and ground.Distance <= (humanoid.HipHeight + rootPart.Size.Y / 2 + 0.75)
@@ -640,12 +725,35 @@ local function getActionConfig(slot: string)
 		return stopTrapConfig
 	elseif slot == "Shoot" then
 		return shootConfig
+	elseif transitionConfig[slot] then
+		return transitionConfig[slot]
 	end
 
 	return nil
 end
 
-local function startAction(slot: string)
+--[[
+	Actions that OWN the body while they run (§72, §73).
+
+	A driven transition rotates the root itself and plays a clip authored to match
+	that rotation. While one is running the ordinary locomotion selection must
+	stand still: it has nothing useful to say, because the footballer's velocity
+	during a reversal passes through zero and its facing is being driven rather
+	than followed.
+
+	This is the actual cause of the 180 stutter. resolveBaseLocomotion ran every
+	frame regardless of what action was playing, so mid-reversal it kept
+	re-selecting and re-weighting jog -- at a measured speed near zero, which is
+	why the logs showed locomotion states chosen with speed = 0 -- and blended
+	that against the reversal clip. Two systems animating the legs at once.
+]]
+local DRIVEN_TRANSITION_ACTIONS = {
+	DirectionChange180 = true,
+	IdleToSprint = true,
+	IdleToSprint180 = true,
+}
+
+local function startAction(slot: string, weight: number?)
 	local record = activeTracks[slot]
 	local track = record and record.Track
 	local config = getActionConfig(slot)
@@ -664,7 +772,7 @@ local function startAction(slot: string)
 	local exitBlend = config.ExitBlendTime or config.FadeOutTime or blendConfig.ActionExit
 	track:Stop(0)
 	track.TimePosition = 0
-	track:Play(config.FadeInTime or blendConfig.ActionEnter, 1, playbackRate)
+	track:Play(config.FadeInTime or blendConfig.ActionEnter, weight or 1, playbackRate)
 	activeAction = slot
 	local duration = math.max(track.Length / math.max(playbackRate, 0.01), fallbackDuration)
 	activeActionUntil = os.clock() + duration
@@ -906,16 +1014,323 @@ local function updateDiagnostics(state: string, family: string, direction: strin
 	sampleGrounding(desiredBaseState)
 end
 
+--[[
+	INTENT WITHOUT MOTION IS NOT A RUN (§72).
+
+	Entry used to be intent alone, so a footballer who is holding a direction but
+	is not actually going anywhere played a full jog cycle on the spot -- the
+	`JogForward speed=0.0` in the runtime evidence. It happens wherever movement
+	is externally held: restart setup, repositioning, the pre-match freeze.
+
+	Entry is still IMMEDIATE on intent, so a genuine start has no added latency:
+	real acceleration produces speed within a frame or two and the state simply
+	continues. What is new is that intent which never turns into motion is given
+	a short grace and then dropped back to Idle, so a held footballer stands
+	still instead of running in place.
+]]
+local intentWithoutMotionSince = 0
+
 local function updateLocomotionVisualActive(rawMagnitude: number, speed: number): boolean
+	-- The footballer also travels under reception and loose-ball assistance, where
+	-- raw stick input is zero. Presentation follows actual movement, not only
+	-- input, otherwise an assisted run toward the ball plays Idle.
+	local movingUnderAssist = speed > (jogConfig.VisualExitSpeed or jogConfig.JogExitSpeed)
+	local hasIntent = rawMagnitude > jogConfig.MovementIntentThreshold
+	local stationary = speed <= (jogConfig.StationaryVisualSpeed or 1.5)
+	local now = os.clock()
+
+	if hasIntent and stationary then
+		if intentWithoutMotionSince <= 0 then
+			intentWithoutMotionSince = now
+		end
+	else
+		intentWithoutMotionSince = 0
+	end
+
+	-- Intent that has produced no movement for this long is a held footballer,
+	-- not a running one.
+	local stalledIntent = intentWithoutMotionSince > 0
+		and now - intentWithoutMotionSince >= (jogConfig.StalledIntentSeconds or 0.2)
+
 	if locomotionVisualActive then
-		if rawMagnitude <= jogConfig.MovementIntentThreshold and speed <= (jogConfig.VisualExitSpeed or jogConfig.JogExitSpeed) then
+		if (not hasIntent and not movingUnderAssist) or stalledIntent then
 			locomotionVisualActive = false
 		end
-	elseif rawMagnitude > jogConfig.MovementIntentThreshold then
+	elseif (hasIntent and not stalledIntent) or movingUnderAssist then
 		locomotionVisualActive = true
 	end
 
 	return locomotionVisualActive
+end
+
+--[[
+	Drive the footballer's actual yaw through a turn transition.
+
+	The imported clips carry no root rotation, so without this the animation
+	plays while the body still faces the old direction and then snaps. Authority
+	is taken only for the length of the clip and handed straight back to normal
+	movement, so AutoRotate is never fought continuously.
+]]
+--[[
+	Which way the footballer turns, decided once and shared by the clip choice
+	and the yaw driver so the two can never disagree.
+
+	Handedness is picked explicitly rather than left to a shortest-path lerp:
+	near 180 degrees the shortest arc is numerically ambiguous and the body can
+	flick either way between frames. facing:Cross(target).Y is positive when the
+	target lies to the player's left, which matches a positive CFrame.Angles Y
+	rotation, so a negative Y is a right turn.
+
+	Returns +1 for left, -1 for right.
+]]
+local function resolveTurnSign(config, target: Vector3): number
+	local rootPart = currentRootPart
+	local facing = getHorizontal(if rootPart then rootPart.CFrame.LookVector else Vector3.zero)
+	local authored = config.AuthoredTurnSign or -1
+
+	if facing.Magnitude <= 1e-3 or target.Magnitude <= 1e-3 then
+		return authored
+	end
+
+	facing = facing.Unit
+	local horizontal = getHorizontal(target)
+	if horizontal.Magnitude <= 1e-3 then
+		return authored
+	end
+	horizontal = horizontal.Unit
+
+	local cross = facing:Cross(horizontal).Y
+	local angle = angleBetweenDegrees(facing, horizontal)
+
+	-- Effectively a straight reversal: follow the clip's authored direction.
+	if angle >= 180 - (config.HandednessAmbiguityDegrees or 6) or math.abs(cross) <= 1e-3 then
+		return authored
+	end
+
+	return if cross > 0 then 1 else -1
+end
+
+local function beginDrivenRotation(config, targetDirection: Vector3)
+	if not config or config.DriveRotation ~= true then
+		return
+	end
+	local horizontal = getHorizontal(targetDirection)
+	if horizontal.Magnitude <= 1e-3 then
+		return
+	end
+	local rootPart = currentRootPart
+	local facing = getHorizontal(if rootPart then rootPart.CFrame.LookVector else Vector3.zero)
+	if facing.Magnitude <= 1e-3 then
+		return
+	end
+
+	local target = horizontal.Unit
+	facing = facing.Unit
+
+	local sign = resolveTurnSign(config, target)
+	local angle = angleBetweenDegrees(facing, target)
+
+	drivenRotationTarget = target
+	drivenRotationSign = sign
+	drivenRotationRemaining = angle
+	drivenRotationUntil = os.clock() + (config.RotationHoldSeconds or 0.4)
+	drivenRotationRate = config.RotationDegreesPerSecond or 540
+	if currentHumanoid then
+		-- Hand orientation to us for the duration of the turn (§73).
+		previousAutoRotate = currentHumanoid.AutoRotate
+		currentHumanoid.AutoRotate = false
+		localPlayer:SetAttribute(
+			AnimationConfig.RotationAuthorityAttribute,
+			AnimationConfig.RotationAuthorityAnimation
+		)
+	end
+end
+
+local function updateDrivenRotation(deltaTime: number)
+	if drivenRotationUntil <= 0 then
+		return
+	end
+	local rootPart = currentRootPart
+	local humanoid = currentHumanoid
+	if not rootPart or not humanoid or os.clock() >= drivenRotationUntil then
+		if humanoid and drivenRotationUntil > 0 then
+			humanoid.AutoRotate = if previousAutoRotate == nil then true else previousAutoRotate
+		end
+		drivenRotationUntil = 0
+		drivenRotationTarget = nil
+		drivenRotationRemaining = 0
+		previousAutoRotate = nil
+		-- Orientation goes back to normal movement ownership (§73).
+		localPlayer:SetAttribute(AnimationConfig.RotationAuthorityAttribute, nil)
+		return
+	end
+
+	local target = drivenRotationTarget
+	if not target then
+		return
+	end
+	local current = getHorizontal(rootPart.CFrame.LookVector)
+	if current.Magnitude <= 1e-3 then
+		return
+	end
+	current = current.Unit
+
+	--[[
+		Bounded yaw step in the handedness chosen at the start of the turn.
+
+		This rotates by an explicit signed angle rather than lerping toward the
+		target, because a lerp always takes the shortest arc: on a left reversal
+		it would silently drag the body back through the right-hand side and
+		undo the mirrored turn.
+	]]
+	local remaining = math.min(drivenRotationRemaining, angleBetweenDegrees(current, target))
+	if remaining <= 2 then
+		humanoid.AutoRotate = if previousAutoRotate == nil then true else previousAutoRotate
+		drivenRotationUntil = 0
+		drivenRotationTarget = nil
+		drivenRotationRemaining = 0
+		previousAutoRotate = nil
+		localPlayer:SetAttribute(AnimationConfig.RotationAuthorityAttribute, nil)
+		return
+	end
+
+	local step = math.min(drivenRotationRate * deltaTime, remaining)
+	drivenRotationRemaining = remaining - step
+
+	local nextDirection = (CFrame.Angles(0, math.rad(step * drivenRotationSign), 0) * current)
+	if nextDirection.Magnitude > 1e-3 then
+		nextDirection = nextDirection.Unit
+		rootPart.CFrame = CFrame.lookAt(rootPart.Position, rootPart.Position + nextDirection)
+	end
+end
+
+local function transitionReady(slot: string, config): boolean
+	if not config or config.Enabled == false then
+		return false
+	end
+	if not activeTracks[slot] then
+		return false
+	end
+	local last = lastTransitionAt[slot]
+	return not last or os.clock() - last >= (config.Cooldown or 0.5)
+end
+
+-- Locomotion transitions are cosmetic. They are selected from actual movement
+-- state and never gate input; MovementController keeps full authority.
+local function updateLocomotionTransitions(locomotionState, speed: number, deltaTime: number)
+	if transitionConfig.Enabled == false or activeAction ~= "" then
+		return
+	end
+
+	local intent = math.max(locomotionState.InputMagnitude or 0, locomotionState.RawMagnitude or 0)
+	local requestedDirection = getHorizontal(locomotionState.RawDirection or Vector3.zero)
+	local movingDirection = getHorizontal(
+		if currentRootPart then currentRootPart.AssemblyLinearVelocity else Vector3.zero
+	)
+	local facing = getHorizontal(if currentRootPart then currentRootPart.CFrame.LookVector else Vector3.zero)
+	local now = os.clock()
+
+	-- Genuine reversal while already travelling.
+	local reversal = transitionConfig.DirectionChange180
+	if reversal and reversal.Enabled ~= false
+		and speed >= (reversal.MinimumSpeed or 11)
+		and intent > 0.05
+		and previousMovingDirection.Magnitude > 1e-3
+		and requestedDirection.Magnitude > 1e-3
+	then
+		local reversalAngle = angleBetweenDegrees(previousMovingDirection, requestedDirection)
+		if reversalAngle >= (reversal.MinimumAngleDegrees or 140) then
+			if reversalCandidateAt <= 0 then
+				reversalCandidateAt = now
+			elseif now - reversalCandidateAt >= (reversal.SustainSeconds or 0.05)
+				and transitionReady("DirectionChange180", reversal)
+			then
+				reversalCandidateAt = 0
+				lastTransitionAt.DirectionChange180 = now
+
+				--[[
+					The clip is authored as a right turn and Roblox exposes no
+					runtime skeletal mirroring, so a left reversal cannot be shown
+					correctly from this asset. AdjustSpeed(-1) is playback
+					reversal, not a mirror, and would be wrong here.
+
+					The gameplay yaw is still mirrored properly by
+					beginDrivenRotation. The clip itself is played at a reduced
+					weight for a left turn so its right-hand lean blends toward
+					normal locomotion instead of visibly contradicting the
+					direction the body is travelling. A dedicated left-turn asset
+					is required for true limb-level mirroring.
+				]]
+				local mirrored = resolveTurnSign(reversal, requestedDirection) > 0
+				local weight = if mirrored
+					then (reversal.UnmirroredClipWeight or 0.55)
+					else 1
+
+				startAction("DirectionChange180", weight)
+				beginDrivenRotation(reversal, requestedDirection)
+				return
+			end
+		else
+			reversalCandidateAt = 0
+		end
+	else
+		reversalCandidateAt = 0
+	end
+
+	-- Starting to move from a genuine standstill.
+	local idleStart = transitionConfig.IdleToSprint
+	local idleStart180 = transitionConfig.IdleToSprint180
+	local standingStill = speed <= math.max(
+		(idleStart and idleStart.MaximumEntrySpeed) or 3.5,
+		(idleStart180 and idleStart180.MaximumEntrySpeed) or 3.5
+	)
+
+	if standingStill and not locomotionVisualActive and requestedDirection.Magnitude > 1e-3 then
+		-- Measure only against live facing. Using a travel direction left over
+		-- from a previous coast is what produced IdleToSprint180 firing with a
+		-- logged angle of ~0 degrees.
+		local facingAngle = if facing.Magnitude > 1e-3
+			then angleBetweenDegrees(facing, requestedDirection)
+			else 0
+		local wantsReverseStart = idleStart180
+			and idleStart180.Enabled ~= false
+			and facing.Magnitude > 1e-3
+			and intent >= (idleStart180.MinimumIntent or 0.35)
+			and facingAngle >= (idleStart180.MinimumAngleDegrees or 115)
+
+		-- Require the reversal intent to persist, so one noisy frame cannot
+		-- classify a straight-ahead start as an opposite-direction start.
+		if wantsReverseStart then
+			if reverseStartCandidateAt <= 0 then
+				reverseStartCandidateAt = now
+			end
+		else
+			reverseStartCandidateAt = 0
+		end
+
+		if wantsReverseStart
+			and now - reverseStartCandidateAt >= (idleStart180.SustainSeconds or 0.06)
+			and transitionReady("IdleToSprint180", idleStart180)
+		then
+			reverseStartCandidateAt = 0
+			lastTransitionAt.IdleToSprint180 = now
+			startAction("IdleToSprint180")
+			beginDrivenRotation(idleStart180, requestedDirection)
+		elseif not wantsReverseStart
+			and idleStart and idleStart.Enabled ~= false
+			and intent >= (idleStart.MinimumIntent or 0.35)
+			and transitionReady("IdleToSprint", idleStart)
+		then
+			lastTransitionAt.IdleToSprint = now
+			startAction("IdleToSprint")
+		end
+	else
+		reverseStartCandidateAt = 0
+	end
+
+	if movingDirection.Magnitude > 1e-3 then
+		previousMovingDirection = movingDirection.Unit
+	end
 end
 
 local function resolveBaseLocomotion(
@@ -929,7 +1344,9 @@ local function resolveBaseLocomotion(
 	local sprintTurn = currentSprintTurn
 	local sprintTurnAngle = 0
 	local direction = currentDirection
-	local rawMagnitude = locomotionState.InputMagnitude or locomotionState.RawMagnitude or 0
+	-- Take whichever intent is larger. RawMagnitude carries assisted movement;
+	-- InputMagnitude carries the player's own stick.
+	local rawMagnitude = math.max(locomotionState.InputMagnitude or 0, locomotionState.RawMagnitude or 0)
 	local visualMovement = updateLocomotionVisualActive(rawMagnitude, speed)
 	local unsupportedAirborne = isAirborne(humanoid) and activeAction ~= "Jump"
 	if unsupportedAirborne then
@@ -964,6 +1381,86 @@ local function resolveBaseLocomotion(
 	return state, currentLocomotionFamily, direction, sprintTurn, sprintTurnAngle
 end
 
+--[[
+	GOALKEEPER PRESENTATION.
+
+	A keeper is not an outfielder standing in a different place: their set
+	position, their lateral guard step and the way they hold the ball are their
+	own vocabulary, and playing an outfield idle in goal is one of the things
+	that made choosing GK feel like nothing had happened.
+
+	The state machine is deliberately tiny, because the keeper's job on the line
+	is tiny:
+
+		holding the ball   -> the idle that has a ball in it
+		diving             -> the reach clip, owned by the action layer
+		shuffling          -> the lateral guard step
+		otherwise standing -> the set position
+
+	and above a running speed it hands back to the ordinary locomotion set, so
+	sprinting off the line looks like a footballer sprinting.
+
+	Returns whether it took ownership of the body this frame.
+]]
+local function updateGoalkeeperAnimation(rootPart: BasePart, speed: number, deltaTime: number): boolean
+	local model = localPlayer.Character
+	if not model or model:GetAttribute(GoalkeeperConfig.RoleAttributeName) ~= GoalkeeperConfig.Role then
+		if keeperPresentationActive then
+			-- No longer a keeper: release the keeper clips so the outfield set can
+			-- take the body back cleanly.
+			stopFamily("Keeper", blendConfig.LocomotionToIdle)
+			keeperPresentationActive = false
+		end
+		return false
+	end
+	if not activeTracks.KeeperIdle then
+		return false
+	end
+
+	local keeperConfig = AnimationConfig.Goalkeeper
+	if keeperConfig.Enabled ~= true then
+		return false
+	end
+
+	-- Running out is footballer movement, not goalkeeping.
+	if speed > keeperConfig.RunThreshold and model:GetAttribute(GoalkeeperConfig.Attributes.Holding) ~= true then
+		if keeperPresentationActive then
+			stopFamily("Keeper", keeperConfig.FadeOutTime)
+			keeperPresentationActive = false
+		end
+		return false
+	end
+
+	local desired = "KeeperIdle"
+	if model:GetAttribute(GoalkeeperConfig.Attributes.Holding) == true and activeTracks.KeeperIdleWithBall then
+		desired = "KeeperIdleWithBall"
+	else
+		local lateral = math.abs(getHorizontal(rootPart.AssemblyLinearVelocity):Dot(rootPart.CFrame.RightVector))
+		if lateral >= keeperConfig.SideStepMinimumSpeed and activeTracks.KeeperSideStep then
+			desired = "KeeperSideStep"
+		end
+	end
+
+	if not keeperPresentationActive then
+		-- Coming from the outfield set: stop it rather than layering on top.
+		stopLocomotion(keeperConfig.FadeInTime)
+		keeperPresentationActive = true
+	end
+	if currentKeeperClip ~= desired then
+		for _, slot in { "KeeperIdle", "KeeperIdleWithBall", "KeeperSideStep" } do
+			if slot ~= desired then
+				stopTrack(slot, keeperConfig.FadeOutTime)
+			end
+		end
+		currentKeeperClip = desired
+	end
+	playTrack(desired, keeperConfig.FadeInTime, 1, keeperConfig.PlaybackRate)
+	currentBasePlaybackRate = keeperConfig.PlaybackRate
+	currentPlaybackRate = keeperConfig.PlaybackRate
+	updateDiagnostics(desired, "Goalkeeper", "Idle", 0, speed, false, false, "Forward", 0, 0, 0, false)
+	return true
+end
+
 local function updateAnimation(deltaTime: number)
 	local humanoid = currentHumanoid
 	local rootPart = currentRootPart
@@ -985,24 +1482,84 @@ local function updateAnimation(deltaTime: number)
 		presentationDirection = locomotionState.RawDirection
 	end
 
+	--[[
+		The keeper owns the body while it is guarding the line. Placed before any
+		outfield selection so the two sets can never both be driving the rig.
+	]]
+	if updateGoalkeeperAnimation(rootPart, speed, deltaTime) then
+		return
+	end
+
 	local localForward, localRight, movementAngle = getLocalMovement(rootPart, presentationDirection)
 	local isPlaceholder = hasBall
 	local ball = getFootball()
 	updateReceptionAction(ball)
 	updateJumpAction(humanoid, speed, sprintRequested)
-	updateSprintActive(speed, sprintRequested, locomotionState.InputMagnitude or locomotionState.RawMagnitude or 0)
+	updateSprintActive(speed, sprintRequested, math.max(locomotionState.InputMagnitude or 0, locomotionState.RawMagnitude or 0))
 	updateStopTrapAction(locomotionState, speed, hasBall, ball)
+	updateLocomotionTransitions(locomotionState, speed, deltaTime)
+	updateDrivenRotation(deltaTime)
 
-	local baseState, family, direction, sprintTurn, sprintTurnAngle = resolveBaseLocomotion(
-		humanoid,
-		locomotionState,
-		movementAngle,
-		speed,
-		hasBall,
-		deltaTime
-	)
-	desiredBaseState = baseState
+	--[[
+		LOCOMOTION HOLDS WHILE A DRIVEN TRANSITION RUNS (§72).
+
+		The transition owns the legs. Re-selecting jog or sprint underneath it is
+		what produced the visible stutter, so the base selection is skipped
+		entirely and the previous state is reported unchanged.
+	]]
+	local drivenTransition = activeAction ~= "" and DRIVEN_TRANSITION_ACTIONS[activeAction] == true
+
+	local baseState, family, direction, sprintTurn, sprintTurnAngle
+	if drivenTransition then
+		baseState = desiredBaseState
+		family = currentLocomotionFamily
+		direction = currentDirection
+		sprintTurn = currentSprintTurn
+		sprintTurnAngle = 0
+	else
+		baseState, family, direction, sprintTurn, sprintTurnAngle = resolveBaseLocomotion(
+			humanoid,
+			locomotionState,
+			movementAngle,
+			speed,
+			hasBall,
+			deltaTime
+		)
+		desiredBaseState = baseState
+	end
+
 	local actionActive = updateActionLifecycle(speed, sprintRequested)
+
+	--[[
+		EXIT (§74).
+
+		The transition has just finished. The body is now facing a completely
+		different way from when it started, so the outgoing state must be chosen
+		against the NEW facing and the CURRENT velocity rather than resumed from
+		whatever was playing before the turn -- which is what made the exit snap
+		into a directional jog that contradicted the body.
+
+		Clearing the cached direction and family forces the next frame's selection
+		to re-evaluate from scratch and to crossfade in, instead of assuming the
+		clip already running is still the right one.
+	]]
+	if drivenTransition and not actionActive then
+		currentDirection = "Forward"
+		currentSprintTurn = "Forward"
+		currentLocomotionFamily = "Default"
+		sprintTurnCandidate = "Forward"
+		sprintTurnCandidateAt = 0
+		baseState, family, direction, sprintTurn, sprintTurnAngle = resolveBaseLocomotion(
+			humanoid,
+			locomotionState,
+			movementAngle,
+			speed,
+			hasBall,
+			deltaTime
+		)
+		desiredBaseState = baseState
+	end
+
 	local displayState = if actionActive then activeAction else baseState
 
 	updateDiagnostics(
@@ -1081,6 +1638,37 @@ local function configureCharacter(character: Model)
 	loadTrack("Jump", assets.Locomotion.Jump, "B90_LOC_Jump", jumpConfig.Priority, false)
 	loadTrack("Pass", assets.Actions.Pass, "B90_ACT_Pass", passConfig.Priority, false)
 	loadTrack("Shoot", assets.Actions.Shoot, "B90_ACT_Shoot", shootConfig.Priority, false)
+
+	--[[
+		THE KEEPER SET.
+
+		Loaded for every local footballer rather than only for goalkeepers,
+		because the position can change between spawns and a keeper who is missing
+		their clips falls back to an outfielder's idle -- which is precisely the
+		"my animation does not use keeper animation" symptom. Five short clips
+		cost far less than getting this wrong.
+
+		These are the same assets the AI keepers already use, so a human keeper
+		and a bot keeper are visually the same footballer.
+	]]
+	local keeperAssets = assets.Goalkeeper
+	local keeperConfig = AnimationConfig.Goalkeeper
+	if keeperAssets then
+		loadTrack("KeeperIdle", keeperAssets.Idle, "B90_GK_Idle", keeperConfig.IdlePriority, true)
+		loadTrack("KeeperIdleWithBall", keeperAssets.IdleWithBall, "B90_GK_IdleWithBall", keeperConfig.IdlePriority, true)
+		loadTrack("KeeperSideStep", keeperAssets.SideStep, "B90_GK_SideStep", keeperConfig.MovementPriority, true)
+		loadTrack("KeeperCatchStanding", keeperAssets.CatchStanding, "B90_GK_CatchStanding", keeperConfig.ActionPriority, false)
+		loadTrack("KeeperThrowPass", keeperAssets.ThrowPass, "B90_GK_ThrowPass", keeperConfig.ActionPriority, false)
+	end
+	for slot, animationId in transitionAssets do
+		local slotConfig = transitionConfig[slot]
+		if slotConfig and slotConfig.Enabled ~= false then
+			loadTrack(slot, animationId, "B90_LOC_" .. slot, slotConfig.Priority, false)
+		end
+	end
+	table.clear(lastTransitionAt)
+	reversalCandidateAt = 0
+	previousMovingDirection = Vector3.zero
 	local shootRecord = activeTracks.Shoot
 	if shootRecord then
 		table.insert(characterConnections, shootRecord.Track:GetMarkerReachedSignal("BallContact"):Connect(function()

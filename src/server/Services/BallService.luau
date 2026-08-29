@@ -8,6 +8,7 @@ local BallConfig = require(Shared.Config.BallConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local PitchConfig = require(Shared.Config.PitchConfig)
 local WorldScaleConfig = require(Shared.Config.WorldScaleConfig)
+local CollisionGroupConfig = require(Shared.Config.CollisionGroupConfig)
 local FreeBallPhysics = require(Shared.Football.FreeBallPhysics)
 local BallControlService = require(script.Parent.BallControlService)
 local PitchService = require(script.Parent.PitchService)
@@ -77,6 +78,15 @@ local function getOrCreateFootball(ballFolder: Folder): Part
 
 	local ball = Instance.new("Part")
 	ball.Name = BallConfig.Name
+	--[[
+		The football has its own collision group purely so the referee can be
+		excluded from it. Ball-against-everything else is unchanged; see
+		CollisionGroupConfig. Guarded so a missing group can never stop the ball
+		from being created.
+	]]
+	pcall(function()
+		ball.CollisionGroup = CollisionGroupConfig.Ball
+	end)
 	ball.Parent = ballFolder
 
 	return ball
@@ -502,6 +512,25 @@ local function applyFootballFlightGravity(ball: BasePart, deltaTime: number)
 		and ball.AssemblyLinearVelocity.Y <= 0
 	then
 		return
+	end
+
+	--[[
+		CURVE (§69). Applied here, in the same step as the custom gravity, because
+		it is the same kind of term: a constant acceleration on a ball that is
+		already in flight. Reading it from an attribute keeps the decision at
+		release and this integration purely mechanical.
+	]]
+	local curve = ball:GetAttribute(flightConfig.CurveAttributeName)
+	if typeof(curve) == "Vector3" and curve.Magnitude > 1e-3 then
+		local bounced = ball:GetAttribute("FootballBounceCount")
+		if flightConfig.CurveSurvivesBounce ~= true and typeof(bounced) == "number" and bounced > 0 then
+			ball:SetAttribute(flightConfig.CurveAttributeName, Vector3.zero)
+		else
+			local clamped = if curve.Magnitude > flightConfig.MaximumCurveAcceleration
+				then curve.Unit * flightConfig.MaximumCurveAcceleration
+				else curve
+			ball.AssemblyLinearVelocity += clamped * deltaTime
+		end
 	end
 
 	local bounceCount = ball:GetAttribute("FootballBounceCount")

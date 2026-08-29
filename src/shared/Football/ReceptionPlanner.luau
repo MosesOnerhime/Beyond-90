@@ -122,8 +122,9 @@ local function getFirstTouchVelocity(
 		Vector3.new(target.X, ball.Position.Y, target.Z)
 end
 
-function ReceptionPlanner.Evaluate(
-	player: Player,
+local function evaluate(
+	receiverId: number,
+	receiverReference,
 	ball: BasePart,
 	rootPart: BasePart,
 	humanoid: Humanoid,
@@ -131,8 +132,8 @@ function ReceptionPlanner.Evaluate(
 	previousBallPosition: Vector3?
 )
 	local actionContext = getBallActionContext(ball)
-	local intendedReceiver = actionContext.IntendedReceiverUserId == player.UserId
-		and player.UserId ~= 0
+	local intendedReceiver = actionContext.IntendedReceiverUserId == receiverId
+		and receiverId ~= 0
 		and os.clock() - actionContext.ActionTime <= config.IntendedReceiverWindowSeconds
 	local ballVelocity = ball.AssemblyLinearVelocity
 	local ballHorizontalVelocity = getHorizontal(ballVelocity)
@@ -228,7 +229,7 @@ function ReceptionPlanner.Evaluate(
 		touchDirection = -ballHorizontalVelocity.Unit
 	end
 
-	if actionContext.ActionType == "KnockOn" and player.UserId == actionContext.InitiatorUserId and playerSpeed >= config.MinChasePlayerSpeed then
+	if actionContext.ActionType == "KnockOn" and receiverId == actionContext.InitiatorUserId and playerSpeed >= config.MinChasePlayerSpeed then
 		touchDirection = movementDirection
 	end
 
@@ -254,7 +255,8 @@ function ReceptionPlanner.Evaluate(
 	end
 
 	return {
-		Player = player,
+		Player = receiverReference,
+		FootballerId = receiverId,
 		RootPart = rootPart,
 		Humanoid = humanoid,
 		Distance = distance,
@@ -276,6 +278,38 @@ function ReceptionPlanner.Evaluate(
 		IntendedReceiver = intendedReceiver,
 		InitiatorUserId = actionContext.InitiatorUserId,
 	}
+end
+
+function ReceptionPlanner.Evaluate(
+	player: Player,
+	ball: BasePart,
+	rootPart: BasePart,
+	humanoid: Humanoid,
+	config,
+	previousBallPosition: Vector3?
+)
+	return evaluate(player.UserId, player, ball, rootPart, humanoid, config, previousBallPosition)
+end
+
+function ReceptionPlanner.EvaluateActor(actor, ball: BasePart, config, previousBallPosition: Vector3?)
+	if not actor or typeof(actor.Id) ~= "number" or not actor.RootPart or not actor.Humanoid then
+		return nil
+	end
+	local result = evaluate(
+		actor.Id,
+		actor,
+		ball,
+		actor.RootPart,
+		actor.Humanoid,
+		config,
+		previousBallPosition
+	)
+	if result then
+		result.DisplayName = actor.DisplayName
+		result.ControlKey = actor.Character
+		result.IsAI = true
+	end
+	return result
 end
 
 return ReceptionPlanner

@@ -31,6 +31,19 @@ local function getRoot(player: Player): BasePart?
 	return if humanoid and humanoid.Health > 0 and root and root:IsA("BasePart") then root else nil
 end
 
+local function getReceiverRoot(receiver): (BasePart?, Model?)
+	if receiver and receiver:IsA("Player") then
+		return getRoot(receiver), receiver.Character
+	elseif receiver and receiver:IsA("Model") then
+		local humanoid = receiver:FindFirstChildOfClass("Humanoid")
+		local root = receiver:FindFirstChild("HumanoidRootPart")
+		if humanoid and humanoid.Health > 0 and root and root:IsA("BasePart") then
+			return root, receiver
+		end
+	end
+	return nil, nil
+end
+
 local function hasPossession(ball: BasePart?): boolean
 	return ball ~= nil
 		and ball:GetAttribute("State") == "Controlled"
@@ -74,14 +87,14 @@ local function updateLine()
 	local candidate = plan and plan.SelectedCandidate
 	local receiver = candidate and candidate.Instance
 	local passerRoot = getRoot(localPlayer)
-	local receiverRoot = if receiver and receiver:IsA("Player") then getRoot(receiver) else nil
+	local receiverRoot, receiverCharacter = getReceiverRoot(receiver)
 	local ball = getFootball()
 	if not plan or not passerRoot or not receiverRoot or not hasPossession(ball) then
 		hidePreview()
 		return
 	end
 
-	local exclusions = { localPlayer.Character :: Instance, receiver.Character :: Instance }
+	local exclusions = { localPlayer.Character :: Instance, receiverCharacter :: Instance }
 	if ball then
 		table.insert(exclusions, ball)
 	end

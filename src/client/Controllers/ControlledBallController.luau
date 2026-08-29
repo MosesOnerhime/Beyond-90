@@ -5,8 +5,10 @@ local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local BallConfig = require(Shared.Config.BallConfig)
+local PositionConfig = require(ReplicatedStorage.Shared.Config.PositionConfig)
 local BallControlMath = require(Shared.Football.BallControlMath)
 local GameConfig = require(Shared.Config.GameConfig)
+local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local MovementController = require(script.Parent:WaitForChild("MovementController"))
 local PlayerConfig = require(Shared.Config.PlayerConfig)
 
@@ -26,6 +28,8 @@ local controlMode = "Carry"
 local captureStartedAt = 0
 local lastCaptureExitAt = 0
 local lastTouchEventTime = 0
+local lastFastTurnAt = 0
+local lastFastTurnAlpha = 0
 local touchEventCount = 0
 local lastDiagnosticTime = 0
 local lastTouchSide = 1
@@ -142,6 +146,62 @@ local function getLocomotionDirection(rootPart: BasePart, locomotionState): Vect
 	return controlDirection or getFacingDirection(rootPart)
 end
 
+-- Dribbling skill 0..1. Development-controlled today; a progression system can
+-- later supply the same normalized value without touching this code.
+local function getDribblingSkill(): number
+	local dribbling = BallConfig.Dribbling
+	if not dribbling or dribbling.Enabled ~= true then
+		return 1
+	end
+	local raw = localPlayer:GetAttribute(dribbling.AttributeName)
+	if typeof(raw) ~= "number" then
+		--[[
+			With no explicit value, the baseline comes from the footballer's
+			position (§43): a forward carries the ball better than a defender.
+			An explicit value is a DEV override and is used as given, so skill
+			testing is not silently rescaled.
+		]]
+		raw = dribbling.DefaultSkill
+			* PositionConfig.GetSkill(localPlayer:GetAttribute(PositionConfig.SlotAttributeName), "Dribbling")
+	end
+	return math.clamp(raw / 100, 0, 1)
+end
+
+-- How sharp is the requested turn, in degrees, between the ball's current
+-- control lane and where the player is now asking to go?
+local function getRequestedTurnAngle(locomotionState): number
+	if locomotionState.RawMagnitude <= 0 or locomotionState.RawDirection.Magnitude <= 0 then
+		return 0
+	end
+	local current = ballIntentDirection or controlDirection
+	if not current or current.Magnitude <= 0 then
+		return 0
+	end
+	local dot = math.clamp(current:Dot(locomotionState.RawDirection.Unit), -1, 1)
+	return math.deg(math.acos(dot))
+end
+
+-- Fast-turn strength for the current request: 0 = no benefit, 1 = full.
+local function getFastTurnAlpha(locomotionState): number
+	local fastTurn = BallConfig.Dribbling and BallConfig.Dribbling.FastTurn
+	if not fastTurn or fastTurn.Enabled ~= true then
+		return 0
+	end
+	local angle = getRequestedTurnAngle(locomotionState)
+	if angle < fastTurn.MinimumAngleDegrees then
+		return 0
+	end
+	local span = math.max(fastTurn.FullAngleDegrees - fastTurn.MinimumAngleDegrees, 1e-4)
+	local angleAlpha = math.clamp((angle - fastTurn.MinimumAngleDegrees) / span, 0, 1)
+
+	-- Skill gates how much of the benefit is available, but never removes it.
+	local skillConfig = BallConfig.Dribbling.Skill
+	local skill = getDribblingSkill()
+	local benefit = skillConfig.MinimumTurnBenefit
+		+ (1 - skillConfig.MinimumTurnBenefit) * skill
+	return angleAlpha * benefit
+end
+
 local function getBallIntentTargetDirection(rootPart: BasePart, locomotionState): Vector3
 	if locomotionState.RawMagnitude > 0 and locomotionState.RawDirection.Magnitude > 0 then
 		local desiredDirection = locomotionState.RawDirection.Unit
@@ -169,6 +229,19 @@ local function updateBallIntentDirection(rootPart: BasePart, locomotionState, de
 		turnRate = math.max(turnRate, controlConfig.CaptureDirectionTurnRate)
 	end
 
+	-- Rotate the control lane onto the new intent earlier rather than waiting
+	-- out the old forward touch. This is what makes a sharp change feel like
+	-- football instead of a delayed drift.
+	local fastTurnAlpha = getFastTurnAlpha(locomotionState)
+	if fastTurnAlpha > 0 then
+		local fastTurn = BallConfig.Dribbling.FastTurn
+		local scale = fastTurn.MinimumTurnRateScale
+			+ (fastTurn.MaximumTurnRateScale - fastTurn.MinimumTurnRateScale) * fastTurnAlpha
+		turnRate *= scale
+		lastFastTurnAt = os.clock()
+		lastFastTurnAlpha = fastTurnAlpha
+	end
+
 	local alpha = math.clamp(turnRate * deltaTime, 0, 1)
 	local nextDirection = BallControlMath.SafeUnit(currentDirection:Lerp(targetDirection, alpha), targetDirection)
 
@@ -177,8 +250,49 @@ local function updateBallIntentDirection(rootPart: BasePart, locomotionState, de
 	return nextDirection
 end
 
+--[[
+	STRIKE PREPARATION (§41, §42).
+
+	Set while the player is holding a shot intent that cannot be struck yet. The
+	ball is drawn back toward a strikeable lead so the next contact arrives
+	sooner, instead of the shot waiting out a full sprint touch and then being
+	rejected for a lead the dribble itself created.
+]]
+local strikePrepUntil = 0
+
+function ControlledBallController.BeginStrikePreparation(duration: number?)
+	local prep = FootballActionConfig.Shoot.Buffer
+		and FootballActionConfig.Shoot.Buffer.StrikePreparation
+	if not prep or prep.Enabled ~= true then
+		return
+	end
+	strikePrepUntil = os.clock() + math.max(duration or 0, 0)
+end
+
+function ControlledBallController.EndStrikePreparation()
+	strikePrepUntil = 0
+end
+
+local function getStrikePreparationLead(): number?
+	if os.clock() >= strikePrepUntil then
+		return nil
+	end
+	local shoot = FootballActionConfig.Shoot
+	local prep = shoot.Buffer and shoot.Buffer.StrikePreparation
+	if not prep or prep.Enabled ~= true then
+		return nil
+	end
+	return shoot.Contact.MaximumForwardLead * prep.LeadScale
+end
+
 local function getLeadDistance(locomotionState): number
 	local minDistance = getMinimumControlDistance()
+
+	-- A declared shot overrides the dribble's own lead: bring it to the foot.
+	local strikeLead = getStrikePreparationLead()
+	if strikeLead then
+		return math.max(strikeLead, minDistance)
+	end
 
 	if not locomotionState.IsMoving or locomotionState.SmoothedSpeed <= controlConfig.StationaryPlayerSpeed then
 		return math.max(controlConfig.StationaryCarryLeadDistance, minDistance)
@@ -190,6 +304,14 @@ local function getLeadDistance(locomotionState): number
 
 	if controlMode == "Capture" then
 		lead *= controlConfig.CaptureLeadScale
+	end
+
+	-- Pull the football closer through a hard turn so it stays inside a
+	-- reachable control lane rather than swinging wide.
+	local fastTurnAlpha = getFastTurnAlpha(locomotionState)
+	if fastTurnAlpha > 0 then
+		local fastTurn = BallConfig.Dribbling.FastTurn
+		lead *= 1 - (1 - fastTurn.LeadTightenScale) * fastTurnAlpha
 	end
 
 	return math.max(lead, minDistance)
@@ -397,6 +519,18 @@ end
 local function updateTouchCancellation(locomotionState)
 	if lastTouchEventTime <= 0 or touchPulseCancelled then
 		return
+	end
+
+	-- A sharp change of intent invalidates the touch already in flight. Without
+	-- this the football finishes travelling along the old axis before it will
+	-- respond, which is exactly the delayed, heavy feel we are removing.
+	local fastTurn = BallConfig.Dribbling and BallConfig.Dribbling.FastTurn
+	if fastTurn and fastTurn.Enabled == true then
+		local angle = getRequestedTurnAngle(locomotionState)
+		if angle >= fastTurn.CancelTouchAngleDegrees then
+			touchPulseCancelled = true
+			return
+		end
 	end
 
 	if locomotionState.RawMagnitude <= 0 then
@@ -699,6 +833,22 @@ local function updateControlledRestState(triggers): boolean
 	return controlledRestActive
 end
 
+-- Additional gain/damping applied while a fast turn is resolving, so the ball
+-- actually crosses onto the new control lane instead of drifting there.
+local function getFastTurnServoBonus(): (number, number)
+	local fastTurn = BallConfig.Dribbling and BallConfig.Dribbling.FastTurn
+	if not fastTurn or fastTurn.Enabled ~= true or lastFastTurnAt <= 0 then
+		return 0, 0
+	end
+	local elapsed = os.clock() - lastFastTurnAt
+	if elapsed > fastTurn.RecoverySeconds then
+		return 0, 0
+	end
+	local decay = 1 - elapsed / math.max(fastTurn.RecoverySeconds, 1e-4)
+	local weight = lastFastTurnAlpha * decay
+	return fastTurn.TurnPositionGainBonus * weight, fastTurn.TurnVelocityDampingBonus * weight
+end
+
 local function getPhaseServoScales(phase: string): (number, number)
 	if controlMode == "Capture" then
 		return 1, 1
@@ -903,6 +1053,29 @@ local function applyPossessionServo(ball: BasePart, rootPart: BasePart, locomoti
 	local positionScale, dampingScale = getPhaseServoScales(phase)
 	positionGain *= positionScale
 	velocityDamping *= dampingScale
+
+	-- Extra authority while a fast turn resolves, so the football crosses onto
+	-- the new control lane promptly instead of drifting across it.
+	local turnGainBonus, turnDampingBonus = getFastTurnServoBonus()
+	positionGain += turnGainBonus
+	velocityDamping += turnDampingBonus
+
+	-- Skill-based control error. At full skill this is exactly zero; at low skill
+	-- the lane widens slightly but the ball is always still recoverable.
+	local dribbling = BallConfig.Dribbling
+	if dribbling and dribbling.Enabled == true then
+		local skill = getDribblingSkill()
+		local errorStuds = dribbling.Skill.MaximumControlErrorStuds * (1 - skill)
+		if errorStuds > 0.01 then
+			-- Slow, smooth wander rather than per-frame jitter.
+			local wander = math.sin(os.clock() * 2.3 + leadDiagnosticSampleId) * errorStuds
+			local lateral = Vector3.new(-direction.Z, 0, direction.X)
+			targetError += lateral * wander
+			positionGain *= dribbling.Skill.LowSkillRecoveryScale
+				+ (1 - dribbling.Skill.LowSkillRecoveryScale) * skill
+		end
+	end
+
 	local maxForwardLead = getMaximumPeakForwardLead(locomotionState)
 	local beyondPeakLead = math.max(0, leadBeforeTarget - maxForwardLead)
 

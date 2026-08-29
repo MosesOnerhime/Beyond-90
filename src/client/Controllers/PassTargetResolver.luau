@@ -5,8 +5,11 @@ local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local BallConfig = require(Shared.Config.BallConfig)
+local AIConfig = require(Shared.Config.AIConfig)
 local BallControlMath = require(Shared.Football.BallControlMath)
+local RestartControl = require(Shared.Football.RestartControl)
 local FootballActionConfig = require(Shared.Config.FootballActionConfig)
+local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
 local FootballTeamEligibility = require(Shared.Football.FootballTeamEligibility)
 local GameConfig = require(Shared.Config.GameConfig)
 local PassPlanner = require(Shared.Football.PassPlanner)
@@ -42,7 +45,18 @@ local function getRoot(player: Player): BasePart?
 	return if humanoid and humanoid.Health > 0 and root and root:IsA("BasePart") then root else nil
 end
 
+--[[
+	May the local player pass right now?
+
+	Open-play possession, OR a live restart they are the taker of (§31). Without
+	the second case a human free-kick or kick-off taker resolved no candidates at
+	all and every Pass press logged `no-valid-receiver` -- which is exactly what
+	the runtime evidence showed.
+]]
 local function hasPossession(ball: BasePart?): boolean
+	if RestartControl.IsHeldBy(ball, localPlayer.UserId) then
+		return true
+	end
 	return ball ~= nil
 		and ball:GetAttribute("State") == "Controlled"
 		and ball:GetAttribute("ControllerUserId") == localPlayer.UserId
@@ -77,6 +91,31 @@ local function collectCandidates()
 					Name = player.Name,
 					UserId = player.UserId,
 					Instance = player,
+					Position = root.Position,
+					Velocity = root.AssemblyLinearVelocity,
+					FacingDirection = BallControlMath.GetHorizontal(root.CFrame.LookVector),
+				})
+			end
+		end
+	end
+	local rootFolder = Workspace:FindFirstChild(GameConfig.WorkspaceContainerName)
+	local footballers = rootFolder and rootFolder:FindFirstChild(AIConfig.FootballerFolderName)
+	if footballers then
+		local localTeam = FootballTeamConfig.Normalize(localPlayer:GetAttribute(FootballTeamConfig.AttributeName))
+		for _, character in footballers:GetChildren() do
+			local humanoid = character:IsA("Model") and character:FindFirstChildOfClass("Humanoid")
+			local root = character:IsA("Model") and character:FindFirstChild("HumanoidRootPart")
+			local id = character:GetAttribute(AIConfig.Attributes.Id)
+			local teamId = FootballTeamConfig.Normalize(character:GetAttribute(FootballTeamConfig.AttributeName))
+			if humanoid and humanoid.Health > 0 and root and root:IsA("BasePart")
+				and typeof(id) == "number" and teamId == localTeam
+			then
+				table.insert(candidates, {
+					Kind = "AI",
+					Name = character.Name,
+					UserId = id,
+					FootballerId = id,
+					Instance = character,
 					Position = root.Position,
 					Velocity = root.AssemblyLinearVelocity,
 					FacingDirection = BallControlMath.GetHorizontal(root.CFrame.LookVector),

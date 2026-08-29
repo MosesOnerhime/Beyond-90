@@ -73,6 +73,25 @@ local BallConfig = {
 			ThroughPass = true,
 			LobPass = true,
 		},
+
+		--[[
+			CURVE (§69).
+
+			A constant horizontal acceleration, decided at release and stored on
+			the ball. It is integrated alongside gravity while the ball is in
+			flight, so a bent shot is genuinely bent -- not a straight shot with a
+			bent line drawn under it.
+
+			It is NOT homing: the vector is fixed when the ball leaves the foot
+			and never consults the goal afterwards, so it is fully predictable and
+			the local preview reproduces it exactly.
+		]]
+		CurveAttributeName = "FootballCurveAcceleration",
+		-- Hard ceiling, so curve can never become a guided missile.
+		MaximumCurveAcceleration = 62,
+		-- Curve is a property of a struck ball in the air. Once it has bounced,
+		-- the spin has largely gone.
+		CurveSurvivesBounce = false,
 	},
 
 	BasicTouch = {
@@ -98,8 +117,33 @@ local BallConfig = {
 		ControlHeightTolerance = 1.25,
 		ControlRetentionMaxSpeed = 68,
 		ControlRetentionSpeedViolationGrace = 0.22,
+		-- Grace before a controller whose retention rule still reports valid, but
+		-- for whom no control context could be built, is actually released.
+		ControlContextLostGrace = 0.25,
 		ControlAcquisitionSpeedGrace = 0.75,
 		ControlRetentionHeightTolerance = 1.8,
+
+		--[[
+			HEIGHT GRACE ON ACQUISITION.
+
+			A lofted pass ARRIVES FROM ABOVE. The reception is legitimate -- the
+			receiver has taken it on the chest or the thigh and is bringing it
+			down -- but for the first fraction of a second afterwards the football
+			is still higher than a ball being dribbled ever is, so the retention
+			check saw it above ControlRetentionHeightTolerance and released
+			possession with "ball too high" the instant it had been granted.
+
+			The speed check already had exactly this problem and already solves it
+			the same way (ControlAcquisitionSpeedGrace): a ball that has just been
+			received is allowed to still be settling. This is that rule applied to
+			the axis a lob actually arrives on.
+
+			Deliberately a GRACE and not a raised tolerance: once the touch has had
+			time to bring the ball down, the ordinary limit applies again, so a
+			player still cannot carry a football at head height.
+		]]
+		ControlAcquisitionHeightGrace = 0.8,
+		ControlAcquisitionHeightTolerance = 5.5,
 		AcquireMinPlayerSpeed = 2,
 		AcquireMinTowardBallDot = 0.12,
 
@@ -265,6 +309,64 @@ local BallConfig = {
 		ControlStealScoreMargin = 1.25,
 		LeadDiagnosticInterval = 0.75,
 		TouchDiagnosticEnabled = true,
+	},
+
+	--[[
+		Dribbling skill and fast direction changes.
+
+		Skill affects CONTROL QUALITY, never top speed. At 100 a correctly
+		executed touch carries no skill-based error at all; lower skill widens
+		the control lane and slows the ball onto a new heading, but the ball is
+		still recoverable -- no random failures.
+	]]
+	Dribbling = {
+		Enabled = true,
+		AttributeName = "Beyond90DribblingSkill",
+		DefaultSkill = 70,
+
+		-- Sharp-turn response. The ball rotates onto the new control lane
+		-- earlier instead of finishing an obsolete forward touch first.
+		FastTurn = {
+			Enabled = true,
+			-- Below this the normal cadence handles it.
+			MinimumAngleDegrees = 55,
+			--[[
+				Full benefit by 130 degrees rather than 150.
+
+				The ramp used to still be climbing at 135, so exactly the turns
+				that throw the ball furthest -- 135 through 180 -- were getting
+				only part of the tightening. A 90-degree turn now lands near the
+				middle of the ramp and anything sharper gets all of it.
+			]]
+			FullAngleDegrees = 130,
+			-- Multiplies BallIntentTurnRate at full skill and a full-angle turn.
+			MaximumTurnRateScale = 2.35,
+			MinimumTurnRateScale = 1.1,
+			-- A sharp turn cancels the in-flight touch so the ball is not left
+			-- travelling along the old axis.
+			CancelTouchAngleDegrees = 95,
+			-- Pull the lead in through a hard turn so the ball stays reachable.
+			-- 0.62 was not enough to stop the ball running on along the old lane.
+			LeadTightenScale = 0.42,
+			-- Extra positional authority while the ball crosses to the new lane.
+			TurnPositionGainBonus = 13,
+			TurnVelocityDampingBonus = 2.2,
+			-- Held slightly longer so the recapture covers the whole turn rather
+			-- than expiring while the body is still coming round.
+			RecoverySeconds = 0.3,
+		},
+
+		-- Skill 0..1 scaling applied to the above.
+		Skill = {
+			-- Lateral control error in studs at zero skill; zero at full skill.
+			MaximumControlErrorStuds = 0.85,
+			-- Fraction of the fast-turn benefit available at zero skill.
+			MinimumTurnBenefit = 0.35,
+			-- First-touch precision falloff at low skill.
+			MaximumFirstTouchErrorStuds = 1.1,
+			-- How much slower a low-skill footballer recovers a difficult touch.
+			LowSkillRecoveryScale = 0.6,
+		},
 	},
 
 	Reception = {

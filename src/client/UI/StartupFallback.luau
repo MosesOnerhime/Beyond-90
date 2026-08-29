@@ -27,11 +27,28 @@ function StartupFallback.Run()
 		return
 	end
 	if player:GetAttribute("Beyond90StartupSequenceActive") == true then
-		local waitStartedAt = os.clock()
+		--[[
+			Wait on LIVENESS, not on a deadline.
+
+			A fixed budget here meant the fallback was silently coupled to the
+			length of the branded sequence: making the intro fades slower pushed
+			the sequence past the budget, and the fallback replayed the entire
+			ident on top of the one already playing.
+
+			So this waits as long as StartupLoading's heartbeat keeps advancing,
+			and only takes over once it has genuinely gone quiet.
+		]]
+		local lastHeartbeat = player:GetAttribute("Beyond90StartupHeartbeat")
+		local lastProgressAt = os.clock()
 		while player:GetAttribute("Beyond90StartupReadyForMenu") ~= true
 			and player:GetAttribute("Beyond90StartupComplete") ~= true
-			and os.clock() - waitStartedAt < ExperienceConfig.PreloadTimeout + 30
+			and os.clock() - lastProgressAt < ExperienceConfig.StartupStallTimeout
 		do
+			local heartbeat = player:GetAttribute("Beyond90StartupHeartbeat")
+			if heartbeat ~= lastHeartbeat then
+				lastHeartbeat = heartbeat
+				lastProgressAt = os.clock()
+			end
 			task.wait()
 		end
 		if player:GetAttribute("Beyond90StartupReadyForMenu") == true

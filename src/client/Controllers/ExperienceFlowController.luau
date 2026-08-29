@@ -11,16 +11,23 @@ local GameConfig = require(Shared.Config.GameConfig)
 local Controllers = script.Parent
 local AnimationController = require(Controllers.AnimationController)
 local AudioController = require(Controllers.AudioController)
+local PositionController = require(script.Parent.PositionController)
 local BallPresentationController = require(Controllers.BallPresentationController)
+local ControlSchemeController = require(Controllers.ControlSchemeController)
 local ControlledBallController = require(Controllers.ControlledBallController)
+local DefendingController = require(Controllers.DefendingController)
 local DevelopmentHUDController = require(Controllers.DevelopmentHUDController)
 local FootballActionController = require(Controllers.FootballActionController)
 local GameModeController = require(Controllers.GameModeController)
+local GoalkeeperController = require(Controllers.GoalkeeperController)
 local InputController = require(Controllers.InputController)
+local MatchPresentationController = require(Controllers.MatchPresentationController)
+local RefereeDecisionController = require(Controllers.RefereeDecisionController)
 local MovementController = require(Controllers.MovementController)
 local PassTargetPresentationController = require(Controllers.PassTargetPresentationController)
 local PassTargetResolver = require(Controllers.PassTargetResolver)
 local PlayerIndicatorController = require(Controllers.PlayerIndicatorController)
+local ShotTrajectoryController = require(Controllers.ShotTrajectoryController)
 local CameraController = require(script.Parent.Parent.Camera.CameraController)
 local UIController = require(script.Parent.Parent.UI.UIController)
 
@@ -38,9 +45,16 @@ local gameplayControllers = {
 	PassTargetResolver,
 	PassTargetPresentationController,
 	FootballActionController,
+	DefendingController,
+	-- After DefendingController, because it reroutes the same tackle input when
+	-- the local footballer is actually a goalkeeper.
+	GoalkeeperController,
+	ShotTrajectoryController,
 	PlayerIndicatorController,
 	BallPresentationController,
 	CameraController,
+	MatchPresentationController,
+	RefereeDecisionController,
 	DevelopmentHUDController,
 }
 
@@ -139,7 +153,7 @@ local function destroyGameplay()
 	gameplayActive = false
 end
 
-function ExperienceFlowController.EnterTraining(teamId: string)
+function ExperienceFlowController.EnterMode(modeId: string, teamId: string)
 	if gameplayActive or localPlayer:GetAttribute("Beyond90ClientExperienceState") == ExperienceConfig.States.ModeLoading then
 		return
 	end
@@ -147,9 +161,11 @@ function ExperienceFlowController.EnterTraining(teamId: string)
 	local currentTransition = transitionId
 	setState(ExperienceConfig.States.ModeLoading)
 	AudioController.BeginTransition()
-	UIController.ShowModeLoading("TRAINING", string.upper(teamId) .. " TEAM - FREE PRACTICE")
+	local modeName = if modeId == "Quick3v3" then "QUICK 3V3" else "TRAINING"
+	local modeDetail = if modeId == "Quick3v3" then "3V3 AI DEVELOPMENT MATCH" else "FREE PRACTICE"
+	UIController.ShowModeLoading(modeName, string.upper(teamId) .. " TEAM - " .. modeDetail)
 	local startedAt = os.clock()
-	GameModeController.EnterTrainingFree(teamId)
+	GameModeController.EnterMode(modeId, teamId)
 	preloadGameplayAssets(function(progress, status)
 		UIController.UpdateModeLoading(status, progress)
 	end)
@@ -170,7 +186,7 @@ function ExperienceFlowController.EnterTraining(teamId: string)
 	if not character or character:GetAttribute("Beyond90CharacterReady") ~= true
 		or localPlayer:GetAttribute("Beyond90ExperienceState") ~= "Gameplay"
 	then
-		warn(string.format("%s[Client][Experience] Training initialization timed out", GameConfig.LogPrefix))
+		warn(string.format("%s[Client][Experience] %s initialization timed out", GameConfig.LogPrefix, modeId))
 		GameModeController.ExitGameplay()
 		setState(ExperienceConfig.States.Menu)
 		UIController.ShowHome()
@@ -192,6 +208,13 @@ function ExperienceFlowController.EnterTraining(teamId: string)
 	setState(ExperienceConfig.States.Gameplay)
 	AudioController.EnterGameplay()
 	UIController.ShowGameplay()
+	-- Everything the player needs is now live. Only at this point may the server
+	-- start the match, so AI cannot contest the ball while we were loading.
+	MatchPresentationController.SignalReady()
+end
+
+function ExperienceFlowController.EnterTraining(teamId: string)
+	ExperienceFlowController.EnterMode("TrainingFree", teamId)
 end
 
 function ExperienceFlowController.ReturnToMenu()
@@ -234,13 +257,19 @@ function ExperienceFlowController.Initialize()
 	end
 	setState(ExperienceConfig.States.MenuLoading)
 	AudioController.Initialize()
+	ControlSchemeController.Initialize()
 	GameModeController.Initialize()
 	UIController.Initialize({
 		EnterTraining = ExperienceFlowController.EnterTraining,
+		EnterMode = ExperienceFlowController.EnterMode,
 		ReturnToMenu = ExperienceFlowController.ReturnToMenu,
 		ResetBall = GameModeController.ResetTrainingBall,
 		SetMenuTrack = AudioController.SetMenuTrack,
 		GetMenuTrack = AudioController.GetMenuTrackIndex,
+		SetMusicEnabled = AudioController.SetMusicEnabled,
+		GetMusicEnabled = AudioController.IsMusicEnabled,
+		SelectPosition = PositionController.SelectPosition,
+		GetPositionOccupancy = PositionController.GetOccupancy,
 		PlayClick = AudioController.PlayClick,
 	})
 	local menuMountStartedAt = os.clock()
@@ -251,11 +280,30 @@ function ExperienceFlowController.Initialize()
 	end
 	localPlayer:SetAttribute("Beyond90MenuReady", true)
 	local startupWaitStartedAt = os.clock()
+	local transitionAtStartupWait = transitionId
 	while localPlayer:GetAttribute("Beyond90StartupComplete") ~= true
 		and os.clock() - startupWaitStartedAt < ExperienceConfig.PreloadTimeout
 	do
 		task.wait()
 	end
+
+	--[[
+		Do not clobber a transition that began while we were waiting.
+
+		This tail used to force the Menu state unconditionally. The startup wait
+		can run for many seconds -- longer still when an asset is slow -- and
+		anything that started entering a mode during that window was silently
+		dragged back to the menu the moment this resumed, after gameplay had
+		already been set up.
+
+		In normal play the window is unreachable, because the menu is not visible
+		to click until this has finished. It cost a verification run to find, and
+		the guard is a transition-id check that costs nothing.
+	]]
+	if transitionId ~= transitionAtStartupWait then
+		return
+	end
+
 	setState(ExperienceConfig.States.Menu)
 	AudioController.EnterMenu()
 	UIController.ShowHome()

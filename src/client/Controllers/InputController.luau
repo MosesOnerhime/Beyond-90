@@ -32,9 +32,13 @@ local connections: { RBXScriptConnection } = {}
 local pressedKeys: { [Enum.KeyCode]: boolean } = {}
 local actionStartedAt: { [string]: number } = {}
 local fallbackThumbstick = Vector2.zero
+local moveStateChanges = 0
+local fallbackActive = false
 local cameraToggleEvent = Instance.new("BindableEvent")
 local jumpEvent = Instance.new("BindableEvent")
 local footballActionEvent = Instance.new("BindableEvent")
+local cameraLockToggleEvent = Instance.new("BindableEvent")
+local tackleAction = nil
 local autoSprintChangedEvent = Instance.new("BindableEvent")
 local manualSprintRequested = false
 local autoSprintEnabled = inputConfig.AutoSprintDefaultEnabled == true
@@ -279,8 +283,20 @@ local function handlePassGesture(value: any)
 	end)
 end
 
+--[[
+	An InputContext only delivers input while it is a descendant of the
+	LocalPlayer. Parented anywhere else -- ReplicatedStorage in particular --
+	every InputAction is created successfully and silently never fires, which
+	looks exactly like broken WASD while setupInputActions() still reports
+	success. PlayerScripts is client-only and dies with the player, so the
+	context has the right lifetime as well as the right owner.
+]]
 local function createInputFolder(): Folder
-	local existing = ReplicatedStorage:FindFirstChild(inputConfig.InputFolderName)
+	local parent: Instance = localPlayer:FindFirstChildOfClass("PlayerScripts")
+		or localPlayer:WaitForChild("PlayerScripts", 5)
+		or localPlayer
+
+	local existing = parent:FindFirstChild(inputConfig.InputFolderName)
 
 	if existing and existing:IsA("Folder") then
 		return existing
@@ -288,7 +304,7 @@ local function createInputFolder(): Folder
 
 	local folder = Instance.new("Folder")
 	folder.Name = inputConfig.InputFolderName
-	folder.Parent = ReplicatedStorage
+	folder.Parent = parent
 
 	return folder
 end
@@ -340,6 +356,16 @@ local function setupInputActions(): boolean
 	local okShoot, shoot = pcall(function()
 		return Instance.new("InputAction")
 	end)
+	local okTackle, tackle = pcall(function()
+		return Instance.new("InputAction")
+	end)
+	local okCameraLock, cameraLock = pcall(function()
+		return Instance.new("InputAction")
+	end)
+
+	if not okTackle or not okCameraLock then
+		return false
+	end
 
 	if not okContext
 		or not okMove
@@ -387,6 +413,7 @@ local function setupInputActions(): boolean
 
 	table.insert(connections, moveAction.StateChanged:Connect(function(value)
 		if typeof(value) == "Vector2" then
+			moveStateChanges += 1
 			setMoveVector(value, "InputAction")
 		end
 	end))
@@ -515,6 +542,36 @@ local function setupInputActions(): boolean
 		handleBoolFootballAction("Shoot", value)
 	end))
 
+	tackle.Name = inputConfig.TackleActionName
+	setProperty(tackle, "Type", Enum.InputActionType.Bool)
+	tackle.Parent = context
+	tackleAction = tackle
+
+	addBinding(tackle, "KeyboardTackle", {
+		KeyCode = inputConfig.TackleKey,
+	})
+	addBinding(tackle, "GamepadTackle", {
+		KeyCode = Enum.KeyCode.ButtonL1,
+	})
+
+	table.insert(connections, tackle.StateChanged:Connect(function(value)
+		handleBoolFootballAction("Tackle", value)
+	end))
+
+	cameraLock.Name = "Beyond90CameraLock"
+	setProperty(cameraLock, "Type", Enum.InputActionType.Bool)
+	cameraLock.Parent = context
+
+	addBinding(cameraLock, "KeyboardCameraLock", {
+		KeyCode = inputConfig.CameraLockKey,
+	})
+
+	table.insert(connections, cameraLock.StateChanged:Connect(function(value)
+		if value == true then
+			cameraLockToggleEvent:Fire()
+		end
+	end))
+
 	local moveStateOk, moveState = pcall(function()
 		return moveAction:GetState()
 	end)
@@ -577,6 +634,10 @@ local function refreshFallbackMoveVector()
 end
 
 local function setupUserInputFallback()
+	if fallbackActive then
+		return
+	end
+	fallbackActive = true
 	inputState.Source = "UserInputService"
 
 	table.insert(connections, UserInputService.InputBegan:Connect(function(inputObject, gameProcessed)
@@ -613,6 +674,13 @@ local function setupUserInputFallback()
 		elseif inputObject.KeyCode == inputConfig.ShootKey or inputObject.KeyCode == Enum.KeyCode.ButtonB then
 			actionStartedAt.Shoot = os.clock()
 			fireFootballAction("Shoot", "Pressed", 0)
+		elseif inputObject.KeyCode == inputConfig.TackleKey or inputObject.KeyCode == Enum.KeyCode.ButtonL1 then
+			actionStartedAt.Tackle = os.clock()
+			fireFootballAction("Tackle", "Pressed", 0)
+		end
+
+		if inputObject.KeyCode == inputConfig.CameraLockKey then
+			cameraLockToggleEvent:Fire()
 		end
 
 		refreshFallbackMoveVector()
@@ -631,6 +699,14 @@ local function setupUserInputFallback()
 
 		if inputObject.KeyCode == Enum.KeyCode.Thumbstick1 then
 			fallbackThumbstick = Vector2.zero
+		end
+
+		if inputObject.KeyCode == inputConfig.TackleKey or inputObject.KeyCode == Enum.KeyCode.ButtonL1 then
+			local tackleStartedAt = actionStartedAt.Tackle
+			actionStartedAt.Tackle = nil
+			if tackleStartedAt then
+				fireFootballAction("Tackle", "Released", os.clock() - tackleStartedAt)
+			end
 		end
 
 		if inputObject.KeyCode == inputConfig.PassKey or inputObject.KeyCode == Enum.KeyCode.ButtonX then
@@ -732,6 +808,10 @@ function InputController.ReleaseTouchInputs()
 	actionStartedAt.Shoot = nil
 end
 
+function InputController.GetCameraLockToggleEvent(): BindableEvent
+	return cameraLockToggleEvent
+end
+
 function InputController.GetCameraToggleEvent(): BindableEvent
 	return cameraToggleEvent
 end
@@ -768,6 +848,51 @@ function InputController.ToggleAutoSprint()
 	InputController.SetAutoSprintEnabled(not autoSprintEnabled)
 end
 
+--[[
+	Silent-failure guard. Several conditions let the InputAction path construct
+	successfully and still never deliver a value: a rejected Type enum, a binding
+	property this engine version does not accept, a context detached later. Each
+	is indistinguishable from dead WASD at the gameplay layer. If a movement key
+	is genuinely held down and the action has still reported nothing, hand over
+	to the UserInputService path once rather than leaving the player stuck.
+]]
+local function armInputActionWatchdog()
+	local movementKeys = {
+		[Enum.KeyCode.W] = true,
+		[Enum.KeyCode.A] = true,
+		[Enum.KeyCode.S] = true,
+		[Enum.KeyCode.D] = true,
+	}
+
+	local watchdog
+	watchdog = UserInputService.InputBegan:Connect(function(inputObject, gameProcessed)
+		if gameProcessed or not movementKeys[inputObject.KeyCode] then
+			return
+		end
+
+		task.delay(inputConfig.InputActionWatchdogSeconds, function()
+			if fallbackActive or not initialized or not watchdog.Connected then
+				return
+			end
+			-- Only conclusive while the key is still held.
+			if not UserInputService:IsKeyDown(inputObject.KeyCode) then
+				return
+			end
+
+			watchdog:Disconnect()
+
+			if moveStateChanges > 0 then
+				return
+			end
+
+			warnLog("InputAction reported no movement while a movement key was held; switching to UserInputService fallback")
+			setupUserInputFallback()
+		end)
+	end)
+
+	table.insert(connections, watchdog)
+end
+
 function InputController.Initialize()
 	if initialized then
 		return
@@ -785,11 +910,18 @@ function InputController.Initialize()
 		nativeControls:Disable()
 	end)
 
-	if setupInputActions() then
+	if setupInputActions() and inputContext and inputContext:IsDescendantOf(localPlayer) then
 		log("Input source: InputAction")
+		armInputActionWatchdog()
 	else
+		if inputFolder then
+			inputFolder:Destroy()
+			inputFolder = nil
+			inputContext = nil
+			movementAction = nil
+		end
 		setupUserInputFallback()
-		warnLog("InputAction instances unavailable; using UserInputService fallback")
+		warnLog("InputAction path unavailable or not player-owned; using UserInputService fallback")
 	end
 end
 

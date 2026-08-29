@@ -1,10 +1,13 @@
 local Players = game:GetService("Players")
+local StarterPlayer = game:GetService("StarterPlayer")
+local PhysicsService = game:GetService("PhysicsService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local GameConfig = require(Shared.Config.GameConfig)
+local CollisionGroupConfig = require(Shared.Config.CollisionGroupConfig)
 local PlayerConfig = require(Shared.Config.PlayerConfig)
 local GroundProbe = require(Shared.World.GroundProbe)
 local CharacterAppearanceService = require(script.Parent.CharacterAppearanceService)
@@ -109,7 +112,66 @@ local function placeCharacterAtDevelopmentSpawn(character: Model, spawnLocation:
 	character:PivotTo(spawnLocation.CFrame + Vector3.new(0, developmentSpawnCharacterYOffset, 0))
 end
 
+--[[
+	Register the collision groups once, before any character is built.
+
+	Registering is idempotent in effect but errors if a name already exists, so
+	each call is guarded. See CollisionGroupConfig for why these exist at all.
+]]
+local collisionGroupsReady = false
+local function ensureCollisionGroups()
+	if collisionGroupsReady then
+		return
+	end
+	collisionGroupsReady = true
+	for _, groupName in { CollisionGroupConfig.Footballer, CollisionGroupConfig.Official, CollisionGroupConfig.Ball } do
+		if not PhysicsService:IsCollisionGroupRegistered(groupName) then
+			local ok, err = pcall(function()
+				PhysicsService:RegisterCollisionGroup(groupName)
+			end)
+			if not ok then
+				warn(string.format("%s[PlayerService] Could not register collision group %s: %s",
+					GameConfig.LogPrefix, groupName, tostring(err)))
+			end
+		end
+	end
+	for _, pair in CollisionGroupConfig.NonCollidingPairs do
+		pcall(function()
+			PhysicsService:CollisionGroupSetCollidable(pair[1], pair[2], false)
+		end)
+	end
+end
+
+--[[
+	Put every part of a footballer into the Footballer group.
+
+	This changes nothing about how footballers collide -- Footballer still
+	collides with the world, the ball and other footballers. It exists so the
+	referee has something to be excluded from.
+]]
+local function applyCollisionGroup(character: Model, groupName: string)
+	ensureCollisionGroups()
+	for _, descendant in character:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			descendant.CollisionGroup = groupName
+		end
+	end
+end
+
+function PlayerService.ApplyCollisionGroup(character: Model, groupName: string)
+	applyCollisionGroup(character, groupName)
+end
+
+--[[
+	Register the collision groups. Called at bootstrap before anything assigns
+	one, because assigning an unregistered group name throws.
+]]
+function PlayerService.EnsureCollisionGroups()
+	ensureCollisionGroups()
+end
+
 local function normalizeCharacterPhysics(character: Model)
+	applyCollisionGroup(character, CollisionGroupConfig.Footballer)
 	local unanchoredCount = 0
 	local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
 	local collidableParts = {}
@@ -530,6 +592,65 @@ local function onSprintRequested(player: Player, requested: any)
 	setSprintState(player, requested)
 end
 
+--[[
+	The footballer body, shared by everything that is not a real player.
+
+	AI footballers and the referee must not spawn a different-looking rig from the
+	one a human controls, so the Beyond 90 StarterCharacter is the primary
+	template and a generic Roblox rig is only ever a last-resort fallback.
+
+	Lives here because PlayerService already owns the footballer body -- physics
+	normalization and grounding are immediately below. Returns the clone and the
+	name of the source it came from, for diagnostics.
+]]
+function PlayerService.CloneFootballerTemplate(): (Model?, string)
+	local starterCharacter = StarterPlayer:FindFirstChild("StarterCharacter")
+	if starterCharacter and starterCharacter:IsA("Model")
+		and starterCharacter:FindFirstChildOfClass("Humanoid")
+		and starterCharacter:FindFirstChild("HumanoidRootPart")
+	then
+		return starterCharacter:Clone(), "StarterCharacter"
+	end
+	for _, player in Players:GetPlayers() do
+		if player.Character and player.Character:FindFirstChildOfClass("Humanoid") then
+			return player.Character:Clone(), "LivePlayerCharacter"
+		end
+	end
+	local description = Instance.new("HumanoidDescription")
+	local ok, generated = pcall(function()
+		return Players:CreateHumanoidModelFromDescription(description, Enum.HumanoidRigType.R15)
+	end)
+	description:Destroy()
+	if ok and generated then
+		return generated, "GeneratedR15"
+	end
+	return nil, "none"
+end
+
+function PlayerService.NormalizeFootballerPhysics(character: Model)
+	normalizeCharacterPhysics(character)
+end
+
+-- AI footballers spawn outside the Player spawn pipeline, so they need the same
+-- HipHeight floor a human character receives. Only the minimum is applied here;
+-- the full settle/validate schedule stays a Player-spawn concern.
+function PlayerService.ApplyFootballerGrounding(character: Model, humanoid: Humanoid)
+	local groundingConfig = getGroundingConfig()
+	local minimumHipHeight = groundingConfig.MinimumHipHeightStuds
+
+	if typeof(minimumHipHeight) == "number" and humanoid.HipHeight < minimumHipHeight then
+		humanoid.HipHeight = minimumHipHeight
+	end
+
+	character:SetAttribute("Beyond90HipHeight", humanoid.HipHeight)
+	character:SetAttribute("Beyond90GroundingCalibrated", true)
+
+	local lowestFootBottomY = getLowestFootBottomY(character)
+	if lowestFootBottomY then
+		character:SetAttribute("Beyond90LowestFootBottomY", lowestFootBottomY)
+	end
+end
+
 function PlayerService.Initialize(spawnLocation: SpawnLocation)
 	if initialized then
 		return
@@ -541,6 +662,30 @@ function PlayerService.Initialize(spawnLocation: SpawnLocation)
 	local remotes = getOrCreateFolder(ReplicatedStorage, "Remotes")
 	sprintRemote = getOrCreateRemoteEvent(remotes, inputConfig.SprintRemoteName)
 	sprintRemote.OnServerEvent:Connect(onSprintRequested)
+
+	--[[
+		WHICH BODY THE PLAYER WEARS (§23-§29).
+
+		The choice lives on the SERVER, as a player attribute, because that is
+		where the character is built -- a client-set attribute would not replicate
+		up, so the spawn would never see it. The client asks; the server decides
+		and records.
+
+		Validated against the configured source list rather than trusted, so the
+		remote cannot be used to put a footballer into a state the appearance
+		service does not know how to build.
+	]]
+	local identity = PlayerConfig.Appearance.Identity
+	if identity and identity.Enabled == true then
+		local avatarRemote = getOrCreateRemoteEvent(remotes, identity.RemoteName)
+		avatarRemote.OnServerEvent:Connect(function(player, requested)
+			if typeof(requested) ~= "string" or not identity.Sources[requested] then
+				return
+			end
+			player:SetAttribute(identity.AttributeName, requested)
+			log(string.format("%s avatar source -> %s", player.Name, requested))
+		end)
+	end
 
 	for _, player in Players:GetPlayers() do
 		configurePlayer(player, spawnLocation)

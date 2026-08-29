@@ -1,3 +1,4 @@
+local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
@@ -206,7 +207,81 @@ local function normalizeDescription(description: HumanoidDescription)
 	end
 end
 
-function CharacterAppearanceService.StandardizeCharacter(player: Player, character: Model, humanoid: Humanoid): boolean
+--[[
+	Which body should this footballer wear?
+
+	A player's own choice when they have made one, the configured default
+	otherwise. AI footballers and officials are never given a Roblox avatar --
+	they have no account to take one from -- so they always wear the uniform
+	body.
+]]
+local function getIdentitySource(player: Player?): string
+	local identity = appearanceConfig.Identity
+	if not identity or identity.Enabled ~= true or not player then
+		return "Beyond90Avatar"
+	end
+	local chosen = player:GetAttribute(identity.AttributeName)
+	if typeof(chosen) == "string" and identity.Sources[chosen] then
+		return chosen
+	end
+	return identity.Default
+end
+
+--[[
+	Put the player's own Roblox avatar on this rig.
+
+	Applied as a HumanoidDescription onto the existing character rather than by
+	spawning a different model, so every downstream system -- the animation
+	tracks, the collider policy, the grounding calibration, the ball-control
+	geometry -- keeps working on exactly the rig it already knew about. Only the
+	appearance changes.
+
+	Bounded and fail-safe: the fetch is a web call, and a player whose avatar
+	cannot be read spawns in the uniform body instead of not spawning at all.
+
+	Returns whether the avatar was actually applied.
+]]
+local function applyRobloxAvatar(player: Player, character: Model, humanoid: Humanoid): boolean
+	local identity = appearanceConfig.Identity
+	local okFetch, description = pcall(function()
+		return Players:GetHumanoidDescriptionFromUserId(player.UserId)
+	end)
+	if not okFetch or not description then
+		warnLog(string.format(
+			"Could not read the Roblox avatar for %s; using the Beyond 90 body",
+			player.Name
+		))
+		return false
+	end
+
+	--[[
+		SIZE IS NOT INHERITED.
+
+		The description carries the player's own body scales, and applying them
+		would hand a taller avatar a longer stride and a wider reach. Neutralising
+		them here is cheaper and more reliable than scaling it back out
+		afterwards, and it means the canonical-height pass below starts from a
+		known frame every time.
+	]]
+	for _, property in { "HeightScale", "WidthScale", "DepthScale", "HeadScale", "BodyTypeScale", "ProportionScale" } do
+		pcall(function()
+			(description :: any)[property] = 1
+		end)
+	end
+
+	local okApply, err = pcall(function()
+		humanoid:ApplyDescription(description)
+	end)
+	description:Destroy()
+	if not okApply then
+		warnLog(string.format("Could not apply the Roblox avatar for %s: %s", player.Name, tostring(err)))
+		return false
+	end
+	RunService.Heartbeat:Wait()
+	return true
+end
+
+local function standardizeCharacter(label: string, character: Model, humanoid: Humanoid, player: Player?): boolean
 	if not appearanceConfig.StandardizeEnabled then
 		return false
 	end
@@ -216,11 +291,28 @@ function CharacterAppearanceService.StandardizeCharacter(player: Player, charact
 			"%s[Character] ERROR expected R15 but received %s for %s",
 			GameConfig.LogPrefix,
 			humanoid.RigType.Name,
-			player.Name
+			label
 		))
 		character:SetAttribute("Beyond90StandardR15", false)
 		return false
 	end
+
+	--[[
+		IDENTITY FIRST, then scale.
+
+		Order matters: applying a description resizes limbs, so the canonical
+		height pass has to run afterwards or the footballer ends up whatever
+		height the avatar happened to be.
+	]]
+	local identitySource = getIdentitySource(player)
+	local wearingRobloxAvatar = false
+	if identitySource == "RobloxAvatar" and player then
+		wearingRobloxAvatar = applyRobloxAvatar(player, character, humanoid)
+	end
+	character:SetAttribute(
+		"Beyond90AvatarSource",
+		if wearingRobloxAvatar then "RobloxAvatar" else "Beyond90Avatar"
+	)
 
 	if appearanceConfig.ApplyDescriptionStandardization then
 		local okDescription, description = pcall(function()
@@ -228,7 +320,7 @@ function CharacterAppearanceService.StandardizeCharacter(player: Player, charact
 		end)
 
 		if not okDescription or not description then
-			warnLog(string.format("Could not read applied HumanoidDescription for %s", player.Name))
+			warnLog(string.format("Could not read applied HumanoidDescription for %s", label))
 			return false
 		end
 
@@ -241,7 +333,7 @@ function CharacterAppearanceService.StandardizeCharacter(player: Player, charact
 		description:Destroy()
 
 		if not okApply then
-			warnLog(string.format("Could not apply standardized HumanoidDescription for %s: %s", player.Name, tostring(err)))
+			warnLog(string.format("Could not apply standardized HumanoidDescription for %s: %s", label, tostring(err)))
 			return false
 		end
 
@@ -272,14 +364,26 @@ function CharacterAppearanceService.StandardizeCharacter(player: Player, charact
 		scaleFactor or -1,
 		tostring(developmentFootballer),
 		if hasR15Structure then "ok" else "missing " .. structureReport,
-		if developmentFootballer
-			then "development-startercharacter-scale"
+		if wearingRobloxAvatar
+			then "roblox-avatar-scaled"
+			elseif developmentFootballer
+			then "beyond90-body-scaled"
 			elseif appearanceConfig.ApplyDescriptionStandardization
 			then "runtime-standardized"
 			else "avatar-settings-source"
 	))
 
 	return true
+end
+
+function CharacterAppearanceService.StandardizeCharacter(player: Player, character: Model, humanoid: Humanoid): boolean
+	-- The player is passed through so their own avatar can be applied; an NPC
+	-- has no account to take one from and keeps the uniform body.
+	return standardizeCharacter(player.Name, character, humanoid, player)
+end
+
+function CharacterAppearanceService.StandardizeNPC(label: string, character: Model, humanoid: Humanoid): boolean
+	return standardizeCharacter(label, character, humanoid)
 end
 
 return CharacterAppearanceService

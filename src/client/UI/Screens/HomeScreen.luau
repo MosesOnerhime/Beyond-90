@@ -1,6 +1,7 @@
 local Players = game:GetService("Players")
-local GuiService = game:GetService("GuiService")
+local ContentProvider = game:GetService("ContentProvider")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
@@ -8,8 +9,11 @@ local Workspace = game:GetService("Workspace")
 local React = require(ReplicatedStorage.Shared.ReactPackages).React
 local Assets = require(ReplicatedStorage.Shared.Config.UIAssetConfig)
 local ExperienceConfig = require(ReplicatedStorage.Shared.Config.ExperienceConfig)
+local PlayerConfig = require(ReplicatedStorage.Shared.Config.PlayerConfig)
 local Theme = require(script.Parent.Parent.Theme)
 local ReactUI = require(script.Parent.Parent.Components.ReactUI)
+local MenuFooter = require(script.Parent.Parent.Components.MenuFooter)
+local ControlSchemeConfig = require(ReplicatedStorage.Shared.Config.ControlSchemeConfig)
 
 local localPlayer = Players.LocalPlayer
 
@@ -100,6 +104,72 @@ local function AnimatedMenuPlayer()
 			if humanoid then
 				humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
 			end
+
+			--[[
+				THE MENU FOOTBALLER IS YOU (§18).
+
+				The home screen shows a footballer standing in the tunnel, and it
+				was always the same anonymous rig -- which reads as a stock model
+				rather than as the player's own footballer, and contradicts the
+				Settings screen where they have just chosen to play as their own
+				avatar.
+
+				So when they are playing as their Roblox avatar, the menu wears it
+				too. Applied as a description onto the existing rig rather than by
+				swapping models, so the camera framing, the anchoring, the idle
+				animation and the drag-to-rotate all keep working on the rig they
+				were written for.
+
+				Best-effort by design: this is a decorative surface. A player whose
+				avatar cannot be fetched sees the default footballer, which is
+				exactly what they saw before, rather than an empty viewport.
+			]]
+			local identityConfig = PlayerConfig.Appearance.Identity
+			local chosenSource = localPlayer:GetAttribute(identityConfig.AttributeName)
+			if typeof(chosenSource) ~= "string" or not identityConfig.Sources[chosenSource] then
+				chosenSource = identityConfig.Default
+			end
+			if humanoid and identityConfig.Enabled == true
+				and chosenSource == identityConfig.Sources.RobloxAvatar
+			then
+				task.spawn(function()
+					local okFetch, description = pcall(function()
+						return Players:GetHumanoidDescriptionFromUserId(localPlayer.UserId)
+					end)
+					if disposed or not okFetch or not description then
+						if description then description:Destroy() end
+						return
+					end
+					-- Same rule as on the pitch: the face is the player's, the
+					-- frame is everyone's, so the menu shows the footballer they
+					-- will actually be.
+					for _, property in { "HeightScale", "WidthScale", "DepthScale", "HeadScale", "BodyTypeScale", "ProportionScale" } do
+						pcall(function()
+							(description :: any)[property] = 1
+						end)
+					end
+					pcall(function()
+						humanoid:ApplyDescription(description)
+					end)
+					description:Destroy()
+					if disposed or not model.Parent then
+						return
+					end
+					-- Accessories change the bounding box, so re-seat the model on
+					-- the floor and re-cache the pivot the drag rotation uses.
+					for _, descendant in model:GetDescendants() do
+						if descendant:IsA("BasePart") then
+							descendant.Anchored = descendant == root
+							descendant.CanCollide = false
+							descendant.CanTouch = false
+							descendant.CanQuery = false
+						end
+					end
+					local reCFrame, reSize = model:GetBoundingBox()
+					model:PivotTo(model:GetPivot() + Vector3.new(0, -(reCFrame.Position.Y - reSize.Y / 2), 0))
+					basePivotRef.current = model:GetPivot()
+				end)
+			end
 			model:PivotTo(CFrame.Angles(0, math.rad(135), 0))
 			local boundingCFrame, boundingSize = model:GetBoundingBox()
 			model:PivotTo(model:GetPivot() + Vector3.new(0, -(boundingCFrame.Position.Y - boundingSize.Y / 2), 0))
@@ -116,12 +186,51 @@ local function AnimatedMenuPlayer()
 				local animation = Instance.new("Animation")
 				animation.AnimationId = "rbxassetid://71821812678071"
 				local loaded, track = pcall(function() return animator:LoadAnimation(animation) end)
-				animation:Destroy()
+
+				--[[
+					Make the footballer finished BEFORE the menu is revealed.
+
+					LoadAnimation returns immediately, but the keyframe data still
+					has to arrive; until it does the rig holds its imported T-pose.
+					Signalling readiness at Play() therefore revealed the menu while
+					the character was still a T-pose blending into its idle -- which
+					is exactly the "clipping in" that was visible.
+
+					So: preload the animation asset, wait for the track to report a
+					real Length, start it with NO fade so the very first frame is
+					already the idle pose, and only then let the reveal proceed.
+					Every wait is bounded so a bad asset cannot hang the menu.
+				]]
 				if loaded and track then
 					track.Priority = Enum.AnimationPriority.Idle
 					track.Looped = true
-					track:Play(0.18, 1, 1)
+
+					pcall(function()
+						ContentProvider:PreloadAsync({ animation })
+					end)
+
+					local waitStartedAt = os.clock()
+					while track.Length <= 0 and os.clock() - waitStartedAt < 4 and not disposed do
+						task.wait()
+					end
+
+					if not disposed then
+						-- Zero fade: no blend out of the T-pose to be seen.
+						track:Play(0, 1, 1)
+						-- One presented frame, so the idle pose is actually drawn.
+						RunService.RenderStepped:Wait()
+					end
+
+					if track.Length <= 0 then
+						warn("[Beyond90][UI] Menu footballer idle did not load in time; revealing anyway")
+					end
+					Players.LocalPlayer:SetAttribute("Beyond90MenuCharacterReady", true)
 				end
+				animation:Destroy()
+			end
+			if not humanoid then
+				-- No rig to animate; do not hold the reveal open for it.
+				Players.LocalPlayer:SetAttribute("Beyond90MenuCharacterReady", true)
 			end
 		end)
 		return function()
@@ -273,13 +382,16 @@ local function PlayerStat(props)
 end
 
 local function HomeScreen(props)
+	-- The prompt set for the player's chosen scheme; mirrored on the player by
+	-- ControlSchemeController so no screen needs a controller dependency.
+	local menuPrompt = ControlSchemeConfig.MenuPrompts[
+		ControlSchemeConfig.Normalize(localPlayer:GetAttribute(ControlSchemeConfig.AttributeName))
+	] or ControlSchemeConfig.MenuPrompts.Keyboard
 	local portrait, setPortrait = React.useState("")
 	local playerBust, setPlayerBust = React.useState("")
 	local selectedNavigation, setSelectedNavigation = React.useState(1)
 	local rootRef = React.useRef(nil)
 	local mobile = UserInputService.TouchEnabled
-	local topLeftInset = GuiService:GetGuiInset()
-	local footerInset = if mobile then topLeftInset.Y else 0
 	React.useEffect(function()
 		task.spawn(function()
 			local headOk, headImage = pcall(function()
@@ -314,11 +426,19 @@ local function HomeScreen(props)
 		return function() cancelled = true end
 	end, {})
 
+	--[[
+		Every destination is now a real page (§12-§16).
+
+		Clubs and Profile used to raise a "coming soon" toast because there was
+		nothing to open. They now have designed pages that state honestly what
+		they will hold, which is a far better answer to a player clicking them.
+	]]
 	local nav = {
+		-- TRAINING is reached through PLAY now, not from Home (§15). The mode,
+		-- its screen and the DEV entry points are all unchanged.
 		{ "PLAY", "Jump into matches\nCompete and win", Assets.Navigation.Play, props.OpenModes },
-		{ "TRAINING", "Improve your skills\nMaster the pitch", Assets.Navigation.Training, props.OpenModes },
-		{ "CLUBS", "Join or create a club\nComing soon", Assets.Navigation.Clubs, props.ComingSoon },
-		{ "PROFILE", "View stats and progression\nComing soon", Assets.Navigation.Profile, props.ComingSoon },
+		{ "CLUBS", "Join or create a club\nPlay together", Assets.Navigation.Clubs, props.OpenClubs },
+		{ "PROFILE", "View stats and progression\nCustomize your identity", Assets.Navigation.Profile, props.OpenProfile },
 		{ "SETTINGS", "Game settings\nand preferences", Assets.Navigation.Settings, props.OpenSettings },
 	}
 	local navChildren = {
@@ -378,10 +498,24 @@ local function HomeScreen(props)
 				}),
 			}),
 		}),
+		--[[
+			ScaleType.Crop fills the frame and discards whatever does not fit,
+			which is what clipped the wordmark on desktop: the frame is far wider
+			than the source is, so Crop scaled to the width and cut the top and
+			bottom away.
+
+			Fit never crops. The source is mostly empty space around the mark, so
+			the visible region is selected explicitly first -- the same rectangle
+			the startup sequence uses -- and Fit then letterboxes only in the
+			rare aspect ratios where the frame is narrower than the mark.
+		]]
 		Logo = React.createElement("ImageLabel", {
 			Position = UDim2.fromScale(if mobile then 0.025 else 0.045, if mobile then 0.035 else 0.055),
 			Size = UDim2.fromScale(if mobile then 0.34 else 0.38, if mobile then 0.17 else 0.2),
-			BackgroundTransparency = 1, Image = Assets.Logo, ScaleType = Enum.ScaleType.Crop, ZIndex = 3,
+			BackgroundTransparency = 1, Image = Assets.Logo,
+			ImageRectOffset = Vector2.new(20, 175),
+			ImageRectSize = Vector2.new(1000, 300),
+			ScaleType = Enum.ScaleType.Fit, ZIndex = 3,
 		}),
 		Account = glassFrame({
 			Position = UDim2.fromScale(if mobile then 0.77 else 0.81, 0.018),
@@ -461,8 +595,17 @@ local function HomeScreen(props)
 			BackgroundTransparency = 1, ZIndex = 4,
 		}, {
 			Aspect = React.createElement("UIAspectRatioConstraint", { AspectRatio = 0.59, DominantAxis = Enum.DominantAxis.Height }),
-			Title = text({ Position = UDim2.fromScale(0.1, 0), Size = UDim2.fromScale(0.8, 0.052), Font = Enum.Font.GothamMedium, Text = "FEATURED PLAYER", TextColor3 = Theme.AccentCyan, TextSize = if mobile then 9 else 12 }),
-			Card = React.createElement("ImageLabel", { Position = UDim2.fromScale(0.01, 0.045), Size = UDim2.fromScale(0.98, 0.84), BackgroundTransparency = 1, Image = Assets.FeaturedPlayerFrame, ScaleType = Enum.ScaleType.Stretch, ClipsDescendants = true }, {
+			--[[
+				Per ref/mockup 1.png the label is a caption attached to the card:
+				it sits fully above the artwork, left edge aligned just inside the
+				card's own left edge, with a small consistent gap.
+
+				It previously spanned 0 -> 0.052 while the card began at 0.045, so
+				the two overlapped and the label read as printed on the card's top
+				edge rather than labelling it.
+			]]
+			Title = text({ Position = UDim2.fromScale(0.055, 0), Size = UDim2.fromScale(0.9, 0.042), Font = Enum.Font.GothamBold, Text = "FEATURED PLAYER", TextColor3 = Theme.AccentCyan, TextSize = if mobile then 9 else 12 }),
+			Card = React.createElement("ImageLabel", { Position = UDim2.fromScale(0.01, 0.062), Size = UDim2.fromScale(0.98, 0.84), BackgroundTransparency = 1, Image = Assets.FeaturedPlayerFrame, ScaleType = Enum.ScaleType.Stretch, ClipsDescendants = true }, {
 				Portrait = React.createElement("ImageLabel", { Position = UDim2.fromScale(0.18, 0.08), Size = UDim2.fromScale(0.72, 0.54), BackgroundTransparency = 1, Image = if playerBust ~= "" then playerBust else portrait, ScaleType = Enum.ScaleType.Fit, Rotation = 5 }, {
 					Fade = React.createElement("UIGradient", { Rotation = 90, Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(0.65, 0.04), NumberSequenceKeypoint.new(1, 1) }) }),
 				}),
@@ -486,30 +629,57 @@ local function HomeScreen(props)
 			AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromScale(0.5, if mobile then 0.86 else 0.875),
 			Size = UDim2.fromScale(if mobile then 0.95 else 0.9, if mobile then 0.15 else 0.135), BackgroundTransparency = 1, ZIndex = 5,
 		}, navChildren),
-		FooterFade = React.createElement("Frame", {
-			AnchorPoint = Vector2.new(0, 1),
-			Position = UDim2.new(0, 0, if mobile then 1 else 0.9, footerInset),
-			Size = UDim2.new(1, 0, if mobile then 0.3 else 0.18, footerInset),
-			BackgroundColor3 = Color3.fromRGB(1, 5, 17), BorderSizePixel = 0, ZIndex = 2,
-		}, {
-			Gradient = React.createElement("UIGradient", { Rotation = 90, Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.42, 0.76), NumberSequenceKeypoint.new(0.72, 0.3), NumberSequenceKeypoint.new(1, 0.04) }) }),
-		}),
-		Footer = React.createElement("Frame", {
-			AnchorPoint = if mobile then Vector2.new(0, 1) else Vector2.zero,
-			Position = UDim2.new(0, 0, if mobile then 1 else 0.9, footerInset),
-			Size = UDim2.new(1, 0, if mobile then 0.14 else 0.1, footerInset),
-			BackgroundColor3 = Color3.fromRGB(1, 5, 17), BackgroundTransparency = 0.02,
-			BorderSizePixel = 0, ZIndex = 6,
-		}, {
-			Content = React.createElement("Frame", {
-				Size = UDim2.new(1, 0, 1, -footerInset), BackgroundTransparency = 1,
-			}, {
-			SelectGlyph = React.createElement("ImageLabel", { Position = UDim2.fromScale(if mobile then 0.025 else 0.035, if mobile then 0.24 else 0.2), Size = UDim2.fromOffset(if mobile then 22 else 28, if mobile then 22 else 28), BackgroundTransparency = 1, Image = Assets.Menu.Select, ScaleType = Enum.ScaleType.Fit }),
-			Select = not mobile and text({ Position = UDim2.fromScale(0.06, 0.22), Size = UDim2.fromScale(0.06, 0.5), Font = Enum.Font.GothamMedium, Text = "SELECT", TextColor3 = Theme.MutedText, TextSize = 11 }) or nil,
-			OpenMenuIcon = Assets.Menu.OpenMenu ~= "" and React.createElement("ImageLabel", { Position = UDim2.fromScale(if mobile then 0.075 else 0.118, if mobile then 0.27 else 0.27), Size = UDim2.fromOffset(20, 20), BackgroundTransparency = 1, Image = Assets.Menu.OpenMenu, ScaleType = Enum.ScaleType.Fit }) or panel({ Position = UDim2.fromScale(if mobile then 0.075 else 0.118, 0.27), Size = UDim2.fromOffset(20, 20), BackgroundTransparency = 0.2 }, {
-				Mark = text({ Size = UDim2.fromScale(1, 1), Font = Theme.Fonts.Caption, Text = "=", TextColor3 = Theme.Text, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Center }),
+			Footer = React.createElement(MenuFooter.Root, {
+				Mobile = mobile,
+				DesktopTop = 0.9,
+				DesktopHeight = 0.1,
+				DesktopFadeHeight = 0.18,
+				FadeZIndex = 2,
+				--[[
+					Below Navigation (ZIndex 5).
+
+					ZIndexBehavior is Sibling, so ordering is decided between
+					these two frames by their own ZIndex -- the footer's internal
+					layering does not matter here. Defaulting the footer root to
+					6 put its darkening wash in front of the navigation buttons
+					and dimmed them. The wash belongs behind the nav.
+				]]
+				RootZIndex = 3,
+				Content = React.createElement("Frame", {
+					Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+				}, {
+			--[[
+				The select prompt follows the player's chosen control scheme
+				(section 40). Showing the controller "A" glyph to somebody playing
+				on a keyboard told them to press a button they do not have; a
+				keyboard player gets a click prompt instead.
+			]]
+			--[[
+				CONTROL HINTS (§9).
+
+				Icon and label are laid out as one unit by MenuFooter.Prompt, so
+				they cannot drift apart across viewports -- which is exactly what
+				the previous hand-positioned version did, each piece placed at its
+				own scale coordinate.
+
+				The artwork follows the player's chosen control scheme (section
+				40): a keyboard player is shown a mouse click and the ESC key, a
+				controller player is shown the controller glyphs.
+			]]
+			SelectPrompt = React.createElement(MenuFooter.Prompt, {
+				Mobile = mobile,
+				Position = UDim2.fromScale(if mobile then 0.025 else 0.035, if mobile then 0.18 else 0.16),
+				Image = if menuPrompt.SelectImageKey then Assets.Menu[menuPrompt.SelectImageKey] else "",
+				Fallback = menuPrompt.Select,
+				Label = "SELECT",
 			}),
-			OpenMenu = not mobile and text({ Position = UDim2.fromScale(0.138, 0.22), Size = UDim2.fromScale(0.09, 0.5), Font = Enum.Font.GothamMedium, Text = "OPEN MENU", TextColor3 = Theme.MutedText, TextSize = 11 }) or nil,
+			OpenMenuPrompt = React.createElement(MenuFooter.Prompt, {
+				Mobile = mobile,
+				Position = UDim2.fromScale(if mobile then 0.115 else 0.135, if mobile then 0.18 else 0.16),
+				Image = if menuPrompt.BackImageKey then Assets.Menu[menuPrompt.BackImageKey] else "",
+				Fallback = menuPrompt.Back,
+				Label = "OPEN MENU",
+			}),
 			NewsTag = text({ Position = UDim2.fromScale(if mobile then 0.125 else 0.295, 0.22), Size = UDim2.fromScale(if mobile then 0.065 else 0.06, 0.5), Font = Theme.Fonts.Navigation, Text = "NEWS", TextColor3 = Theme.Accent, TextSize = if mobile then 9 else 12 }),
 			News = text({ Position = UDim2.fromScale(if mobile then 0.19 else 0.34, if mobile then 0.08 else 0.22), Size = UDim2.fromScale(if mobile then 0.53 else 0.43, if mobile then 0.84 else 0.5), Font = Enum.Font.Gotham, Text = "Welcome to Beyond 90! Season 1 is live now. Compete, climb the ranks, and become a legend.", TextColor3 = Color3.fromRGB(205, 214, 234), TextSize = if mobile then 8 else 11, TextWrapped = mobile }),
 			Friends = panel({ Position = UDim2.fromScale(if mobile then 0.755 else 0.825, 0.16), Size = UDim2.fromScale(if mobile then 0.07 else 0.055, 0.64), BackgroundColor3 = Color3.fromRGB(2, 8, 26), BackgroundTransparency = 0.02 }, {
@@ -521,7 +691,7 @@ local function HomeScreen(props)
 			}),
 			Network = panel({ Position = UDim2.fromScale(if mobile then 0.92 else 0.937, 0.16), Size = UDim2.fromScale(if mobile then 0.065 else 0.047, 0.64), BackgroundColor3 = Color3.fromRGB(2, 8, 26), BackgroundTransparency = 0.02 }, {
 				Icon = React.createElement("ImageLabel", { Position = UDim2.fromScale(0.13, 0.13), Size = UDim2.fromScale(0.74, 0.74), BackgroundTransparency = 1, Image = Assets.Social.Network, ScaleType = Enum.ScaleType.Fit }),
-			}),
+				}),
 			}),
 		}),
 	})

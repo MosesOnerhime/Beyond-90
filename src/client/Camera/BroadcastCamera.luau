@@ -7,6 +7,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local BallConfig = require(Shared.Config.BallConfig)
 local BallControlMath = require(Shared.Football.BallControlMath)
 local CameraConfig = require(Shared.Config.CameraConfig)
+local MatchRulesConfig = require(ReplicatedStorage.Shared.Config.MatchRulesConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
 
@@ -255,15 +256,34 @@ local function getCurrentPreset()
 	}
 end
 
-local function getCameraWeight(ball: BasePart?): number
-	if ball
+local function hasLocalPossession(ball: BasePart?): boolean
+	return ball ~= nil
 		and ball:GetAttribute("State") == "Controlled"
 		and ball:GetAttribute("ControllerUserId") == localPlayer.UserId
-	then
+end
+
+--[[
+	How strongly does the camera hold the CONTROLLED PLAYER? (§61)
+
+	On the ball: firmly, because the player and the football are the same
+	subject.
+
+	Off the ball: the football is the subject, and increasingly so the further
+	away the play is -- but never completely, so the player can still locate
+	themselves relative to it (§62).
+]]
+local function getCameraWeight(rootPart: BasePart, ball: BasePart?): number
+	if hasLocalPossession(ball) then
 		return config.PlayerBallWeightControlled
 	end
+	if not ball then
+		return config.PlayerBallWeightFree
+	end
 
-	return config.PlayerBallWeightFree
+	local distance = BallControlMath.GetHorizontal(ball.Position - rootPart.Position).Magnitude
+	local alpha = math.clamp(distance / math.max(config.OffBallDistanceFull or 1, 1e-3), 0, 1)
+	local floor = config.OffBallMinimumPlayerWeight or config.PlayerBallWeightFree
+	return config.PlayerBallWeightFree + (floor - config.PlayerBallWeightFree) * alpha
 end
 
 local function getBoundedBallInfluence(rootPart: BasePart, ball: BasePart?): Vector3
@@ -271,8 +291,14 @@ local function getBoundedBallInfluence(rootPart: BasePart, ball: BasePart?): Vec
 		return Vector3.zero
 	end
 
-	local influence = BallControlMath.GetHorizontal(ball.Position - rootPart.Position) * (1 - getCameraWeight(ball))
-	return BallControlMath.ClampMagnitude(influence, config.MaxBallInfluence)
+	local influence = BallControlMath.GetHorizontal(ball.Position - rootPart.Position)
+		* (1 - getCameraWeight(rootPart, ball))
+	-- Off the ball the camera is allowed to travel much further toward the
+	-- play; on the ball the tighter clamp keeps the carrier framed.
+	local limit = if hasLocalPossession(ball)
+		then config.MaxBallInfluence
+		else (config.MaxBallInfluenceOffBall or config.MaxBallInfluence)
+	return BallControlMath.ClampMagnitude(influence, limit)
 end
 
 local function getAttackingGoalContext(pitchState)
@@ -517,7 +543,72 @@ local function resolveObstruction(focus: Vector3, desiredPosition: Vector3, pitc
 	return clampCameraToSafeCorridor(corrected, pitchState, distanceScale)
 end
 
+--[[
+	AUTHORITATIVE REPOSITION CATCH-UP (§64).
+
+	When the rules teleport the controlled footballer for a restart, the ordinary
+	Broadcast smoothing -- which is deliberately slow, because that is what makes
+	it feel like a camera operator rather than a follow cam -- spent a long time
+	drifting across the pitch to find them again.
+
+	The server bumps a reposition epoch on the character whenever it moves them
+	authoritatively. That is the signal this watches for: a brief, strongly
+	boosted catch-up, then straight back to normal. Nothing about ordinary
+	Broadcast1 / Broadcast2 smoothing is changed.
+]]
+local repositionBoostUntil = 0
+local repositionEpoch: number? = nil
+local repositionConnection: RBXScriptConnection? = nil
+local repositionWatchedCharacter: Model? = nil
+
+local function watchRepositionEpoch(character: Model?)
+	if character == repositionWatchedCharacter then
+		return
+	end
+	if repositionConnection then
+		repositionConnection:Disconnect()
+		repositionConnection = nil
+	end
+	repositionWatchedCharacter = character
+	repositionEpoch = nil
+	if not character then
+		return
+	end
+	local attribute = MatchRulesConfig.RepositionEpochAttributeName
+	repositionEpoch = character:GetAttribute(attribute)
+	repositionConnection = character:GetAttributeChangedSignal(attribute):Connect(function()
+		local value = character:GetAttribute(attribute)
+		if typeof(value) ~= "number" then
+			return
+		end
+		-- Only a CHANGE counts, so simply joining a match does not trigger it.
+		if repositionEpoch ~= nil and value ~= repositionEpoch then
+			repositionBoostUntil = os.clock() + CameraConfig.Reposition.DurationSeconds
+		end
+		repositionEpoch = value
+	end)
+end
+
+--[[
+	Scale factors for this frame: (responsiveness, acceleration, shouldSnap).
+	Both are 1 in ordinary play, which is what keeps normal smoothing intact.
+]]
+local function getRepositionBoost(currentPosition: Vector3?, targetPosition: Vector3): (number, number, boolean)
+	local config = CameraConfig.Reposition
+	if config.Enabled ~= true or os.clock() >= repositionBoostUntil then
+		return 1, 1, false
+	end
+	--[[
+		A displacement this large cannot be interpolated without reading as a whip
+		pan across the stadium, so the camera cuts instead.
+	]]
+	local snap = currentPosition ~= nil
+		and (targetPosition - currentPosition).Magnitude >= config.SnapDistance
+	return config.ResponsivenessScale, config.AccelerationScale, snap
+end
+
 local function updateCamera(deltaTime: number)
+	watchRepositionEpoch(Players.LocalPlayer.Character)
 	if not active then
 		return
 	end
@@ -614,25 +705,37 @@ local function updateCamera(deltaTime: number)
 		cameraVelocity = Vector3.zero
 		focusVelocity = Vector3.zero
 	else
-		smoothedPosition, cameraVelocity = smoothLimitedVector(
-			smoothedPosition,
-			rigPosition,
-			cameraVelocity,
-			config.PositionResponsiveness,
-			config.PositionMaxAcceleration,
-			config.PositionMaxSpeed,
-			deltaTime
-		)
-		smoothedFocus, focusVelocity = smoothLimitedVector(
-			smoothedFocus,
-			focusTarget,
-			focusVelocity,
-			config.FocusResponsiveness,
-			config.FocusMaxAcceleration,
-			config.FocusMaxSpeed,
-			deltaTime
-		)
-		smoothedFOV += (targetFOV - smoothedFOV) * expAlpha(config.ZoomResponsiveness, deltaTime)
+		local responsivenessScale, accelerationScale, shouldSnap =
+			getRepositionBoost(smoothedPosition, rigPosition)
+
+		if shouldSnap then
+			-- Extreme displacement: cut rather than whip-pan across the stadium.
+			smoothedPosition = rigPosition
+			smoothedFocus = focusTarget
+			cameraVelocity = Vector3.zero
+			focusVelocity = Vector3.zero
+		else
+			smoothedPosition, cameraVelocity = smoothLimitedVector(
+				smoothedPosition,
+				rigPosition,
+				cameraVelocity,
+				config.PositionResponsiveness * responsivenessScale,
+				config.PositionMaxAcceleration * accelerationScale,
+				config.PositionMaxSpeed * accelerationScale,
+				deltaTime
+			)
+			smoothedFocus, focusVelocity = smoothLimitedVector(
+				smoothedFocus,
+				focusTarget,
+				focusVelocity,
+				config.FocusResponsiveness * responsivenessScale,
+				config.FocusMaxAcceleration * accelerationScale,
+				config.FocusMaxSpeed * accelerationScale,
+				deltaTime
+			)
+		end
+		smoothedFOV += (targetFOV - smoothedFOV)
+			* expAlpha(config.ZoomResponsiveness * responsivenessScale, deltaTime)
 	end
 
 	local desiredForward = BallControlMath.SafeUnit((smoothedFocus :: Vector3) - (smoothedPosition :: Vector3), camera.CFrame.LookVector)

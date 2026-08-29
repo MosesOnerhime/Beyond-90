@@ -9,12 +9,19 @@ local BallControlMath = require(Shared.Football.BallControlMath)
 local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
 local GameConfig = require(Shared.Config.GameConfig)
+local PositionConfig = require(Shared.Config.PositionConfig)
 local PlayerConfig = require(Shared.Config.PlayerConfig)
+local MatchRulesConfig = require(Shared.Config.MatchRulesConfig)
 local FootballTeamEligibility = require(Shared.Football.FootballTeamEligibility)
 local PassPlanner = require(Shared.Football.PassPlanner)
 local ShotPlanner = require(Shared.Football.ShotPlanner)
+local ThrowInPlanner = require(Shared.Football.ThrowInPlanner)
 local BallControlService = require(script.Parent.BallControlService)
+local FootballerRegistryService = require(script.Parent.FootballerRegistryService)
 local GoalService = require(script.Parent.GoalService)
+local MatchRulesService = require(script.Parent.MatchRulesService)
+local PitchService = require(script.Parent.PitchService)
+local RestartService = require(script.Parent.RestartService)
 
 local FootballActionService = {}
 
@@ -26,6 +33,7 @@ local lastActionAtByPlayer: { [Player]: { [string]: number } } = {}
 local nextPassId = 0
 local nextShotId = 0
 local preparedShotsByPlayer = {}
+local lastAIActionAtById = {}
 
 local function getShootingSkill(player: Player): number
 	local config = FootballActionConfig.Shoot.Skill
@@ -33,6 +41,12 @@ local function getShootingSkill(player: Player): number
 	if typeof(value) ~= "number" then
 		value = config.Default
 	end
+	--[[
+		Position shapes the footballer (§43): a forward finishes better than a
+		defender. It scales execution quality only -- it never decides whether or
+		where to shoot, which stays entirely with the player.
+	]]
+	value *= PositionConfig.GetSkill(player:GetAttribute(PositionConfig.SlotAttributeName), "Shooting")
 	return math.clamp(value, config.Minimum, config.Maximum)
 end
 
@@ -42,6 +56,102 @@ end
 
 local function warnLog(message: string)
 	warn(string.format("%s[FootballAction] %s", GameConfig.LogPrefix, message))
+end
+
+--[[
+	Is this request a SET PIECE being taken? (§28, §29)
+
+	Returns the taker's footballer record and the restart kind when the player is
+	the designated taker and `actionType` is a legal way to take that restart;
+	nil otherwise. A restart take skips the possession requirement -- the ball is
+	held on its spot, not dribbled -- but gains a much stricter action rule in
+	exchange, so it is not a loophole.
+]]
+--[[
+	Where the defending goalkeeper is standing.
+
+	Handed to ShotPlanner so target selection can pick the side of the goal the
+	keeper is NOT covering (§68). Assistance with execution, not with the
+	decision: the player has already chosen to shoot.
+]]
+local function getDefendingGoalkeeperPosition(teamId: string?): Vector3?
+	if not teamId then
+		return nil
+	end
+	for _, actor in FootballerRegistryService.GetAll() do
+		if actor.TeamId ~= nil
+			and actor.TeamId ~= teamId
+			and actor.Position == "Goalkeeper"
+			and actor.RootPart
+			and actor.RootPart.Parent
+		then
+			return actor.RootPart.Position
+		end
+	end
+	return nil
+end
+
+--[[
+	DEVELOPMENT SHOT INTENSITY (§18).
+
+	A power multiplier for testing, independent of Shooting Skill. Returns 1
+	unless a tester has moved the control, so ordinary play is untouched.
+]]
+local function getShotIntensityScale(player: Player): number
+	local config = FootballActionConfig.DevelopmentShotIntensity
+	local value = player:GetAttribute(config.AttributeName)
+	if typeof(value) ~= "number" then
+		return 1
+	end
+	return math.clamp(value, config.Minimum, config.Maximum) / math.max(config.Reference, 1e-3)
+end
+
+--[[
+	Apply charge and the development intensity override to a finished plan, and
+	record the curve so BallService can integrate it.
+
+	One place, so power can never be applied twice or forgotten on one path.
+]]
+local function applyShotPower(plan, chargePower: number?, intensityScale: number)
+	if typeof(plan.LaunchVelocity) ~= "Vector3" then
+		return plan
+	end
+	local scale = intensityScale
+	if typeof(chargePower) == "number" then
+		plan.ChargePower = chargePower
+		scale *= chargePower
+	end
+	if scale ~= 1 then
+		plan.LaunchVelocity *= scale
+		plan.LaunchSpeed = (plan.LaunchSpeed or plan.LaunchVelocity.Magnitude) * scale
+		plan.VerticalLaunchSpeed = (plan.VerticalLaunchSpeed or 0) * scale
+		plan.HorizontalLaunchSpeed = (plan.HorizontalLaunchSpeed or 0) * scale
+		--[[
+			Scaling the launch shortens the flight, so the curve must scale with
+			it or the ball would bend by a different amount than it was aimed for.
+			Time scales as 1/scale, and displacement goes as acceleration x time^2,
+			so the acceleration scales as scale^2.
+		]]
+		if typeof(plan.CurveAcceleration) == "Vector3" then
+			plan.CurveAcceleration *= scale * scale
+		end
+	end
+	plan.ShotIntensityScale = intensityScale
+	return plan
+end
+
+local function getRestartTake(player: Player, actionType: string)
+	if not MatchRulesService.IsRestartActive() or not RestartService.IsAwaitingAction() then
+		return nil, nil
+	end
+	local actor = FootballerRegistryService.GetHumanActor(player)
+	if not actor then
+		return nil, nil
+	end
+	if not RestartService.IsLegalRestartAction(actor, actionType) then
+		return nil, nil
+	end
+	return actor, RestartService.GetActiveRestartKind()
 end
 
 local function getOrCreateFolder(parent: Instance, name: string): Folder
@@ -163,6 +273,8 @@ local function sendFeedback(player: Player, accepted: boolean, reason: string?, 
 		Reason = reason or "",
 		ActionType = actionTypeOverride or (plan and plan.ActionType) or "",
 		TargetPosition = plan and plan.TargetPosition or nil,
+		ReleasePosition = plan and plan.ReleasePosition or nil,
+		LaunchVelocity = plan and plan.LaunchVelocity or nil,
 		TargetName = plan and plan.SelectedCandidate and plan.SelectedCandidate.Name or "",
 		TargetUserId = plan and plan.SelectedCandidate and plan.SelectedCandidate.UserId or 0,
 		LaunchSpeed = plan and plan.LaunchSpeed or 0,
@@ -185,6 +297,15 @@ local function sendFeedback(player: Player, accepted: boolean, reason: string?, 
 		Result = plan and plan.Result or "",
 		BodyAlignment = plan and plan.BodyAlignment or 0,
 		AlignmentErrorAlpha = plan and plan.AlignmentErrorAlpha or 0,
+		ChargePower = plan and plan.ChargePower or 1,
+		--[[
+			The curve the ball was actually given (§69, §71). The preview must use
+			the same vector the server integrates, or the drawn line and the flight
+			diverge -- which is exactly the regression §71 exists to prevent.
+		]]
+		CurveAcceleration = plan and plan.CurveAcceleration or nil,
+		IsFinesse = plan and plan.IsFinesse or false,
+		ShotIntensityScale = plan and plan.ShotIntensityScale or 1,
 	})
 end
 
@@ -214,17 +335,10 @@ local function getHoldIntensity(actionConfig, holdDuration: number): number
 end
 
 local function getSelectedReceiverUserId(plan): number
-	if not plan or not plan.SelectedCandidate or plan.SelectedCandidate.Kind ~= "Player" then
+	if not plan or not plan.SelectedCandidate then
 		return 0
 	end
-
-	local instance = plan.SelectedCandidate.Instance
-
-	if typeof(instance) == "Instance" and instance:IsA("Player") then
-		return instance.UserId
-	end
-
-	return 0
+	return plan.SelectedCandidate.UserId or plan.SelectedCandidate.FootballerId or 0
 end
 
 local function handlePass(player: Player, actionType: string, payload)
@@ -236,7 +350,20 @@ local function handlePass(player: Player, actionType: string, payload)
 		return
 	end
 
-	if not BallControlService.IsControlledBy(player, ball) then
+	--[[
+		A set piece is taken WITHOUT possession: the ball is held on its spot by
+		RestartService, so requiring possession here would make a legal kick-off
+		impossible. In exchange the restart rules decide whether this action type
+		is allowed at all (§29).
+	]]
+	local restartActor, restartKind = getRestartTake(player, actionType)
+
+	if not restartActor and MatchRulesService.IsRestartActive() then
+		rejectPass(player, actionType, 0, "restart-not-yours")
+		return
+	end
+
+	if not restartActor and not BallControlService.IsControlledBy(player, ball) then
 		rejectPass(player, actionType, 0, "passer-no-possession")
 		return
 	end
@@ -249,7 +376,12 @@ local function handlePass(player: Player, actionType: string, payload)
 
 	local ballDistance = BallControlMath.GetHorizontal(ball.Position - rootPart.Position).Magnitude
 
-	if ballDistance > BallConfig.Control.HardControlDistance then
+	-- A restart taker stands beside the ball rather than controlling it, so the
+	-- controlled-ball range test does not apply; the taker radius bounds them.
+	local maximumBallDistance = if restartActor
+		then MatchRulesConfig.GetTakerMovementRadius(restartKind) + 2
+		else BallConfig.Control.HardControlDistance
+	if ballDistance > maximumBallDistance then
 		rejectPass(player, actionType, 0, "controlled-ball-out-of-range")
 		return
 	end
@@ -266,17 +398,22 @@ local function handlePass(player: Player, actionType: string, payload)
 		return
 	end
 
-	local receiver = findPlayerByUserId(requestedReceiverUserId)
-	if not receiver then
+	local receiverActor = FootballerRegistryService.GetActorById(requestedReceiverUserId)
+	if not receiverActor then
 		rejectPass(player, actionType, requestedReceiverUserId, "receiver-missing")
 		return
 	end
-	local eligible, eligibilityReason = FootballTeamEligibility.AreTeammates(player, receiver, FootballActionConfig.Targeting)
+	local passerTeam = FootballTeamConfig.Normalize(player:GetAttribute(FootballTeamConfig.AttributeName))
+	local eligible = receiverActor.Id ~= player.UserId and passerTeam ~= nil and receiverActor.TeamId == passerTeam
+	local eligibilityReason = if eligible then "same-team" else "receiver-not-teammate"
+	if receiverActor.Player then
+		eligible, eligibilityReason = FootballTeamEligibility.AreTeammates(player, receiverActor.Player, FootballActionConfig.Targeting)
+	end
 	if not eligible then
 		rejectPass(player, actionType, requestedReceiverUserId, eligibilityReason)
 		return
 	end
-	local candidate = createPlayerCandidate(receiver)
+	local candidate = FootballerRegistryService.CreateCandidate(receiverActor)
 	if not candidate then
 		rejectPass(player, actionType, requestedReceiverUserId, "receiver-dead")
 		return
@@ -310,25 +447,37 @@ local function handlePass(player: Player, actionType: string, payload)
 		rejectPass(player, actionType, requestedReceiverUserId, rejectionReason or "invalid-target-position")
 		return
 	end
+	plan.ReleasePosition = ball.Position
 
 	nextPassId += 1
 	local passId = nextPassId
-	local released = BallControlService.ReleaseForFootballAction(
-		ball,
-		player,
-		actionType,
-		plan.LaunchVelocity,
-		plan.ReleaseReacquireSuppression,
-		plan.ReleaseReacquireExitDistance,
-		{
-			PassId = passId,
-			IntendedReceiverUserId = getSelectedReceiverUserId(plan),
-			IntendedReceiverName = plan.SelectedCandidate and plan.SelectedCandidate.Name or "",
-			TargetPosition = plan.TargetPosition,
-			TargetKind = plan.SelectedCandidate and plan.SelectedCandidate.Kind or "Space",
-			EstimatedArrivalTime = plan.PredictedArrivalTime,
-		}
-	)
+	local actionContext = {
+		PassId = passId,
+		IntendedReceiverUserId = getSelectedReceiverUserId(plan),
+		IntendedReceiverName = plan.SelectedCandidate and plan.SelectedCandidate.Name or "",
+		TargetPosition = plan.TargetPosition,
+		TargetKind = plan.SelectedCandidate and plan.SelectedCandidate.Kind or "Space",
+		EstimatedArrivalTime = plan.PredictedArrivalTime,
+	}
+
+	local released
+	if restartActor then
+		released = BallControlService.ReleaseForRestart(ball, restartActor, actionType, plan.LaunchVelocity, actionContext)
+		if released then
+			-- THIS is what restarts the match, not touching the ball.
+			MatchRulesService.NotifyRestartAction(restartActor, actionType)
+		end
+	else
+		released = BallControlService.ReleaseForFootballAction(
+			ball,
+			player,
+			actionType,
+			plan.LaunchVelocity,
+			plan.ReleaseReacquireSuppression,
+			plan.ReleaseReacquireExitDistance,
+			actionContext
+		)
+	end
 
 	if not released then
 		sendFeedback(player, false, "release rejected", plan)
@@ -354,6 +503,94 @@ local function handlePass(player: Player, actionType: string, payload)
 	sendFeedback(player, true, "", plan)
 end
 
+-- Is the football physically strikeable by this footballer right now? A shot may
+-- only leave the foot when this is true, so a sprint touch that is still out in
+-- front of the player defers the strike instead of swinging through nothing.
+local function getShotContactState(player: Player, ball: BasePart)
+	local contactConfig = FootballActionConfig.Shoot.Contact
+	local rootPart = getPlayerRoot(player)
+	if not rootPart then
+		return "abandon", nil
+	end
+	local toBall = BallControlMath.GetHorizontal(ball.Position - rootPart.Position)
+	local distance = toBall.Magnitude
+	if distance > contactConfig.AbandonDistance then
+		return "abandon", rootPart
+	end
+	if math.abs(ball.Position.Y - rootPart.Position.Y) > contactConfig.MaximumHeight + rootPart.Size.Y then
+		return "wait", rootPart
+	end
+	if distance > contactConfig.ContactRadius then
+		return "wait", rootPart
+	end
+	local controlDirection = BallControlMath.SafeUnit(
+		BallControlMath.GetHorizontal(rootPart.AssemblyLinearVelocity),
+		BallControlMath.GetHorizontal(rootPart.CFrame.LookVector)
+	)
+	local forwardLead = toBall:Dot(controlDirection)
+	if forwardLead > contactConfig.MaximumForwardLead or forwardLead < -contactConfig.MaximumBehindLead then
+		return "wait", rootPart
+	end
+	local lateral = (toBall - controlDirection * forwardLead).Magnitude
+	if lateral > contactConfig.MaximumLateralOffset then
+		return "wait", rootPart
+	end
+	return "contact", rootPart
+end
+
+-- Re-solve the shot from where the football actually is at strike time. Planning
+-- at request time and launching up to a touch-cycle later was also the dominant
+-- source of local shot-trajectory prediction error.
+local function replanPreparedShot(player: Player, prepared)
+	local ball = prepared.Ball
+	local rootPart = getPlayerRoot(player)
+	if not rootPart then
+		return prepared.Plan
+	end
+	local goals = GoalService.GetGoals()
+	local goal = goals[prepared.GoalId]
+	local defendedGoal = goals[prepared.DefendedGoalId]
+	if prepared.Plan.ActionType == "Clearance" or not goal then
+		local attackingDirection = if goal and defendedGoal
+			then BallControlMath.SafeUnit(
+				BallControlMath.GetHorizontal(goal.MouthCenter - defendedGoal.MouthCenter),
+				prepared.AimDirection
+			)
+			else prepared.AimDirection
+		local plan = ShotPlanner.PlanClearance(
+			ball.Position,
+			prepared.AimDirection,
+			attackingDirection,
+			FootballActionConfig.Shoot
+		)
+		if plan then
+			plan.ClientActionId = prepared.ClientActionId
+			plan.ReleasePosition = ball.Position
+			applyShotPower(plan, prepared.ChargePower, getShotIntensityScale(player))
+		end
+		return plan or prepared.Plan
+	end
+	local teamId = FootballTeamConfig.Normalize(player:GetAttribute(FootballTeamConfig.AttributeName))
+	local plan = ShotPlanner.Plan(
+		ball.Position,
+		prepared.AimDirection,
+		goal,
+		BallConfig.Radius,
+		FootballActionConfig.Shoot,
+		getShootingSkill(player),
+		rootPart.CFrame.LookVector,
+		getDefendingGoalkeeperPosition(teamId),
+		prepared.ChargePower
+	)
+	if not plan then
+		return prepared.Plan
+	end
+	plan.ClientActionId = prepared.ClientActionId
+	plan.ReleasePosition = ball.Position
+	-- Re-planning solves fresh geometry; re-apply the power chosen at request.
+	return applyShotPower(plan, prepared.ChargePower, getShotIntensityScale(player))
+end
+
 local function releasePreparedShot(player: Player, clientActionId: string, releaseReason: string)
 	local prepared = preparedShotsByPlayer[player]
 	if not prepared or prepared.ClientActionId ~= clientActionId then
@@ -365,7 +602,9 @@ local function releasePreparedShot(player: Player, clientActionId: string, relea
 		return
 	end
 	local ball = prepared.Ball
-	local plan = prepared.Plan
+	local plan = if FootballActionConfig.Shoot.Contact.Enabled == true and ball.Parent
+		then replanPreparedShot(player, prepared)
+		else prepared.Plan
 	if plan.ActionType == "Shoot"
 		and player:GetAttribute(FootballTeamConfig.AttackingGoalAttributeName) ~= plan.GoalId
 	then
@@ -389,6 +628,7 @@ local function releasePreparedShot(player: Player, clientActionId: string, relea
 			TargetKind = if plan.ActionType == "Clearance" then "Space" else "Goal",
 			GoalId = plan.GoalId,
 			EstimatedArrivalTime = plan.PredictedArrivalTime,
+			CurveAcceleration = plan.CurveAcceleration,
 		}
 	)
 	if not released then
@@ -416,11 +656,119 @@ local function releasePreparedShot(player: Player, clientActionId: string, relea
 	sendFeedback(player, true, "", plan, "Shoot", "Released")
 end
 
+--[[
+	A shot that TAKES a restart -- a penalty, a free kick, or a corner struck at
+	goal (§29, §37).
+
+	Deliberately not the prepared-shot flow. That flow exists to wait for the
+	football to become strikeable while it is being dribbled; a restart ball is
+	already stationary at the taker's feet, so waiting for a contact window that
+	is permanently satisfied would only add latency. Everything else -- planning,
+	Shooting Skill, charge -- is the ordinary shot path, so a penalty is struck by
+	exactly the same rules as a shot from open play.
+]]
+local function handleRestartShot(player: Player, payload, restartActor, restartKind: string?)
+	local ball = getFootball()
+	local rootPart = getPlayerRoot(player)
+	if not ball or not rootPart then
+		sendFeedback(player, false, "shooter-character-missing", nil, "Shoot")
+		return
+	end
+	if not isCooldownReady(player, "Shoot", FootballActionConfig.Shoot.Cooldown) then
+		sendFeedback(player, false, "cooldown", nil, "Shoot")
+		return
+	end
+
+	local goals = GoalService.GetGoals()
+	local teamId = FootballTeamConfig.Normalize(player:GetAttribute(FootballTeamConfig.AttributeName))
+	local mapping = FootballTeamConfig.GetGoalMapping(teamId)
+	local goal = mapping and goals[mapping.AttackingGoalId]
+	if not goal then
+		sendFeedback(player, false, "goal-unavailable", nil, "Shoot")
+		return
+	end
+
+	local chargeConfig = FootballActionConfig.Shoot.Charge
+	local chargePower = chargeConfig.MaximumPower
+	if chargeConfig.Enabled == true then
+		local requested = if payload and typeof(payload.ChargePower) == "number" then payload.ChargePower else nil
+		if requested then
+			chargePower = math.clamp(requested, chargeConfig.MinimumPower, chargeConfig.MaximumPower)
+		end
+	end
+
+	local aimDirection = getAimDirection(player, payload)
+	local plan, reason = ShotPlanner.Plan(
+		ball.Position,
+		aimDirection,
+		goal,
+		BallConfig.Radius,
+		FootballActionConfig.Shoot,
+		getShootingSkill(player),
+		rootPart.CFrame.LookVector,
+		getDefendingGoalkeeperPosition(teamId),
+		chargePower
+	)
+	if not plan then
+		sendFeedback(player, false, reason or "goal-unavailable", nil, "Shoot")
+		return
+	end
+	applyShotPower(plan, chargePower, getShotIntensityScale(player))
+	plan.ReleasePosition = ball.Position
+
+	local released = BallControlService.ReleaseForRestart(ball, restartActor, "Shoot", plan.LaunchVelocity, {
+		IntendedReceiverUserId = 0,
+		TargetPosition = plan.TargetPosition,
+		TargetKind = "Goal",
+		GoalId = plan.GoalId,
+		EstimatedArrivalTime = plan.PredictedArrivalTime,
+		CurveAcceleration = plan.CurveAcceleration,
+	})
+	if not released then
+		sendFeedback(player, false, "shot-release-rejected", plan, "Shoot")
+		return
+	end
+	MatchRulesService.NotifyRestartAction(restartActor, "Shoot")
+	log(string.format(
+		"[RestartShot] restart=%s player=%s goal=%s distance=%.1f launchSpeed=%.1f skill=%.0f result=%s",
+		tostring(restartKind),
+		player.Name,
+		plan.GoalId,
+		plan.Distance,
+		plan.LaunchSpeed,
+		(plan.ShootingSkill or 0) * 100,
+		plan.Result or "Released"
+	))
+	sendFeedback(player, true, "", plan, "Shoot", "Released")
+end
+
 local function handleShoot(player: Player, payload)
 	local phase = if payload and typeof(payload.Phase) == "string" then payload.Phase else "Prepare"
 	local clientActionId = if payload and typeof(payload.ClientActionId) == "string" then payload.ClientActionId else ""
 	if phase == "Commit" then
+		-- The animation marker supplies timing for an already-valid shot. It may
+		-- not decide validity: if the football is not strikeable yet, the contact
+		-- wait keeps running and releases on its own terms.
+		local prepared = preparedShotsByPlayer[player]
+		if prepared and prepared.ClientActionId == clientActionId
+			and FootballActionConfig.Shoot.Contact.Enabled == true
+		then
+			local state = getShotContactState(player, prepared.Ball)
+			if state ~= "contact" then
+				return
+			end
+		end
 		releasePreparedShot(player, clientActionId, "BallContact-marker")
+		return
+	end
+
+	local restartActor, restartKind = getRestartTake(player, "Shoot")
+	if restartActor then
+		handleRestartShot(player, payload, restartActor, restartKind)
+		return
+	end
+	if MatchRulesService.IsRestartActive() then
+		sendFeedback(player, false, "restart-not-yours", nil, "Shoot")
 		return
 	end
 
@@ -444,6 +792,7 @@ local function handleShoot(player: Player, payload)
 		return
 	end
 
+	local holdDuration = if payload and typeof(payload.HoldDuration) == "number" then payload.HoldDuration else 0
 	local goals = GoalService.GetGoals()
 	local aimDirection = getAimDirection(player, payload)
 	local teamId = FootballTeamConfig.Normalize(player:GetAttribute(FootballTeamConfig.AttributeName))
@@ -471,6 +820,26 @@ local function handleShoot(player: Player, payload)
 		else BallControlMath.SafeUnit(BallControlMath.GetHorizontal(goal.MouthCenter - ball.Position), aimDirection)
 	local pitchCenter = if defendedGoal then (goal.MouthCenter + defendedGoal.MouthCenter) * 0.5 else goal.MouthCenter
 	local attackingHalfProgress = BallControlMath.GetHorizontal(ball.Position - pitchCenter):Dot(attackingDirection)
+	--[[
+		Charge is resolved BEFORE planning now, because the plan uses it: a driven
+		shot is kept low and does not bend, a placed one is lifted and does
+		(§66, §69). It used to be applied afterwards as a bare velocity multiplier,
+		which meant power could not influence the shot's shape at all.
+	]]
+	local chargeConfig = FootballActionConfig.Shoot.Charge
+	local chargePower = chargeConfig.MaximumPower
+	if chargeConfig.Enabled == true then
+		local requested = if payload and typeof(payload.ChargePower) == "number" then payload.ChargePower else nil
+		if requested then
+			chargePower = math.clamp(requested, chargeConfig.MinimumPower, chargeConfig.MaximumPower)
+		else
+			-- Fall back to the server's own view of hold duration.
+			local span = math.max(chargeConfig.MaximumHoldSeconds - chargeConfig.MinimumHoldSeconds, 1e-4)
+			local alpha = math.clamp((holdDuration - chargeConfig.MinimumHoldSeconds) / span, 0, 1) ^ chargeConfig.CurveExponent
+			chargePower = chargeConfig.MinimumPower + (chargeConfig.MaximumPower - chargeConfig.MinimumPower) * alpha
+		end
+	end
+
 	local plan, reason
 	if attackingHalfProgress < (FootballActionConfig.Shoot.MinimumShotProgressStuds or 0)
 		or goalDistance > FootballActionConfig.Shoot.MaximumAttackingDistance
@@ -485,27 +854,98 @@ local function handleShoot(player: Player, payload)
 			BallConfig.Radius,
 			FootballActionConfig.Shoot,
 			getShootingSkill(player),
-			rootPart.CFrame.LookVector
+			rootPart.CFrame.LookVector,
+			getDefendingGoalkeeperPosition(teamId),
+			chargePower
 		)
 	end
 	if not plan then
 		sendFeedback(player, false, reason or "goal-unavailable", nil, "Shoot")
 		return
 	end
+	plan.ReleasePosition = ball.Position
 	nextShotId += 1
 	if clientActionId == "" then
 		clientActionId = string.format("%d:%d", player.UserId, nextShotId)
 	end
 	plan.ClientActionId = clientActionId
+
+	-- Accuracy stays with Shooting Skill and body alignment: a fully charged
+	-- shot is powerful, not precise.
+	applyShotPower(plan, chargePower, getShotIntensityScale(player))
+
+	local contactConfig = FootballActionConfig.Shoot.Contact
 	preparedShotsByPlayer[player] = {
+		ChargePower = chargePower,
 		Ball = ball,
 		Plan = plan,
 		ClientActionId = clientActionId,
+		GoalId = goalId,
+		DefendedGoalId = mapping.DefendedGoalId,
+		AimDirection = aimDirection,
 		ExpiresAt = os.clock() + FootballActionConfig.Shoot.PreparedActionLifetime,
 	}
 	sendFeedback(player, true, "", plan, "Shoot", "Prepared")
-	task.delay(FootballActionConfig.Shoot.ContactFallbackTime, function()
-		releasePreparedShot(player, clientActionId, "configured-fallback")
+
+	if contactConfig.Enabled ~= true then
+		task.delay(FootballActionConfig.Shoot.ContactFallbackTime, function()
+			releasePreparedShot(player, clientActionId, "configured-fallback")
+		end)
+		return
+	end
+
+	-- Hold the shot intent until the football is genuinely strikeable. Possession
+	-- is retained throughout; only the physical release waits.
+	task.spawn(function()
+		local startedAt = os.clock()
+		local deadline = startedAt + contactConfig.MaximumWaitSeconds
+		while true do
+			local prepared = preparedShotsByPlayer[player]
+			if not prepared or prepared.ClientActionId ~= clientActionId then
+				return
+			end
+			if not ball.Parent or not BallControlService.IsControlledBy(player, ball) then
+				preparedShotsByPlayer[player] = nil
+				sendFeedback(player, false, "shooter-no-possession", prepared.Plan, "Shoot")
+				return
+			end
+			local state, rootPart = getShotContactState(player, ball)
+			if state == "contact" then
+				releasePreparedShot(player, clientActionId, string.format(
+					"contact-window+%.0fms",
+					(os.clock() - startedAt) * 1000
+				))
+				return
+			end
+			if state == "abandon" then
+				preparedShotsByPlayer[player] = nil
+				sendFeedback(player, false, "shot-contact-lost", prepared.Plan, "Shoot")
+				log(string.format("[ShotContact] player=%s result=abandoned", player.Name))
+				return
+			end
+			if os.clock() >= deadline then
+				-- Bounded timeout. Release anyway so a queued shot can never hang,
+				-- but re-plan from the current ball position first.
+				releasePreparedShot(player, clientActionId, "contact-timeout")
+				return
+			end
+			-- Bounded orientation assistance toward the football while waiting.
+			if rootPart and contactConfig.FacingAssistDegreesPerSecond > 0 then
+				local toBall = BallControlMath.GetHorizontal(ball.Position - rootPart.Position)
+				if toBall.Magnitude > 0.5 then
+					local current = BallControlMath.GetHorizontal(rootPart.CFrame.LookVector)
+					local maxStep = math.rad(contactConfig.FacingAssistDegreesPerSecond * contactConfig.PollInterval)
+					local blended = BallControlMath.SafeUnit(
+						current.Unit:Lerp(toBall.Unit, math.min(maxStep, 1)),
+						current
+					)
+					if blended.Magnitude > 0 then
+						rootPart.CFrame = CFrame.lookAt(rootPart.Position, rootPart.Position + blended)
+					end
+				end
+			end
+			task.wait(contactConfig.PollInterval)
+		end
 	end)
 end
 
@@ -578,13 +1018,31 @@ local function handleKnockOn(player: Player, payload)
 		0,
 		targetSpeed
 	)
+	-- Relative push scales with how fast the footballer is actually travelling.
+	-- A flat clamp cannot separate from a sprint, which is why sprint knock-ons
+	-- previously stayed under the player's feet.
+	local scaling = actionConfig.VelocityScaling
+	local minPush, maxPush = actionConfig.MinRelativeForwardSpeed, actionConfig.MaxRelativeForwardSpeed
+	if scaling and scaling.Enabled == true then
+		local speedAlpha = math.clamp(
+			(math.max(playerHorizontalVelocity.Magnitude, initialForwardSpeed) - scaling.LowSpeed)
+				/ math.max(scaling.SprintSpeed - scaling.LowSpeed, 1e-4),
+			0,
+			1
+		)
+		local scaledPush = scaling.LowRelativePush
+			+ (scaling.SprintRelativePush - scaling.LowRelativePush) * speedAlpha
+			+ anticipatedPlayerSpeed * scaling.PlayerSpeedCarry
+		minPush = scaledPush
+		maxPush = math.max(scaledPush, actionConfig.MaxRelativeForwardSpeed)
+	end
 	local relativePushSpeed = math.clamp(
 		math.max(
 			requiredForwardSpeed - anticipatedPlayerSpeed,
-			actionConfig.MinRelativeForwardSpeed + actionConfig.LaunchSpeedPadding
+			minPush + actionConfig.LaunchSpeedPadding
 		),
-		actionConfig.MinRelativeForwardSpeed,
-		actionConfig.MaxRelativeForwardSpeed
+		minPush,
+		maxPush
 	)
 	local launchForwardSpeed = anticipatedPlayerSpeed + relativePushSpeed
 	local requiredLateralVelocity = requiredVelocity - requestedAimDirection * requiredForwardSpeed
@@ -623,6 +1081,24 @@ local function handleKnockOn(player: Player, payload)
 		}
 	)
 
+	--[[
+		A knock-on stays a football the player is chasing, not one they lost.
+
+		The football is genuinely free -- an opponent can win it -- but the
+		originator keeps a short priority window so catching up to their own
+		touch is a smooth reacquisition rather than a neutral contest.
+	]]
+	if released then
+		local reacquisition = actionConfig.Reacquisition
+		if reacquisition then
+			BallControlService.RegisterReacquisitionClaim(
+				player,
+				reacquisition.ClaimSeconds,
+				reacquisition.ScoreBonus
+			)
+		end
+	end
+
 	if not released then
 		sendFeedback(player, false, "release rejected", plan)
 		return
@@ -644,6 +1120,128 @@ local function handleKnockOn(player: Player, payload)
 	sendFeedback(player, true, "", plan)
 end
 
+--[[
+	THROW-IN (§32-§35).
+
+	The ball leaves the thrower's hands above their head and travels as a real
+	arc to a team-mate. Hold duration chooses how far it is thrown; the player's
+	own target selection chooses who it is thrown to.
+
+	`taker` is a footballer record, so a human throw and an AI throw run through
+	this identically -- an AI does not get an instant magic restart (§35).
+]]
+local function executeThrowIn(taker, aimDirection: Vector3, holdDuration: number, selectedReceiverId: number?): (boolean, string)
+	local ball = getFootball()
+	if not ball or not taker or not taker.RootPart or not taker.RootPart.Parent then
+		return false, "thrower-character-missing"
+	end
+	local config = FootballActionConfig.ThrowIn
+
+	-- The throw genuinely starts overhead, not at the ball's resting height.
+	local origin = taker.RootPart.Position + Vector3.yAxis * config.ReleaseHeight
+
+	local candidates = {}
+	for _, actor in FootballerRegistryService.GetAll() do
+		if actor.Id ~= taker.Id
+			and actor.TeamId == taker.TeamId
+			and actor.RootPart
+			and actor.RootPart.Parent
+		then
+			table.insert(candidates, {
+				Id = actor.Id,
+				Name = actor.DisplayName,
+				Position = actor.RootPart.Position,
+				Velocity = actor.RootPart.AssemblyLinearVelocity,
+			})
+		end
+	end
+
+	local desiredDistance = ThrowInPlanner.GetDesiredDistance(holdDuration, config)
+	local receiver = ThrowInPlanner.SelectReceiver(
+		origin,
+		aimDirection,
+		candidates,
+		desiredDistance,
+		selectedReceiverId,
+		config
+	)
+
+	local gravity = BallConfig.Flight and BallConfig.Flight.EffectiveGravity or Workspace.Gravity
+	local plan, reason
+	if receiver then
+		plan, reason = ThrowInPlanner.Plan(origin, receiver.Position, receiver.Velocity, config, gravity)
+	else
+		--[[
+			Nobody to aim at. Throwing the ball straight back over the same
+			touchline would restart the loop forever, so it goes a short distance
+			infield instead.
+		]]
+		local pitchState = PitchService.GetState()
+		local infield = if pitchState
+			then BallControlMath.SafeUnit(
+				BallControlMath.GetHorizontal(pitchState.Center - ball.Position),
+				Vector3.xAxis
+			)
+			else BallControlMath.SafeUnit(BallControlMath.GetHorizontal(taker.RootPart.CFrame.LookVector), Vector3.zAxis)
+		plan, reason = ThrowInPlanner.PlanSafeFallback(origin, infield, config, gravity)
+	end
+
+	if not plan then
+		return false, reason or "throw-in-unplannable"
+	end
+
+	--[[
+		The ball is thrown FROM the hands, so it is moved there at release. It is
+		never welded: this is a single placement immediately followed by a
+		physical launch.
+	]]
+	ball.CFrame = CFrame.new(origin)
+
+	local released = BallControlService.ReleaseForRestart(ball, taker, "ThrowIn", plan.LaunchVelocity, {
+		IntendedReceiverUserId = receiver and receiver.Id or 0,
+		IntendedReceiverName = receiver and receiver.Name or "",
+		TargetPosition = plan.TargetPosition,
+		TargetKind = if receiver then "Player" else "Space",
+		EstimatedArrivalTime = plan.PredictedArrivalTime,
+	})
+	if not released then
+		return false, "throw-in-release-rejected"
+	end
+	MatchRulesService.NotifyRestartAction(taker, "ThrowIn")
+
+	log(string.format(
+		"[ThrowIn] thrower=%s receiver=%s hold=%.2fs desired=%.1f actual=%.1f launchSpeed=%.1f vertical=%.1f flight=%.2fs",
+		taker.DisplayName,
+		receiver and receiver.Name or "(infield)",
+		holdDuration,
+		desiredDistance,
+		plan.Distance,
+		plan.LaunchSpeed,
+		plan.VerticalLaunchSpeed,
+		plan.PredictedArrivalTime
+	))
+	return true, ""
+end
+
+FootballActionService.ExecuteThrowIn = executeThrowIn
+
+local function handleThrowIn(player: Player, payload, taker)
+	local holdDuration = if payload and typeof(payload.HoldDuration) == "number" then payload.HoldDuration else 0
+	local selectedReceiverId = if payload and typeof(payload.IntendedReceiverUserId) == "number"
+		then math.floor(payload.IntendedReceiverUserId)
+		else nil
+	if selectedReceiverId == 0 then
+		selectedReceiverId = nil
+	end
+	local aimDirection = getAimDirection(player, payload)
+	local accepted, reason = executeThrowIn(taker, aimDirection, holdDuration, selectedReceiverId)
+	if not accepted then
+		sendFeedback(player, false, reason, nil, "ThrowIn")
+		return
+	end
+	sendFeedback(player, true, "", nil, "ThrowIn", "Released")
+end
+
 local function onActionRequested(player: Player, payload)
 	if typeof(payload) ~= "table" then
 		warnLog(string.format("Rejected malformed action payload from %s", player.Name))
@@ -651,6 +1249,22 @@ local function onActionRequested(player: Player, payload)
 	end
 
 	local actionType = payload.ActionType
+
+	--[[
+		A throw-in is taken with the Pass input, because there is no separate
+		throw button and adding one would break input parity across keyboard,
+		gamepad and touch. The mapping is done HERE rather than on the client so
+		that a client cannot decide for itself that a kick is a throw (§29).
+	]]
+	if (actionType == "GroundPass" or actionType == "ThroughPass" or actionType == "LobPass")
+		and RestartService.GetActiveRestartKind() == MatchRulesConfig.Restarts.ThrowIn
+	then
+		local taker = getRestartTake(player, "ThrowIn")
+		if taker then
+			handleThrowIn(player, payload, taker)
+			return
+		end
+	end
 
 	if actionType == "GroundPass" then
 		handlePass(player, actionType, payload)
@@ -665,6 +1279,364 @@ local function onActionRequested(player: Player, payload)
 	else
 		warnLog(string.format("Rejected unknown action '%s' from %s", tostring(actionType), player.Name))
 	end
+end
+
+local function isAIActionReady(actor, actionType: string, cooldown: number): boolean
+	local now = os.clock()
+	local times = lastAIActionAtById[actor.Id]
+	if not times then
+		times = {}
+		lastAIActionAtById[actor.Id] = times
+	end
+	local previous = times[actionType]
+	if previous and now - previous < cooldown then
+		return false
+	end
+	times[actionType] = now
+	return true
+end
+
+function FootballActionService.ExecuteAIPass(actor, receiverActor, actionType: string?): (boolean, any)
+	local ball = getFootball()
+	local selectedActionType = actionType or "GroundPass"
+	if not ball or not actor or not receiverActor or actor.TeamId ~= receiverActor.TeamId then
+		return false, "invalid-AI-pass-context"
+	end
+	if not BallControlService.IsControlledByAI(actor, ball) then
+		return false, "AI-passer-no-possession"
+	end
+	local candidate = FootballerRegistryService.CreateCandidate(receiverActor)
+	if not candidate then
+		return false, "AI-receiver-unavailable"
+	end
+	local actionConfig = if selectedActionType == "ThroughPass"
+		then FootballActionConfig.ThroughPass
+		elseif selectedActionType == "LobPass"
+		then FootballActionConfig.LobPass
+		else FootballActionConfig.Pass
+	if not isAIActionReady(actor, selectedActionType, actionConfig.Cooldown) then
+		return false, "AI-action-cooldown"
+	end
+	local aimDirection = BallControlMath.SafeUnit(
+		BallControlMath.GetHorizontal(candidate.Position - ball.Position),
+		actor.RootPart.CFrame.LookVector
+	)
+	local plan, reason = PassPlanner.PlanForReceiver(
+		ball.Position,
+		aimDirection,
+		0,
+		selectedActionType,
+		candidate,
+		FootballActionConfig,
+		1,
+		FootballActionConfig.Targeting.RetentionConeDegrees
+	)
+	if not plan then
+		return false, reason or "AI-pass-plan-failed"
+	end
+	plan.ReleasePosition = ball.Position
+	nextPassId += 1
+	local released = BallControlService.ReleaseAIForFootballAction(ball, actor, selectedActionType, plan.LaunchVelocity, {
+		PassId = nextPassId,
+		IntendedReceiverUserId = receiverActor.Id,
+		IntendedReceiverName = receiverActor.DisplayName,
+		TargetPosition = plan.TargetPosition,
+		TargetKind = receiverActor.Kind,
+		EstimatedArrivalTime = plan.PredictedArrivalTime,
+	})
+	if not released then
+		return false, "AI-pass-release-rejected"
+	end
+	log(string.format(
+		"[AIPass] passer=%s receiver=%s type=%s distance=%.1f launchSpeed=%.1f eta=%.2f",
+		actor.DisplayName,
+		receiverActor.DisplayName,
+		selectedActionType,
+		plan.Distance,
+		plan.LaunchSpeed,
+		plan.PredictedArrivalTime
+	))
+	return true, plan
+end
+
+function FootballActionService.ExecuteAIShot(actor, clearance: boolean?): (boolean, any)
+	local ball = getFootball()
+	if not ball or not actor or not BallControlService.IsControlledByAI(actor, ball) then
+		return false, "AI-shooter-no-possession"
+	end
+	if not isAIActionReady(actor, "Shoot", FootballActionConfig.Shoot.Cooldown) then
+		return false, "AI-action-cooldown"
+	end
+	local mapping = FootballTeamConfig.GetGoalMapping(actor.TeamId)
+	local goals = GoalService.GetGoals()
+	local attackingGoal = mapping and goals[mapping.AttackingGoalId]
+	local defendedGoal = mapping and goals[mapping.DefendedGoalId]
+	if not attackingGoal or not defendedGoal then
+		return false, "AI-goal-unavailable"
+	end
+	local attackingDirection = BallControlMath.SafeUnit(
+		BallControlMath.GetHorizontal(attackingGoal.MouthCenter - defendedGoal.MouthCenter),
+		actor.RootPart.CFrame.LookVector
+	)
+	local plan, reason
+	if clearance then
+		plan = ShotPlanner.PlanClearance(ball.Position, attackingDirection, attackingDirection, FootballActionConfig.Shoot)
+	else
+		plan, reason = ShotPlanner.Plan(
+			ball.Position,
+			attackingGoal.MouthCenter - ball.Position,
+			attackingGoal,
+			BallConfig.Radius,
+			FootballActionConfig.Shoot,
+			actor.ShootingSkill or FootballActionConfig.Shoot.Skill.Default,
+			actor.RootPart.CFrame.LookVector
+		)
+	end
+	if not plan then
+		return false, reason or "AI-shot-plan-failed"
+	end
+	plan.ReleasePosition = ball.Position
+	local released = BallControlService.ReleaseAIForFootballAction(ball, actor, plan.ActionType, plan.LaunchVelocity, {
+		TargetPosition = plan.TargetPosition,
+		TargetKind = if clearance then "Space" else "Goal",
+		GoalId = plan.GoalId,
+		EstimatedArrivalTime = plan.PredictedArrivalTime,
+		CurveAcceleration = plan.CurveAcceleration,
+	})
+	if not released then
+		return false, "AI-shot-release-rejected"
+	end
+	log(string.format(
+		"[AIShot] player=%s type=%s goal=%s distance=%.1f launchSpeed=%.1f eta=%.2f result=%s",
+		actor.DisplayName,
+		plan.ActionType,
+		plan.GoalId,
+		plan.Distance,
+		plan.LaunchSpeed,
+		plan.PredictedArrivalTime,
+		plan.Result or "Released"
+	))
+	return true, plan
+end
+
+--[[
+	AI TAKES A SET PIECE (§80).
+
+	The AI chooses the football decision -- which team-mate, how hard, whether to
+	shoot -- and then executes it through exactly the same restart release a human
+	uses. There is deliberately no bot-only shortcut: an AI kick-off is a pass, an
+	AI throw-in is a throw, an AI penalty is a shot, and each of them completes the
+	restart only because MatchRulesService accepted the action as legal.
+
+	Returns (taken, reason).
+]]
+function FootballActionService.ExecuteAIRestart(actor, restartKind: string): (boolean, string)
+	local ball = getFootball()
+	if not ball or not actor or not actor.RootPart or not actor.RootPart.Parent then
+		return false, "AI-restart-invalid-taker"
+	end
+	if not RestartService.IsAwaitingAction() then
+		return false, "restart-not-ready"
+	end
+	if not RestartService.IsAuthorizedTaker(actor) then
+		return false, "not-the-taker"
+	end
+
+	local restarts = MatchRulesConfig.Restarts
+
+	-- A throw-in is thrown. Distance is chosen from the available team-mates
+	-- rather than from a hold, since an AI has no button to hold.
+	if restartKind == restarts.ThrowIn then
+		local aim = BallControlMath.SafeUnit(
+			BallControlMath.GetHorizontal(actor.RootPart.CFrame.LookVector),
+			Vector3.zAxis
+		)
+		-- Mid-range hold: a sensible default throw rather than always short or long.
+		local hold = FootballActionConfig.ThrowIn.HoldMaxTime * 0.45
+		return executeThrowIn(actor, aim, hold, nil)
+	end
+
+	-- A penalty is a shot, and only a shot.
+	if restartKind == restarts.Penalty then
+		local accepted = FootballActionService.ExecuteRestartShot(actor)
+		return accepted, if accepted then "" else "AI-penalty-shot-failed"
+	end
+
+	--[[
+		Everything else is played to a team-mate. The AI picks the best available
+		receiver by the same "furthest forward that is still reachable" reasoning
+		it uses in open play, rather than simply the nearest body.
+	]]
+	local mapping = FootballTeamConfig.GetGoalMapping(actor.TeamId)
+	local goals = GoalService.GetGoals()
+	local attackingGoal = mapping and goals[mapping.AttackingGoalId]
+
+	--[[
+		A goal kick is played long; everything else is played on the ground. This
+		is a football decision, so it belongs to the AI rather than to the restart
+		rules -- both action types are legal for a goal kick.
+	]]
+	--[[
+		A goal kick is hit long and a corner is CROSSED; everything else is played
+		on the ground. Both are legal for their restart, so this is the AI making a
+		football decision rather than the rules dictating one.
+
+		The corner mattered in testing: played as a ground pass it used the ground
+		pass's 88-stud range, and from a corner flag in a 3v3 there is frequently
+		nobody inside that -- so the restart fell through to a clearance. A cross
+		reaches the far post, which is what a corner is for.
+	]]
+	local actionType = if restartKind == restarts.GoalKick or restartKind == restarts.CornerKick
+		then "LobPass"
+		else "GroundPass"
+	local actionConfig = if actionType == "LobPass" then FootballActionConfig.LobPass else FootballActionConfig.Pass
+
+	--[[
+		Range must come from the action actually being played. Using the ground
+		pass's 88-stud limit for a LOB from the keeper's own goal line meant a
+		goal kick could find nobody at all, and the restart was abandoned rather
+		than taken.
+	]]
+	local best, bestScore = nil, -math.huge
+	for _, candidate in FootballerRegistryService.GetAll() do
+		if candidate.Id ~= actor.Id
+			and candidate.TeamId == actor.TeamId
+			and candidate.RootPart
+			and candidate.RootPart.Parent
+		then
+			local distance = BallControlMath.GetHorizontal(candidate.RootPart.Position - ball.Position).Magnitude
+			if distance >= actionConfig.MinDistance and distance <= actionConfig.MaxDistance then
+				-- Prefer a team-mate who is forward, but not one so far away the
+				-- pass has no chance of arriving.
+				local progress = if attackingGoal
+					then -BallControlMath.GetHorizontal(candidate.RootPart.Position - attackingGoal.MouthCenter).Magnitude
+					else 0
+				local score = progress * 0.02 - distance * 0.01
+				if score > bestScore then
+					best, bestScore = candidate, score
+				end
+			end
+		end
+	end
+
+	--[[
+		NOBODY IN RANGE.
+
+		A restart must still be taken. A real keeper with no option simply hits it
+		long, so the ball is cleared upfield through the ordinary clearance
+		planner rather than the restart being abandoned and play resuming with a
+		dead ball on the six-yard line.
+	]]
+	if not best then
+		local defendedGoal = mapping and goals[mapping.DefendedGoalId]
+		if not attackingGoal or not defendedGoal then
+			return false, "AI-restart-no-receiver"
+		end
+		local upfield = BallControlMath.SafeUnit(
+			BallControlMath.GetHorizontal(attackingGoal.MouthCenter - defendedGoal.MouthCenter),
+			actor.RootPart.CFrame.LookVector
+		)
+		local plan = ShotPlanner.PlanClearance(ball.Position, upfield, upfield, FootballActionConfig.Shoot)
+		if not plan then
+			return false, "AI-restart-no-receiver"
+		end
+		local released = BallControlService.ReleaseForRestart(ball, actor, actionType, plan.LaunchVelocity, {
+			TargetPosition = plan.TargetPosition,
+			TargetKind = "Space",
+			EstimatedArrivalTime = plan.PredictedArrivalTime,
+		})
+		if not released or not MatchRulesService.NotifyRestartAction(actor, actionType) then
+			return false, "AI-restart-clearance-rejected"
+		end
+		log(string.format("[AIRestart] %s cleared upfield by %s (no receiver in range)", restartKind, actor.DisplayName))
+		return true, ""
+	end
+
+	local candidate = FootballerRegistryService.CreateCandidate(best)
+	if not candidate then
+		return false, "AI-restart-receiver-unavailable"
+	end
+
+	local aimDirection = BallControlMath.SafeUnit(
+		BallControlMath.GetHorizontal(candidate.Position - ball.Position),
+		actor.RootPart.CFrame.LookVector
+	)
+	local plan, reason = PassPlanner.PlanForReceiver(
+		ball.Position,
+		aimDirection,
+		0,
+		actionType,
+		candidate,
+		FootballActionConfig,
+		1,
+		FootballActionConfig.Targeting.RetentionConeDegrees
+	)
+	if not plan then
+		return false, reason or "AI-restart-plan-failed"
+	end
+
+	nextPassId += 1
+	local released = BallControlService.ReleaseForRestart(ball, actor, actionType, plan.LaunchVelocity, {
+		PassId = nextPassId,
+		IntendedReceiverUserId = best.Id,
+		IntendedReceiverName = best.DisplayName,
+		TargetPosition = plan.TargetPosition,
+		TargetKind = "Player",
+		EstimatedArrivalTime = plan.PredictedArrivalTime,
+	})
+	if not released then
+		return false, "AI-restart-release-rejected"
+	end
+	if not MatchRulesService.NotifyRestartAction(actor, actionType) then
+		return false, "AI-restart-action-rejected"
+	end
+
+	log(string.format(
+		"[AIRestart] %s taken by %s -> %s (%s, %.1f studs)",
+		restartKind,
+		actor.DisplayName,
+		best.DisplayName,
+		actionType,
+		plan.Distance
+	))
+	return true, ""
+end
+
+--[[
+	A shot that takes a restart, for an AI taker. Shares ShotPlanner with the
+	human path so a bot penalty is struck by the same model as a human one.
+]]
+function FootballActionService.ExecuteRestartShot(actor): boolean
+	local ball = getFootball()
+	local mapping = FootballTeamConfig.GetGoalMapping(actor.TeamId)
+	local goals = GoalService.GetGoals()
+	local goal = mapping and goals[mapping.AttackingGoalId]
+	if not ball or not goal or not actor.RootPart then
+		return false
+	end
+	local plan = ShotPlanner.Plan(
+		ball.Position,
+		goal.MouthCenter - ball.Position,
+		goal,
+		BallConfig.Radius,
+		FootballActionConfig.Shoot,
+		actor.ShootingSkill or FootballActionConfig.Shoot.Skill.Default,
+		actor.RootPart.CFrame.LookVector
+	)
+	if not plan then
+		return false
+	end
+	local released = BallControlService.ReleaseForRestart(ball, actor, "Shoot", plan.LaunchVelocity, {
+		TargetPosition = plan.TargetPosition,
+		TargetKind = "Goal",
+		GoalId = plan.GoalId,
+		EstimatedArrivalTime = plan.PredictedArrivalTime,
+		CurveAcceleration = plan.CurveAcceleration,
+	})
+	if not released then
+		return false
+	end
+	return MatchRulesService.NotifyRestartAction(actor, "Shoot")
 end
 
 function FootballActionService.Initialize()

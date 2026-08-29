@@ -20,7 +20,8 @@ local GameModeConfig = {
 		},
 		Quick3v3 = {
 			DisplayName = "Quick 3v3",
-			Enabled = false,
+			Enabled = true,
+			AllowsBallReset = true,
 		},
 		Tournament5v5 = {
 			DisplayName = "Tournament 5v5",

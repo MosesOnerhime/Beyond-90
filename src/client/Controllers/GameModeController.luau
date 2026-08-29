@@ -35,10 +35,14 @@ function GameModeController.GetPlayerState(): string
 	return Players.LocalPlayer:GetAttribute("Beyond90ExperienceState") or "Menu"
 end
 
-function GameModeController.EnterTrainingFree(teamId: string)
+function GameModeController.EnterMode(modeId: string, teamId: string)
 	if requestRemote then
-		requestRemote:FireServer({ Mode = "TrainingFree", TeamId = teamId })
+		requestRemote:FireServer({ Mode = modeId, TeamId = teamId })
 	end
+end
+
+function GameModeController.EnterTrainingFree(teamId: string)
+	GameModeController.EnterMode("TrainingFree", teamId)
 end
 
 function GameModeController.ResetTrainingBall()

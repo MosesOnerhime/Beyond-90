@@ -3,6 +3,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
+local AIConfig = require(Shared.Config.AIConfig)
 local BallConfig = require(Shared.Config.BallConfig)
 local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local GameConfig = require(Shared.Config.GameConfig)
@@ -17,12 +18,72 @@ local CONTROL_STATE_CONTROLLED = "Controlled"
 local controlConfig = BallConfig.Control
 local ownershipConfig = BallConfig.Ownership
 local activeController: Player? = nil
+local activeAIController = nil
 local lastControlDirectionByPlayer: { [Player]: Vector3 } = {}
 local lastLogicalTouchByPlayer: { [Player]: number } = {}
 local logicalTouchCountByPlayer: { [Player]: number } = {}
 local lastLeadDiagnosticByPlayer: { [Player]: number } = {}
 local leadDiagnosticSampleIdByPlayer: { [Player]: number } = {}
 local acquisitionSuppressedUntilByPlayer: { [Player]: any } = {}
+--[[
+	Reacquisition claims.
+
+	A knock-on is not a loss of possession -- the player deliberately pushed the
+	ball ahead and is chasing their own touch. Treating it like any other loose
+	ball meant the originator was suppressed for well over a second and then had
+	to win a neutral contest for a ball they had just played.
+
+	A claim is priority, never ownership: it only adds to the originator's
+	candidate score, so an opponent who genuinely arrives first still wins the
+	football.
+]]
+local reacquisitionClaimByPlayer: { [Player]: { Until: number, ScoreBonus: number } } = {}
+
+--[[
+	Report a football contact to the referee.
+
+	Resolved lazily so this module never has to require MatchRulesService at load
+	time, which keeps the dependency strictly one-way.
+]]
+local matchRulesService = nil
+local footballerRegistryService = nil
+local function getRegistry()
+	if footballerRegistryService == nil then
+		local ok, resolved = pcall(function()
+			return require(script.Parent.FootballerRegistryService)
+		end)
+		footballerRegistryService = if ok then resolved else false
+	end
+	return footballerRegistryService or nil
+end
+
+local function notifyRulesTouch(actor, kind: string)
+	if not actor then
+		return
+	end
+	if matchRulesService == nil then
+		local ok, resolved = pcall(function()
+			return require(script.Parent.MatchRulesService)
+		end)
+		matchRulesService = if ok then resolved else false
+	end
+	if matchRulesService then
+		matchRulesService.NotifyTouch(actor, kind)
+	end
+end
+
+local function getReacquisitionBonus(player: Player): number
+	local claim = reacquisitionClaimByPlayer[player]
+	if not claim then
+		return 0
+	end
+	if os.clock() >= claim.Until then
+		reacquisitionClaimByPlayer[player] = nil
+		return 0
+	end
+	return claim.ScoreBonus
+end
+
 local lastReceptionDiagnosticAtByPlayer: { [Player]: number } = {}
 local lastOwnershipValidationAt = 0
 local distanceViolationStartedAt: number? = nil
@@ -35,6 +96,71 @@ local networkOwnershipHandoffUntil = 0
 local controlAcquiredAt = 0
 local speedViolationStartedAt: number? = nil
 local receptionTransactionByPassId: { [number]: { Player: Player, Time: number, Epoch: number } } = {}
+-- Milestone 6.1 AI possession acceptance metrics.
+local aiPossessionStats = {
+	Acquisitions = 0,
+	Releases = 0,
+	UnintendedReleases = 0,
+	DistanceExceeded = 0,
+	--[[
+		RELEASE REASONS (§79).
+
+		Losing the ball to a TACKLE was previously counted as an unintended
+		release -- i.e. as an AI ball-control failure -- which made the possession
+		stability metric read much worse than the control system deserved. An
+		opponent winning the ball is the game working, not the AI failing.
+
+		Kept separate so the stability number means what it claims to.
+	]]
+	Tackled = 0,
+	OpponentWon = 0,
+	InvalidState = 0,
+	Unexpected = 0,
+	DurationSum = 0,
+	CurrentMinLead = 0,
+	CurrentMaxLead = 0,
+}
+
+--[[
+	Classify a release reason.
+
+	Returns one of:
+		IntentionalAction  the AI played the ball (pass, shot, clearance)
+		Tackled            an opponent took it -- not a control failure
+		OpponentWon        another footballer legitimately acquired it
+		DistanceExceeded   the AI genuinely lost its own football
+		InvalidState       the match tore the possession down (restart, reset)
+		Unexpected         anything else, which is what should be investigated
+]]
+local function classifyReleaseReason(reason: string): string
+	local function has(needle: string): boolean
+		return string.find(reason, needle, 1, true) ~= nil
+	end
+	if has("Pass") or has("Shoot") or has("Clearance") or has("KnockOn") or has("ThrowIn") then
+		return "IntentionalAction"
+	end
+	if has("Tackled") or has("tackle") then
+		return "Tackled"
+	end
+	if has("distance exceeded") then
+		return "DistanceExceeded"
+	end
+	--[[
+		Other genuine control failures. These are the AI losing its own football --
+		it went too high to keep, or too fast -- so they count against stability,
+		but they are KNOWN causes and should not be reported as unexplained.
+	]]
+	if has("too high") or has("too fast") or has("speed") or has("invalid") then
+		return "LostControl"
+	end
+	if has("restart") or has("stopped") or has("rebuilding") or has("reset") or has("kickoff") then
+		return "InvalidState"
+	end
+	if has("acquired") or has("opponent") then
+		return "OpponentWon"
+	end
+	return "Unexpected"
+end
 
 local function log(message: string)
 	print(string.format("%s[Ball] %s", GameConfig.LogPrefix, message))
@@ -117,9 +243,11 @@ local function setPlayerNetworkOwner(ball: BasePart, player: Player)
 	log(string.format("Ball network owner -> %s", player.Name))
 end
 
-local function setBallState(ball: BasePart, state: string, controller: Player?)
+local function setBallState(ball: BasePart, state: string, controller: Player?, aiController)
 	ball:SetAttribute("State", state)
 	ball:SetAttribute("ControllerUserId", if controller then controller.UserId else 0)
+	ball:SetAttribute("ControllerFootballerId", if aiController then aiController.Id else if controller then controller.UserId else 0)
+	ball:SetAttribute("ControllerKind", if aiController then "AI" else if controller then "Human" else "")
 end
 
 local function advanceControlEpoch(ball: BasePart): number
@@ -286,17 +414,18 @@ local function updateControlDirection(player: Player, rootPart: BasePart, moveme
 end
 
 local function resolveControlDirection(ball: BasePart, candidate): Vector3
+	local controlKey = candidate.ControlKey or candidate.Player
 	local handoffUntil = ball:GetAttribute("ControlHandoffUntil")
 	local initialDirection = ball:GetAttribute("InitialControlDirection")
 	if typeof(handoffUntil) == "number" and os.clock() < handoffUntil
 		and typeof(initialDirection) == "Vector3" and initialDirection.Magnitude > 0.05
 	then
 		local direction = BallControlMath.SafeUnit(initialDirection, getFacingDirection(candidate.RootPart))
-		lastControlDirectionByPlayer[candidate.Player] = direction
+		lastControlDirectionByPlayer[controlKey] = direction
 		return direction
 	end
 	return updateControlDirection(
-		candidate.Player,
+		controlKey,
 		candidate.RootPart,
 		candidate.MovementDirection,
 		candidate.PlayerSpeed
@@ -310,7 +439,8 @@ local function getControlContext(
 	maxBallSpeed: number,
 	heightTolerance: number,
 	requireAcquireMovement: boolean,
-	requireClearContactPath: boolean
+	requireClearContactPath: boolean,
+	useHorizontalSpeed: boolean?
 )
 	local character, rootPart, humanoid = getCharacterParts(player)
 
@@ -322,7 +452,19 @@ local function getControlContext(
 		return nil
 	end
 
-	if ball.AssemblyLinearVelocity.Magnitude > maxBallSpeed then
+	--[[
+		Retention is defined on HORIZONTAL ball speed, and getControllerInvalidReason
+		enforces exactly that, with a grace period. Measuring the full 3-D speed here
+		made the two disagree: a normal dribble touch with its small vertical lift
+		could exceed the 3-D limit while the horizontal component was still legal.
+		getControllerInvalidReason then reported the controller valid, this returned
+		nil anyway, and possession was dropped as "movement state invalid" with no
+		grace at all -- mid-sprint, on a legitimate touch.
+	]]
+	local measuredSpeed = if useHorizontalSpeed
+		then BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity).Magnitude
+		else ball.AssemblyLinearVelocity.Magnitude
+	if measuredSpeed > maxBallSpeed then
 		return nil
 	end
 
@@ -396,8 +538,39 @@ local function getActiveControllerContext(player: Player, ball: BasePart)
 		controlConfig.ControlRetentionMaxSpeed,
 		controlConfig.ControlRetentionHeightTolerance,
 		false,
-		false
+		false,
+		-- Retention uses the horizontal measure, matching getControllerInvalidReason.
+		true
 	)
+end
+
+--[[
+	Restart and pre-match acquisition block (§25, §27, §28).
+
+	NOBODY acquires ordinary dribble possession while a restart is pending -- the
+	designated taker included. That is the whole architectural point: runtime
+	evidence showed a kick-off being "taken" as a LooseBall / TakeInStride
+	reception, after which the taker simply dribbled away, which is not a legal
+	kick-off in any code path.
+
+	During a restart the taker holds RestartControl instead (RestartService), and
+	the only way out of it is a legal release action. Before the match has been
+	started at all, no one may touch the ball either.
+]]
+local function isRestartBlocked(_actor): boolean
+	if matchRulesService == nil then
+		local ok, resolved = pcall(function()
+			return require(script.Parent.MatchRulesService)
+		end)
+		matchRulesService = if ok then resolved else false
+	end
+	if not matchRulesService then
+		return false
+	end
+	if matchRulesService.IsPreMatch and matchRulesService.IsPreMatch() then
+		return true
+	end
+	return matchRulesService.IsRestartActive()
 end
 
 local function chooseBestCandidate(ball: BasePart)
@@ -438,12 +611,34 @@ local function chooseBestCandidate(ball: BasePart)
 
 		local candidate = getCandidateContext(player, ball)
 
-		if candidate and (not bestCandidate or candidate.Score > bestCandidate.Score) then
-			bestCandidate = candidate
+		if candidate and isRestartBlocked(getRegistry() and getRegistry().GetHumanActor(player)) then
+			candidate = nil
+		end
+
+		if candidate then
+			-- Chasing your own knock-on is favoured, not guaranteed: this only
+			-- raises the score, so a better-placed opponent still wins the ball.
+			candidate.Score += getReacquisitionBonus(player)
+			if not bestCandidate or candidate.Score > bestCandidate.Score then
+				bestCandidate = candidate
+			end
 		end
 	end
 
 	return bestCandidate
+end
+
+local function getCandidateFootballerId(candidate): number
+	if typeof(candidate.FootballerId) == "number" then
+		return candidate.FootballerId
+	end
+	return if typeof(candidate.Player) == "Instance" and candidate.Player:IsA("Player")
+		then candidate.Player.UserId
+		else 0
+end
+
+local function getCandidateDisplayName(candidate): string
+	return candidate.DisplayName or (candidate.Player and candidate.Player.Name) or "Footballer"
 end
 
 local function applyReceptionFirstTouch(ball: BasePart, candidate, epoch: number)
@@ -470,8 +665,10 @@ local function applyReceptionFirstTouch(ball: BasePart, candidate, epoch: number
 		then BallConfig.Reception.AngularDampingOnSettle
 		else BallConfig.Reception.AngularDampingOnReceive
 	ball.AssemblyAngularVelocity = ball.AssemblyAngularVelocity:Lerp(Vector3.zero, angularDamping)
-	ball:SetAttribute("LastReceptionPlayerUserId", candidate.Player.UserId)
-	ball:SetAttribute("LastReceptionPlayerName", candidate.Player.Name)
+	local receiverId = getCandidateFootballerId(candidate)
+	local receiverName = getCandidateDisplayName(candidate)
+	ball:SetAttribute("LastReceptionPlayerUserId", receiverId)
+	ball:SetAttribute("LastReceptionPlayerName", receiverName)
 	ball:SetAttribute("LastReceptionType", candidate.FirstTouchType)
 	ball:SetAttribute("LastReceptionDistance", candidate.Distance)
 	ball:SetAttribute("LastReceptionBallSpeed", candidate.BallSpeed)
@@ -487,15 +684,27 @@ local function applyReceptionFirstTouch(ball: BasePart, candidate, epoch: number
 	ball:SetAttribute("ControlHandoffUntil", os.clock() + BallConfig.Control.HandoffStabilizationDuration)
 	local actionStartedAt = ball:GetAttribute("LastFootballActionTime")
 	local predictedArrival = ball:GetAttribute("LastFootballActionEstimatedArrivalTime")
+	local passId = ball:GetAttribute("LastFootballActionPassId")
+	-- A pass is delivered exactly once. Without this latch every later
+	-- re-acquisition inside the intended-receiver window re-measured the same
+	-- pass against its original launch time, producing growing phantom ETAs.
+	local passAlreadyDelivered = typeof(passId) == "number"
+		and passId ~= 0
+		and ball:GetAttribute("LastFootballActionDeliveredPassId") == passId
 	if candidate.IntendedReceiver
+		and not passAlreadyDelivered
 		and (candidate.ActionType == "GroundPass" or candidate.ActionType == "ThroughPass" or candidate.ActionType == "LobPass")
 		and typeof(actionStartedAt) == "number"
 	then
 		local measuredArrival = os.clock() - actionStartedAt
+		if typeof(passId) == "number" and passId ~= 0 then
+			ball:SetAttribute("LastFootballActionDeliveredPassId", passId)
+		end
 		log(string.format(
-			"[PassArrival] type=%s receiver=%s predictedETA=%.2f measuredETA=%.2f measuredArrivalSpeed=%.1f",
+			"[PassArrival] type=%s receiver=%s passId=%s predictedETA=%.2f measuredETA=%.2f measuredArrivalSpeed=%.1f",
 			candidate.ActionType,
-			candidate.Player.Name,
+			receiverName,
+			tostring(passId or 0),
 			if typeof(predictedArrival) == "number" then predictedArrival else 0,
 			measuredArrival,
 			ballSpeedBefore
@@ -506,17 +715,18 @@ local function applyReceptionFirstTouch(ball: BasePart, candidate, epoch: number
 		return
 	end
 
-	local last = lastReceptionDiagnosticAtByPlayer[candidate.Player]
+	local diagnosticKey = candidate.ControlKey or candidate.Player
+	local last = lastReceptionDiagnosticAtByPlayer[diagnosticKey]
 	local now = os.clock()
 
 	if last and now - last < BallConfig.Reception.DiagnosticCooldown then
 		return
 	end
 
-	lastReceptionDiagnosticAtByPlayer[candidate.Player] = now
+	lastReceptionDiagnosticAtByPlayer[diagnosticKey] = now
 	log(string.format(
 		"[Reception] player=%s type=%s intended=%s distance=%.2f ballSpeed=%.2f relativeSpeed=%.2f result=Acquired firstTouch=%s",
-		candidate.Player.Name,
+		receiverName,
 		if candidate.ActionType ~= "" then candidate.ActionType else "LooseBall",
 		tostring(candidate.IntendedReceiver),
 		candidate.Distance,
@@ -527,7 +737,7 @@ local function applyReceptionFirstTouch(ball: BasePart, candidate, epoch: number
 	log(string.format(
 		"[ReceptionHandoff] epoch=%d player=%s type=%s firstTouch=%s playerSpeed=%.1f leadBefore=%.2f ballSpeedBefore=%.2f ballSpeedAfter=%.2f relativeSpeedAfter=%.2f expectedLead=%.2f",
 		epoch,
-		candidate.Player.Name,
+		receiverName,
 		if candidate.ActionType ~= "" then candidate.ActionType else "LooseBall",
 		candidate.FirstTouchType,
 		candidate.PlayerSpeed,
@@ -664,7 +874,7 @@ local function acquireControl(ball: BasePart, player: Player, receptionContext)
 	ball:SetAttribute("LastLocalTouchRelativeLongitudinalVelocity", 0)
 	ball:SetAttribute("LastLocalTouchPredictedRecontactTime", 0)
 	ball:SetAttribute("LastLocalTouchActualRecontactTime", 0)
-	ball:SetAttribute("LastReceptionPlayerUserId", if receptionContext then receptionContext.Player.UserId else 0)
+	ball:SetAttribute("LastReceptionPlayerUserId", if receptionContext then getCandidateFootballerId(receptionContext) else 0)
 	ball:SetAttribute("LastReceptionType", if receptionContext then receptionContext.FirstTouchType else "")
 	ball:SetAttribute("ControlEpoch", epoch)
 	local clientServoReadyAt = Workspace:GetServerTimeNow()
@@ -687,6 +897,8 @@ local function acquireControl(ball: BasePart, player: Player, receptionContext)
 	distanceViolationStartedAt = nil
 
 	log(string.format("Control acquired by %s", player.Name))
+	-- Last touch drives every restart decision, so it is reported, not inferred.
+	notifyRulesTouch(getRegistry() and getRegistry().GetHumanActor(player), "Control")
 
 	if isPlayerOwnedMode() then
 		if receptionContext then
@@ -719,6 +931,10 @@ local function applyVelocityDelta(ball: BasePart, deltaVelocity: Vector3): boole
 	return true
 end
 
+-- Set while the retention rule reports a valid controller but no control context
+-- could be built; see the grace handling in the update path.
+local contextLostSince: number? = nil
+
 local function getControllerInvalidReason(ball: BasePart): string?
 	local hardReason = getHardControllerInvalidReason(activeController)
 
@@ -733,12 +949,25 @@ local function getControllerInvalidReason(ball: BasePart): string?
 		return "character invalid"
 	end
 
-	if not isBallWithinHeight(ball, controlConfig.ControlRetentionHeightTolerance) then
+	--[[
+		A just-received lofted ball is allowed to still be coming down.
+
+		Same shape as the speed grace immediately below: for a short window after
+		acquisition the football is judged against a taller tolerance, because a
+		lob is received from above and needs a touch to bring it to the floor.
+		After the window the ordinary limit applies, so nobody dribbles at chest
+		height.
+	]]
+	local sinceAcquired = os.clock() - controlAcquiredAt
+	local heightTolerance = if sinceAcquired < controlConfig.ControlAcquisitionHeightGrace
+		then controlConfig.ControlAcquisitionHeightTolerance
+		else controlConfig.ControlRetentionHeightTolerance
+	if not isBallWithinHeight(ball, heightTolerance) then
 		return "ball too high"
 	end
 
 	local horizontalSpeed = BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity).Magnitude
-	local speedLimit = if os.clock() - controlAcquiredAt < controlConfig.ControlAcquisitionSpeedGrace
+	local speedLimit = if sinceAcquired < controlConfig.ControlAcquisitionSpeedGrace
 		then ownershipConfig.MaxControlledSpeed
 		else controlConfig.ControlRetentionMaxSpeed
 	if horizontalSpeed > speedLimit then
@@ -818,8 +1047,16 @@ end
 
 local function applyPlannedContact(ball: BasePart, candidate, controlDirection: Vector3): boolean
 	local now = os.clock()
-	local lastLogicalTouch = lastLogicalTouchByPlayer[candidate.Player]
-	if now - controlAcquiredAt < controlConfig.HandoffNoTouchDuration then
+	local controlKey = candidate.ControlKey or candidate.Player
+	local lastLogicalTouch = lastLogicalTouchByPlayer[controlKey]
+	-- A human client takes over its own servo shortly after acquisition, so the
+	-- long server no-touch window is harmless there. An AI has no client, so the
+	-- same window would leave the football completely uncorrected while the
+	-- footballer accelerates away from it.
+	local noTouchDuration = if candidate.IsAI
+		then AIConfig.ControlledBall.NoTouchDuration
+		else controlConfig.HandoffNoTouchDuration
+	if now - controlAcquiredAt < noTouchDuration then
 		return false
 	end
 
@@ -861,9 +1098,9 @@ local function applyPlannedContact(ball: BasePart, candidate, controlDirection: 
 		return false
 	end
 
-	lastLogicalTouchByPlayer[candidate.Player] = now
-	local count = (logicalTouchCountByPlayer[candidate.Player] or 0) + 1
-	logicalTouchCountByPlayer[candidate.Player] = count
+	lastLogicalTouchByPlayer[controlKey] = now
+	local count = (logicalTouchCountByPlayer[controlKey] or 0) + 1
+	logicalTouchCountByPlayer[controlKey] = count
 	ball:SetAttribute("LastControlTouchTime", now)
 	ball:SetAttribute("LastControlTouchCount", count)
 	ball:SetAttribute("ControlTargetError", velocityPlan.ToPlannedBall.Magnitude)
@@ -871,7 +1108,7 @@ local function applyPlannedContact(ball: BasePart, candidate, controlDirection: 
 	log(string.format(
 		"Control touch #%d by %s plannedSpeed=%.2f playerSpeed=%.2f overdrive=%.2f",
 		count,
-		candidate.Player.Name,
+		candidate.DisplayName or candidate.Player.Name,
 		velocityPlan.DesiredHorizontalVelocity.Magnitude,
 		candidate.PlayerSpeed,
 		velocityPlan.MaxOverdrive
@@ -924,28 +1161,29 @@ end
 
 local function updateLeadDiagnostics(ball: BasePart, candidate, controlDirection: Vector3)
 	local now = os.clock()
+	local controlKey = candidate.ControlKey or candidate.Player
 	local currentLead = BallControlMath.GetHorizontal(ball.Position - candidate.RootPart.Position):Dot(controlDirection)
-	local sampleId = (leadDiagnosticSampleIdByPlayer[candidate.Player] or 0) + 1
-	leadDiagnosticSampleIdByPlayer[candidate.Player] = sampleId
+	local sampleId = (leadDiagnosticSampleIdByPlayer[controlKey] or 0) + 1
+	leadDiagnosticSampleIdByPlayer[controlKey] = sampleId
 	ball:SetAttribute("CurrentBallLead", currentLead)
 	ball:SetAttribute("ServerBallLead", currentLead)
 	ball:SetAttribute("ServerLeadSampleId", sampleId)
 	ball:SetAttribute("ServerLeadSampleTime", now)
 
-	local lastLogTime = lastLeadDiagnosticByPlayer[candidate.Player]
+	local lastLogTime = lastLeadDiagnosticByPlayer[controlKey]
 
 	if lastLogTime and now - lastLogTime < controlConfig.LeadDiagnosticInterval then
 		return
 	end
 
-	lastLeadDiagnosticByPlayer[candidate.Player] = now
-	if isPlayerOwnedMode() then
+	lastLeadDiagnosticByPlayer[controlKey] = now
+	if isPlayerOwnedMode() and not candidate.IsAI then
 		log(string.format("Lead sample id=%d server=%.2f mode=player-owned", sampleId, currentLead))
 	else
 		log(string.format(
 			"Lead sample server=%.2f serverContacts=%d",
 			currentLead,
-			logicalTouchCountByPlayer[candidate.Player] or 0
+			logicalTouchCountByPlayer[controlKey] or 0
 		))
 	end
 end
@@ -1090,9 +1328,140 @@ local function applyCoupledPossessionControl(ball: BasePart, candidate, deltaTim
 	updateLeadDiagnostics(ball, candidate, controlDirection)
 end
 
+-- Speed-scaled carry lead, using the same BallConfig relationships the human
+-- client servo uses so AI and human dribbling share one football model.
+local function getAICarryLead(playerSpeed: number): number
+	if playerSpeed < controlConfig.StationaryPlayerSpeed then
+		return controlConfig.StationaryCarryLeadDistance
+	end
+	local alpha = math.clamp(playerSpeed / math.max(controlConfig.SprintReferenceSpeed, 1e-4), 0, 1)
+	return controlConfig.CarryLeadDistance
+		+ (controlConfig.SprintCarryLeadDistance - controlConfig.CarryLeadDistance) * alpha
+end
+
+-- The AI equivalent of ControlledBallController's possession servo. Humans run
+-- theirs on their own client; an AI has no client, so the authoritative server
+-- has to keep the footballer/ball relationship coherent itself.
+local function applyAIPossessionControl(ball: BasePart, candidate, deltaTime: number)
+	local aiConfig = AIConfig.ControlledBall
+	local controlDirection = resolveControlDirection(ball, candidate)
+	local rootPart = candidate.RootPart
+	local playerVelocity = BallControlMath.GetHorizontal(rootPart.AssemblyLinearVelocity)
+	local leadDistance = getAICarryLead(candidate.PlayerSpeed)
+	local targetPosition = rootPart.Position + controlDirection * leadDistance
+	local positionError = BallControlMath.GetHorizontal(targetPosition - ball.Position)
+	local currentLead = BallControlMath.GetHorizontal(ball.Position - rootPart.Position):Dot(controlDirection)
+
+	local touched = false
+	if candidate.PlayerSpeed >= controlConfig.StationaryPlayerSpeed then
+		touched = applyPlannedContact(ball, candidate, controlDirection)
+	end
+
+	if not touched and aiConfig.Enabled == true and positionError.Magnitude > aiConfig.DeadzoneStuds then
+		-- A football that has fallen behind the footballer needs a firmer pull
+		-- than one drifting slightly ahead, otherwise it never returns to a
+		-- controllable lane before the distance check releases possession.
+		local recovering = currentLead < leadDistance - aiConfig.RecoverLeadError
+		local positionGain = if recovering then aiConfig.RecoverPositionGain else aiConfig.PositionGain
+		local velocityDamping = if recovering then aiConfig.RecoverVelocityDamping else aiConfig.VelocityDamping
+		local ballVelocity = BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity)
+		local desiredVelocity = playerVelocity * aiConfig.PlayerVelocityScale
+			+ positionError * positionGain
+			- (ballVelocity - playerVelocity) * velocityDamping * deltaTime
+		desiredVelocity = BallControlMath.ClampMagnitude(desiredVelocity, aiConfig.MaxCorrectionSpeed)
+		local horizontalDelta = BallControlMath.ClampMagnitude(
+			desiredVelocity - ballVelocity,
+			aiConfig.MaxDeltaSpeedPerSecond * deltaTime
+		)
+		applyVelocityDelta(ball, Vector3.new(horizontalDelta.X, 0, horizontalDelta.Z))
+	end
+
+	if not touched then
+		applyMinimumSeparation(ball, rootPart, controlDirection)
+	end
+
+	aiPossessionStats.CurrentMinLead = math.min(aiPossessionStats.CurrentMinLead, currentLead)
+	aiPossessionStats.CurrentMaxLead = math.max(aiPossessionStats.CurrentMaxLead, currentLead)
+	ball:SetAttribute("ControlTargetError", positionError.Magnitude)
+	ball:SetAttribute("ControlMode", if currentLead < 0 then "AIRecover" else "AICarry")
+	ball:SetAttribute("AIControlLeadMin", aiPossessionStats.CurrentMinLead)
+	ball:SetAttribute("AIControlLeadMax", aiPossessionStats.CurrentMaxLead)
+	updateLeadDiagnostics(ball, candidate, controlDirection)
+end
+
+local function getAIControllerContext(actor, ball: BasePart)
+	if not actor or not actor.Character or not actor.Character.Parent then
+		return nil
+	end
+	local rootPart = actor.RootPart
+	local humanoid = actor.Humanoid
+	if not rootPart or not rootPart.Parent or not humanoid or humanoid.Health <= 0 then
+		return nil
+	end
+	local horizontalVelocity = BallControlMath.GetHorizontal(rootPart.AssemblyLinearVelocity)
+	local playerSpeed = horizontalVelocity.Magnitude
+	local movementDirection = BallControlMath.GetHorizontal(humanoid.MoveDirection)
+	if movementDirection.Magnitude <= 0.05 then
+		movementDirection = BallControlMath.SafeUnit(horizontalVelocity, getFacingDirection(rootPart))
+	else
+		movementDirection = movementDirection.Unit
+	end
+	local horizontalToBall = BallControlMath.GetHorizontal(ball.Position - rootPart.Position)
+	if horizontalToBall.Magnitude <= 0 then
+		return nil
+	end
+	return {
+		Player = actor.Character,
+		ControlKey = actor.Character,
+		DisplayName = actor.DisplayName,
+		IsAI = true,
+		Character = actor.Character,
+		RootPart = rootPart,
+		Humanoid = humanoid,
+		MovementDirection = movementDirection,
+		PlayerSpeed = playerSpeed,
+		DirectionToBall = horizontalToBall.Unit,
+		Distance = horizontalToBall.Magnitude,
+		TowardBallDot = movementDirection:Dot(horizontalToBall.Unit),
+		Score = 0,
+	}
+end
+
+local function getAIControllerInvalidReason(ball: BasePart): string?
+	local actor = activeAIController
+	local candidate = getAIControllerContext(actor, ball)
+	if not candidate then
+		return "AI character invalid"
+	end
+	if not isBallWithinHeight(ball, controlConfig.ControlRetentionHeightTolerance) then
+		return "AI controlled ball too high"
+	end
+	local horizontalSpeed = BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity).Magnitude
+	if horizontalSpeed > controlConfig.ControlRetentionMaxSpeed then
+		return "AI controlled ball too fast"
+	end
+	if candidate.Distance > controlConfig.HardControlDistance then
+		return "AI controlled ball distance exceeded"
+	end
+	return nil
+end
+
+local function clearAIControlState(actor)
+	if not actor then
+		return
+	end
+	local key = actor.Character
+	lastLogicalTouchByPlayer[key] = nil
+	logicalTouchCountByPlayer[key] = nil
+	lastControlDirectionByPlayer[key] = nil
+	lastLeadDiagnosticByPlayer[key] = nil
+	leadDiagnosticSampleIdByPlayer[key] = nil
+end
+
 function BallControlService.Initialize(ball: BasePart)
 	previousFreeBallPosition = ball.Position
 	activeController = nil
+	activeAIController = nil
 	controlAcquiredAt = 0
 	speedViolationStartedAt = nil
 	table.clear(lastLogicalTouchByPlayer)
@@ -1101,6 +1470,7 @@ function BallControlService.Initialize(ball: BasePart)
 	table.clear(lastLeadDiagnosticByPlayer)
 	table.clear(leadDiagnosticSampleIdByPlayer)
 	table.clear(acquisitionSuppressedUntilByPlayer)
+	table.clear(reacquisitionClaimByPlayer)
 	table.clear(lastReceptionDiagnosticAtByPlayer)
 	table.clear(receptionTransactionByPassId)
 	lastOwnershipValidationAt = 0
@@ -1114,6 +1484,8 @@ function BallControlService.Initialize(ball: BasePart)
 	setBallState(ball, CONTROL_STATE_FREE, nil)
 	controlEpoch = 0
 	ball:SetAttribute("ControlEpoch", controlEpoch)
+	ball:SetAttribute("ControllerFootballerId", 0)
+	ball:SetAttribute("ControllerKind", "")
 	clearLegacyDiagnostics(ball)
 	ball:SetAttribute("LastReleaseReason", "")
 	ball:SetAttribute("LastControlTouchTime", -1)
@@ -1177,7 +1549,9 @@ end
 
 function BallControlService.Reset(ball: BasePart)
 	previousFreeBallPosition = nil
-	if activeController then
+	if activeAIController then
+		BallControlService.ReleaseAI(ball, "ball reset")
+	elseif activeController then
 		releaseControl(ball, "ball reset")
 	else
 		setServerNetworkOwner(ball)
@@ -1192,6 +1566,7 @@ function BallControlService.Reset(ball: BasePart)
 	table.clear(lastLeadDiagnosticByPlayer)
 	table.clear(leadDiagnosticSampleIdByPlayer)
 	table.clear(acquisitionSuppressedUntilByPlayer)
+	table.clear(reacquisitionClaimByPlayer)
 	table.clear(lastReceptionDiagnosticAtByPlayer)
 	lastOwnershipValidationAt = 0
 	distanceViolationStartedAt = nil
@@ -1207,6 +1582,8 @@ function BallControlService.Reset(ball: BasePart)
 	ball:SetAttribute("ServerBallLead", 0)
 	ball:SetAttribute("ClientBallLead", 0)
 	ball:SetAttribute("NetworkOwnerUserId", 0)
+	ball:SetAttribute("ControllerFootballerId", 0)
+	ball:SetAttribute("ControllerKind", "")
 	ball:SetAttribute("ControlMode", "")
 	ball:SetAttribute("SmoothedPlayerSpeed", 0)
 	ball:SetAttribute("BallRelativeSpeed", 0)
@@ -1265,6 +1642,7 @@ function BallControlService.CleanupPlayer(player: Player, ball: BasePart?)
 	lastLeadDiagnosticByPlayer[player] = nil
 	leadDiagnosticSampleIdByPlayer[player] = nil
 	acquisitionSuppressedUntilByPlayer[player] = nil
+	reacquisitionClaimByPlayer[player] = nil
 	lastReceptionDiagnosticAtByPlayer[player] = nil
 
 	if activeController == player then
@@ -1283,6 +1661,10 @@ function BallControlService.GetActiveController(): Player?
 	return activeController
 end
 
+function BallControlService.GetActiveAIController()
+	return activeAIController
+end
+
 function BallControlService.IsControlledBy(player: Player, ball: BasePart?): boolean
 	if activeController ~= player then
 		return false
@@ -1294,6 +1676,319 @@ function BallControlService.IsControlledBy(player: Player, ball: BasePart?): boo
 	end
 
 	return true
+end
+
+function BallControlService.IsControlledByAI(actor, ball: BasePart?): boolean
+	if not actor or activeAIController ~= actor then
+		return false
+	end
+	if ball then
+		return ball:GetAttribute("State") == CONTROL_STATE_CONTROLLED
+			and ball:GetAttribute("ControllerKind") == "AI"
+			and ball:GetAttribute("ControllerFootballerId") == actor.Id
+	end
+	return true
+end
+
+function BallControlService.TryAcquireAI(ball: BasePart, actor, maximumDistance: number?, maximumSpeed: number?): boolean
+	if activeController or activeAIController or not actor then
+		return false
+	end
+	-- Nobody dribbles a stationary restart into play (§27).
+	if isRestartBlocked(actor) then
+		return false
+	end
+	local controlCandidate = getAIControllerContext(actor, ball)
+	local receptionContext = ReceptionPlanner.EvaluateActor(actor, ball, BallConfig.Reception, previousFreeBallPosition)
+	if not controlCandidate or not receptionContext
+		or receptionContext.Distance > (maximumDistance or controlConfig.AcquireDistance)
+		or BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity).Magnitude > (maximumSpeed or controlConfig.MaximumControllableBallSpeed)
+		or not isBallWithinHeight(ball, controlConfig.ControlHeightTolerance)
+	then
+		return false
+	end
+
+	activeAIController = actor
+	controlAcquiredAt = os.clock()
+	speedViolationStartedAt = nil
+	local epoch = advanceControlEpoch(ball)
+	clearControllerNoCollision()
+	setControllerNoCollision(ball, actor.Character)
+	setServerNetworkOwner(ball)
+	setBallState(ball, CONTROL_STATE_CONTROLLED, nil, actor)
+	ball:SetAttribute("FootballControlPhase", "Controlled")
+	ball:SetAttribute("LastReleaseReason", "")
+	ball:SetAttribute("ControlClientServoReadyAt", 0)
+	applyReceptionFirstTouch(ball, receptionContext, epoch)
+	logicalTouchCountByPlayer[actor.Character] = 0
+	lastControlDirectionByPlayer[actor.Character] = BallControlMath.SafeUnit(
+		receptionContext.ControlDirection,
+		getFacingDirection(actor.RootPart)
+	)
+	aiPossessionStats.Acquisitions += 1
+	aiPossessionStats.CurrentMinLead = 0
+	aiPossessionStats.CurrentMaxLead = 0
+	log(string.format("Control acquired by AI %s id=%d", actor.DisplayName, actor.Id))
+	notifyRulesTouch(actor, "Control")
+	return true
+end
+
+--[[
+	Force the football free, whoever holds it.
+
+	Used when the referee stops play: a restart must place the ball on the pitch,
+	and a ball still under control is dragged straight back to its controller by
+	the possession servo, which is exactly what left corners unreachable.
+]]
+function BallControlService.ForceRelease(ball: BasePart, reason: string)
+	if activeAIController then
+		BallControlService.ReleaseAI(ball, reason)
+	end
+	if activeController then
+		releaseControl(ball, reason)
+	end
+	ball.AssemblyLinearVelocity = Vector3.zero
+	ball.AssemblyAngularVelocity = Vector3.zero
+end
+
+function BallControlService.ReleaseAI(ball: BasePart, reason: string): boolean
+	local actor = activeAIController
+	if not actor then
+		return false
+	end
+	--[[
+		Acceptance telemetry (§79). Only a release that represents the AI losing
+		its OWN football counts against control stability; being tackled, or the
+		match taking the ball away for a restart, does not.
+	]]
+	local duration = if controlAcquiredAt > 0 then os.clock() - controlAcquiredAt else 0
+	local category = classifyReleaseReason(reason)
+	aiPossessionStats.Releases += 1
+	aiPossessionStats.DurationSum += duration
+
+	if category == "Tackled" then
+		aiPossessionStats.Tackled += 1
+	elseif category == "OpponentWon" then
+		aiPossessionStats.OpponentWon += 1
+	elseif category == "DistanceExceeded" then
+		aiPossessionStats.DistanceExceeded += 1
+		aiPossessionStats.UnintendedReleases += 1
+	elseif category == "LostControl" then
+		aiPossessionStats.UnintendedReleases += 1
+	elseif category == "InvalidState" then
+		aiPossessionStats.InvalidState += 1
+	elseif category == "Unexpected" then
+		aiPossessionStats.Unexpected += 1
+		aiPossessionStats.UnintendedReleases += 1
+	end
+
+	log(string.format(
+		"AI control released: %s by %s duration=%.2fs category=%s minLead=%.2f maxLead=%.2f",
+		reason,
+		actor.DisplayName,
+		duration,
+		category,
+		aiPossessionStats.CurrentMinLead,
+		aiPossessionStats.CurrentMaxLead
+	))
+	setServerNetworkOwner(ball)
+	clearAIControlState(actor)
+	activeAIController = nil
+	controlAcquiredAt = 0
+	speedViolationStartedAt = nil
+	clearControllerNoCollision()
+	setBallState(ball, CONTROL_STATE_FREE, nil)
+	ball:SetAttribute("LastReleaseReason", reason)
+	ball:SetAttribute("ControlClientServoReadyAt", 0)
+	return true
+end
+
+function BallControlService.ReleaseAIForFootballAction(
+	ball: BasePart,
+	actor,
+	actionName: string,
+	launchVelocity: Vector3,
+	actionContext: { [string]: any }?
+): boolean
+	if activeAIController ~= actor or not isFiniteVector(launchVelocity) then
+		return false
+	end
+	if not BallControlService.ReleaseAI(ball, string.format("%s by %s", actionName, actor.DisplayName)) then
+		return false
+	end
+	ball.AssemblyLinearVelocity = launchVelocity
+	local horizontalLaunchVelocity = Vector3.new(launchVelocity.X, 0, launchVelocity.Z)
+	ball.AssemblyAngularVelocity = Vector3.yAxis:Cross(horizontalLaunchVelocity)
+		/ math.max(BallConfig.Radius, 1e-5) * 0.38
+	ball:SetAttribute("LastFootballAction", actionName)
+	ball:SetAttribute("LastFootballActionPlayerUserId", actor.Id)
+	ball:SetAttribute("LastFootballActionTime", os.clock())
+	-- Playing the ball is a touch: it sets last-touch for restart decisions and
+	-- is the moment the offside snapshot is taken.
+	notifyRulesTouch(actor, actionName)
+	ball:SetAttribute("LastFootballActionIntendedReceiverUserId", actionContext and actionContext.IntendedReceiverUserId or 0)
+	ball:SetAttribute("LastFootballActionIntendedReceiverName", actionContext and actionContext.IntendedReceiverName or "")
+	ball:SetAttribute("LastFootballActionPassId", actionContext and actionContext.PassId or 0)
+	ball:SetAttribute("LastFootballActionTargetPosition", actionContext and actionContext.TargetPosition or nil)
+	ball:SetAttribute("LastFootballActionTargetKind", actionContext and actionContext.TargetKind or "")
+	ball:SetAttribute("LastFootballActionEstimatedArrivalTime", actionContext and actionContext.EstimatedArrivalTime or 0)
+	ball:SetAttribute("LastFootballActionGoalId", actionContext and actionContext.GoalId or "")
+	--[[
+		CURVE (§69). Set once, at release, and integrated by BallService while the
+		ball is in flight. Explicitly cleared when there is none, so a straight
+		pass can never inherit the bend of the shot before it.
+	]]
+	ball:SetAttribute(
+		BallConfig.Flight.CurveAttributeName,
+		if actionContext and typeof(actionContext.CurveAcceleration) == "Vector3"
+			then actionContext.CurveAcceleration
+			else Vector3.zero
+	)
+	ball:SetAttribute("FootballFlightComplete", false)
+	ball:SetAttribute("FootballGrounded", false)
+	ball:SetAttribute("FootballBounceCount", 0)
+	ball:SetAttribute("FootballControlPhase", "Loose")
+	return true
+end
+
+--[[
+	Release the football FROM A RESTART (§28, §29).
+
+	A restart ball is not possessed -- it is held on its spot by RestartService --
+	so this deliberately does not go through the possession release path. It is
+	the only way a set piece can be played, which is what makes "dribble the
+	kick-off away" unrepresentable rather than merely discouraged.
+
+	`actor` is a footballer record; a human taker and an AI taker use the same
+	call, so neither gets a privileged restart.
+]]
+function BallControlService.ReleaseForRestart(
+	ball: BasePart,
+	actor,
+	actionName: string,
+	launchVelocity: Vector3,
+	actionContext: { [string]: any }?
+): boolean
+	if not actor or not isFiniteVector(launchVelocity) then
+		return false
+	end
+
+	--[[
+		A restart ball must be genuinely free before it is struck. Nothing should
+		hold it at this point, but clearing any stale controller here means a
+		mid-restart possession bug can never produce a ball that is launched and
+		simultaneously owned.
+	]]
+	if activeController then
+		BallControlService.Release(ball, "restart taken")
+	end
+	if activeAIController then
+		BallControlService.ReleaseAI(ball, "restart taken")
+	end
+
+	ball:SetAttribute("State", "Free")
+	ball:SetAttribute("ControllerKind", "")
+	ball:SetAttribute("ControllerFootballerId", 0)
+	ball:SetAttribute("ControllerUserId", 0)
+
+	pcall(function()
+		ball:SetNetworkOwner(nil)
+	end)
+
+	ball.AssemblyLinearVelocity = launchVelocity
+	local horizontalLaunchVelocity = Vector3.new(launchVelocity.X, 0, launchVelocity.Z)
+	ball.AssemblyAngularVelocity = Vector3.yAxis:Cross(horizontalLaunchVelocity)
+		/ math.max(BallConfig.Radius, 1e-5) * 0.38
+
+	ball:SetAttribute("LastFootballAction", actionName)
+	ball:SetAttribute("LastFootballActionPlayerUserId", actor.Id)
+	ball:SetAttribute("LastFootballActionTime", os.clock())
+	ball:SetAttribute("LastFootballActionIntendedReceiverUserId", actionContext and actionContext.IntendedReceiverUserId or 0)
+	ball:SetAttribute("LastFootballActionIntendedReceiverName", actionContext and actionContext.IntendedReceiverName or "")
+	ball:SetAttribute("LastFootballActionPassId", actionContext and actionContext.PassId or 0)
+	ball:SetAttribute("LastFootballActionTargetPosition", actionContext and actionContext.TargetPosition or nil)
+	ball:SetAttribute("LastFootballActionTargetKind", actionContext and actionContext.TargetKind or "")
+	ball:SetAttribute("LastFootballActionEstimatedArrivalTime", actionContext and actionContext.EstimatedArrivalTime or 0)
+	ball:SetAttribute("LastFootballActionGoalId", actionContext and actionContext.GoalId or "")
+	--[[
+		CURVE (§69). Set once, at release, and integrated by BallService while the
+		ball is in flight. Explicitly cleared when there is none, so a straight
+		pass can never inherit the bend of the shot before it.
+	]]
+	ball:SetAttribute(
+		BallConfig.Flight.CurveAttributeName,
+		if actionContext and typeof(actionContext.CurveAcceleration) == "Vector3"
+			then actionContext.CurveAcceleration
+			else Vector3.zero
+	)
+	ball:SetAttribute("FootballFlightComplete", false)
+	ball:SetAttribute("FootballGrounded", false)
+	ball:SetAttribute("FootballBounceCount", 0)
+	ball:SetAttribute("FootballControlPhase", "Loose")
+
+	--[[
+		The taker cannot immediately reclaim their own restart. Real restarts
+		require a second touch by someone else first; this at least prevents the
+		taker passing to themselves.
+	]]
+	if actor.Player then
+		acquisitionSuppressedUntilByPlayer[actor.Player] = {
+			MinUntil = os.clock() + 0.35,
+			RequiresExit = true,
+			HasExited = false,
+			ExitDistance = 6,
+			ExpireAt = os.clock() + 3,
+		}
+	end
+
+	-- Report the touch so last-touch and the offside snapshot stay correct.
+	notifyRulesTouch(actor, actionName)
+	return true
+end
+
+function BallControlService.GetAIPossessionStats()
+	local releases = math.max(aiPossessionStats.Releases, 1)
+	return {
+		Acquisitions = aiPossessionStats.Acquisitions,
+		Releases = aiPossessionStats.Releases,
+		UnintendedReleases = aiPossessionStats.UnintendedReleases,
+		DistanceExceeded = aiPossessionStats.DistanceExceeded,
+		Tackled = aiPossessionStats.Tackled,
+		OpponentWon = aiPossessionStats.OpponentWon,
+		InvalidState = aiPossessionStats.InvalidState,
+		Unexpected = aiPossessionStats.Unexpected,
+		MeanControlDuration = aiPossessionStats.DurationSum / releases,
+		MinLead = aiPossessionStats.CurrentMinLead,
+		MaxLead = aiPossessionStats.CurrentMaxLead,
+	}
+end
+
+function BallControlService.ResetAIPossessionStats()
+	aiPossessionStats.Acquisitions = 0
+	aiPossessionStats.Releases = 0
+	aiPossessionStats.UnintendedReleases = 0
+	aiPossessionStats.DistanceExceeded = 0
+	aiPossessionStats.Tackled = 0
+	aiPossessionStats.OpponentWon = 0
+	aiPossessionStats.InvalidState = 0
+	aiPossessionStats.Unexpected = 0
+	aiPossessionStats.DurationSum = 0
+	aiPossessionStats.CurrentMinLead = 0
+	aiPossessionStats.CurrentMaxLead = 0
+end
+
+--[[
+	Give `player` temporary priority to win the football back, without blocking
+	anyone else from contesting it.
+]]
+function BallControlService.RegisterReacquisitionClaim(player: Player, duration: number, scoreBonus: number)
+	if duration <= 0 or scoreBonus <= 0 then
+		return
+	end
+	reacquisitionClaimByPlayer[player] = {
+		Until = os.clock() + duration,
+		ScoreBonus = scoreBonus,
+	}
 end
 
 function BallControlService.SuppressAcquisition(player: Player, duration: number, exitDistance: number?)
@@ -1337,6 +2032,8 @@ function BallControlService.ReleaseForFootballAction(
 	ball:SetAttribute("LastFootballAction", actionName)
 	ball:SetAttribute("LastFootballActionPlayerUserId", player.UserId)
 	ball:SetAttribute("LastFootballActionTime", os.clock())
+	local registry = getRegistry()
+	notifyRulesTouch(registry and registry.GetHumanActor(player), actionName)
 	ball:SetAttribute("LastFootballActionIntendedReceiverUserId", actionContext and actionContext.IntendedReceiverUserId or 0)
 	ball:SetAttribute("LastFootballActionIntendedReceiverName", actionContext and actionContext.IntendedReceiverName or "")
 	ball:SetAttribute("LastFootballActionPassId", actionContext and actionContext.PassId or 0)
@@ -1346,6 +2043,17 @@ function BallControlService.ReleaseForFootballAction(
 	ball:SetAttribute("LastFootballActionPredictedCatchTime", actionContext and actionContext.PredictedCatchTime or 0)
 	ball:SetAttribute("LastFootballActionPeakSeparation", actionContext and actionContext.PeakSeparation or 0)
 	ball:SetAttribute("LastFootballActionGoalId", actionContext and actionContext.GoalId or "")
+	--[[
+		CURVE (§69). Set once, at release, and integrated by BallService while the
+		ball is in flight. Explicitly cleared when there is none, so a straight
+		pass can never inherit the bend of the shot before it.
+	]]
+	ball:SetAttribute(
+		BallConfig.Flight.CurveAttributeName,
+		if actionContext and typeof(actionContext.CurveAcceleration) == "Vector3"
+			then actionContext.CurveAcceleration
+			else Vector3.zero
+	)
 	ball:SetAttribute("FootballFlightComplete", false)
 	ball:SetAttribute("FootballGrounded", false)
 	ball:SetAttribute("FootballBounceCount", 0)
@@ -1391,6 +2099,13 @@ function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
 	end
 	local stepDeltaTime = math.max(deltaTime or BallConfig.BasicTouch.CheckInterval, 1 / 240)
 
+	if activeAIController then
+		local invalidReason = getAIControllerInvalidReason(ball)
+		if invalidReason then
+			BallControlService.ReleaseAI(ball, invalidReason)
+		end
+	end
+
 	if activeController then
 		local invalidReason = getControllerInvalidReason(ball)
 
@@ -1411,7 +2126,7 @@ function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
 		end
 	end
 
-	local bestCandidate = chooseBestCandidate(ball)
+	local bestCandidate = if not activeAIController then chooseBestCandidate(ball) else nil
 
 	if bestCandidate then
 		if not activeController then
@@ -1424,6 +2139,18 @@ function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
 				acquireControl(ball, bestCandidate.Player, bestCandidate)
 			end
 		end
+	end
+
+	if activeAIController then
+		local aiCandidate = getAIControllerContext(activeAIController, ball)
+		if not aiCandidate then
+			BallControlService.ReleaseAI(ball, "AI movement state invalid")
+			return false
+		end
+		previousFreeBallPosition = nil
+		applyAIPossessionControl(ball, aiCandidate, stepDeltaTime)
+		setBallState(ball, CONTROL_STATE_CONTROLLED, nil, activeAIController)
+		return true
 	end
 
 	if not activeController then
@@ -1454,11 +2181,28 @@ function BallControlService.Update(ball: BasePart, deltaTime: number?): boolean
 		-- Distance/speed violations are handled above with their configured grace period.
 		-- Do not bypass that grace while the ownership handoff is reconciling.
 		if getControllerInvalidReason(ball) then
+			contextLostSince = nil
 			return false
 		end
+		--[[
+			The authoritative retention rule says this controller is still valid,
+			yet no control context could be built. That is a transient -- a frame
+			mid-touch, a handoff still settling -- not a loss of possession, so it
+			gets a short grace instead of an immediate release. A genuine problem
+			persists and still releases; getControllerInvalidReason also remains
+			free to release on its own terms.
+		]]
+		local now = os.clock()
+		contextLostSince = contextLostSince or now
+		if now - contextLostSince < controlConfig.ControlContextLostGrace then
+			return false
+		end
+		contextLostSince = nil
 		releaseControl(ball, "movement state invalid")
 		return false
 	end
+
+	contextLostSince = nil
 
 	if isPlayerOwnedMode() and os.clock() < networkOwnershipHandoffUntil then
 		applyCoupledPossessionControl(ball, activeCandidate, stepDeltaTime)

@@ -5,7 +5,10 @@ local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local BallControlMath = require(Shared.Football.BallControlMath)
+local RestartControl = require(Shared.Football.RestartControl)
+local BallConfig = require(Shared.Config.BallConfig)
 local FootballActionConfig = require(Shared.Config.FootballActionConfig)
+local GoalkeeperConfig = require(Shared.Config.GoalkeeperConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local ControlledBallController = require(script.Parent:WaitForChild("ControlledBallController"))
 local AudioController = require(script.Parent:WaitForChild("AudioController"))
@@ -23,6 +26,9 @@ local connections: { RBXScriptConnection } = {}
 local presentationEvent = Instance.new("BindableEvent")
 local shootActionSequence = 0
 local pendingShootActionId = ""
+local lastShootPressAt = 0
+local bufferedShotToken = 0
+local bufferedShotActive = false
 
 local function log(message: string)
 	print(string.format("%s[Client][FootballAction] %s", GameConfig.LogPrefix, message))
@@ -115,6 +121,192 @@ local function createTargetMarker(position: Vector3, targetName: string?)
 	Debris:AddItem(marker, FootballActionConfig.Debug.MarkerDuration)
 end
 
+
+local function getFootball(): BasePart?
+	local root = Workspace:FindFirstChild(GameConfig.WorkspaceContainerName)
+	local folder = root and root:FindFirstChild("Ball")
+	local ball = folder and folder:FindFirstChild(BallConfig.Name)
+	return if ball and ball:IsA("BasePart") then ball else nil
+end
+
+local function hasLocalPossession(ball: BasePart?): boolean
+	return ball ~= nil
+		and ball:GetAttribute("State") == "Controlled"
+		and ball:GetAttribute("ControllerFootballerId") == localPlayer.UserId
+end
+
+--[[
+	Does the local player hold a live set piece? (§31)
+
+	Deliberately separate from `hasLocalPossession`: this grants the right to
+	PLAY the ball, never the right to carry it. Dribbling systems must keep
+	asking `hasLocalPossession` and will keep getting false during a restart.
+]]
+local function hasRestartControl(ball: BasePart?): boolean
+	return RestartControl.IsHeldBy(ball, localPlayer.UserId)
+end
+
+-- "May I play the ball right now?" -- open-play possession OR a live restart.
+local function canPlayBall(ball: BasePart?): boolean
+	return hasLocalPossession(ball) or hasRestartControl(ball)
+end
+
+-- Charge curve. Power only scales launch speed; placement accuracy is entirely
+-- separate and still comes from Shooting Skill and body alignment.
+local function getChargePower(holdDuration: number): number
+	local charge = FootballActionConfig.Shoot.Charge
+	if not charge or charge.Enabled ~= true then
+		return charge and charge.MaximumPower or 1
+	end
+	local span = math.max(charge.MaximumHoldSeconds - charge.MinimumHoldSeconds, 1e-4)
+	local alpha = math.clamp((holdDuration - charge.MinimumHoldSeconds) / span, 0, 1)
+	alpha = alpha ^ charge.CurveExponent
+	return charge.MinimumPower + (charge.MaximumPower - charge.MinimumPower) * alpha
+end
+
+-- Mirrors the server's contact window so the client does not send a request the
+-- server would only reject.
+local function isBallStrikeable(): boolean
+	local ball = getFootball()
+	--[[
+		A set-piece ball is stationary on its spot, so there is no touch cycle to
+		time and nothing to wait for -- it is strikeable the instant the restart
+		goes live. Running the open-play contact window over it would reject the
+		taker for standing the wrong distance from a ball that is not moving.
+	]]
+	if hasRestartControl(ball) then
+		return true
+	end
+	if not hasLocalPossession(ball) then
+		return false
+	end
+	local character = localPlayer.Character
+	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+	if not rootPart or not rootPart:IsA("BasePart") then
+		return false
+	end
+	local contact = FootballActionConfig.Shoot.Contact
+	local toBall = BallControlMath.GetHorizontal(ball.Position - rootPart.Position)
+	if toBall.Magnitude > contact.ContactRadius then
+		return false
+	end
+	local controlDirection = BallControlMath.SafeUnit(
+		BallControlMath.GetHorizontal(rootPart.AssemblyLinearVelocity),
+		BallControlMath.GetHorizontal(rootPart.CFrame.LookVector)
+	)
+	local forwardLead = toBall:Dot(controlDirection)
+	if forwardLead > contact.MaximumForwardLead or forwardLead < -contact.MaximumBehindLead then
+		return false
+	end
+	local lateral = (toBall - controlDirection * forwardLead).Magnitude
+	return lateral <= contact.MaximumLateralOffset
+end
+
+local function cancelPendingShot(reason: string)
+	pendingShootActionId = ""
+	bufferedShotToken += 1
+	bufferedShotActive = false
+	presentationEvent:Fire({ Stage = "Rejected", ActionType = "Shoot", Reason = reason })
+end
+
+--[[
+	Hold the shot intent locally until the football returns into a strikeable
+	position. The player experience is: "I pressed Shoot while dribbling, so my
+	footballer strikes the next valid touch" -- no pixel-perfect timing against
+	the dribble cycle.
+]]
+local function bufferShotRequest(remote: RemoteEvent, payload, actionId: string)
+	local config = FootballActionConfig.Shoot.Buffer
+	bufferedShotToken += 1
+	local token = bufferedShotToken
+	bufferedShotActive = true
+	--[[
+		Ask the controlled ball to come back to a strikeable lead while the
+		intent is held (§41). Without this the buffer can only wait out a full
+		sprint touch; with it the next contact is pulled forward, so the shot
+		normally releases in a fraction of the budget rather than at the timeout.
+	]]
+	ControlledBallController.BeginStrikePreparation(config.MaximumWaitSeconds)
+	log("[ShotBuffer] holding shot intent until contact")
+
+	task.spawn(function()
+		local startedAt = os.clock()
+		while token == bufferedShotToken do
+			if pendingShootActionId ~= actionId then
+				bufferedShotActive = false
+				return
+			end
+			local ball = getFootball()
+			-- Possession genuinely lost, or the ball is beyond recovery. A live
+			-- restart counts as held, so a penalty taker is never treated as
+			-- having lost a ball that is sitting on the spot in front of them.
+			if not canPlayBall(ball) then
+				local character = localPlayer.Character
+				local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+				local distance = if ball and rootPart and rootPart:IsA("BasePart")
+					then BallControlMath.GetHorizontal(ball.Position - rootPart.Position).Magnitude
+					else math.huge
+				if distance > config.AbandonDistance then
+					bufferedShotActive = false
+					ControlledBallController.EndStrikePreparation()
+					MovementController.CancelActionMovement("Shoot")
+					cancelPendingShot("shot-buffer-possession-lost")
+					log("[ShotBuffer] abandoned; possession lost")
+					return
+				end
+			elseif isBallStrikeable() then
+				bufferedShotActive = false
+				ControlledBallController.EndStrikePreparation()
+				payload.BufferedSeconds = os.clock() - startedAt
+				remote:FireServer(payload)
+				log(string.format("[ShotBuffer] released after %.0fms", (os.clock() - startedAt) * 1000))
+				return
+			end
+			if os.clock() - startedAt >= config.MaximumWaitSeconds then
+				-- Bounded: send anyway and let the server's contact preparation
+				-- make the final call rather than silently dropping the input.
+				bufferedShotActive = false
+				ControlledBallController.EndStrikePreparation()
+				payload.BufferedSeconds = os.clock() - startedAt
+				remote:FireServer(payload)
+				log("[ShotBuffer] timeout; deferring to server contact window")
+				return
+			end
+			task.wait(config.PollInterval)
+		end
+		bufferedShotActive = false
+		ControlledBallController.EndStrikePreparation()
+	end)
+end
+
+-- The actions this controller is responsible for sending.
+local OWNED_ACTIONS = {
+	GroundPass = true,
+	ThroughPass = true,
+	LobPass = true,
+	KnockOn = true,
+	Shoot = true,
+}
+
+--[[
+	A GOALKEEPER IS NOT AN OUTFIELDER.
+
+	The keeper's dive and throw are rerouted from these same inputs by
+	GoalkeeperController, so this controller must let them pass rather than also
+	acting on them -- otherwise pressing dive would fire a tackle request at the
+	same moment, and the server would be asked for two different football actions
+	from one keypress.
+
+	Read from the character attribute the server writes when it registers a
+	keeper rather than from GoalkeeperController, so this file does not need to
+	know that controller exists.
+]]
+local function isLocalGoalkeeper(): boolean
+	local model = localPlayer.Character
+	return model ~= nil
+		and model:GetAttribute(GoalkeeperConfig.RoleAttributeName) == GoalkeeperConfig.Role
+end
+
 local function onFootballAction(action)
 	local remote = requestRemote
 
@@ -124,32 +316,96 @@ local function onFootballAction(action)
 
 	local actionType = action.ActionType
 
-	if (actionType == "GroundPass" or actionType == "ThroughPass" or actionType == "LobPass" or actionType == "KnockOn" or actionType == "Shoot")
-		and action.Phase ~= "Released"
-	then
+	--[[
+		This controller owns the ATTACKING actions only. Defensive intents such as
+		Tackle travel on DefendingService's own remote, and everything else on the
+		shared input event belongs to somebody else.
+
+		This was previously a blacklist of the five attacking actions, so any
+		other action fell through to the generic send at the bottom and was
+		forwarded to the football-action remote -- which is why every tackle press
+		also produced a server-side "Rejected unknown action 'Tackle'".
+	]]
+	if not OWNED_ACTIONS[actionType] then
+		return
+	end
+
+	--[[
+		A goalkeeper's pass key throws the ball out, and that is resolved by
+		GoalkeeperService against the held football rather than by the ordinary
+		passing pipeline. Letting the attacking actions through as well would
+		send two competing requests for one press.
+	]]
+	if isLocalGoalkeeper() then
+		return
+	end
+
+	if action.Phase ~= "Released" then
 		return
 	end
 
 	if actionType == "Shoot" then
+		local shootConfig = FootballActionConfig.Shoot
+		local fakeConfig = shootConfig.FakeShot
+		local now = os.clock()
+
+		-- Double tap converts the pending shot into a fake. Handled before the
+		-- request goes out, so no shot can physically release first.
+		if fakeConfig and fakeConfig.Enabled == true
+			and pendingShootActionId ~= ""
+			and now - lastShootPressAt <= fakeConfig.DoubleTapWindow
+		then
+			cancelPendingShot("fake-shot")
+			lastShootPressAt = 0
+			presentationEvent:Fire({
+				Stage = "FakeShot",
+				ActionType = "Shoot",
+				Timestamp = action.Timestamp or now,
+			})
+			MovementController.CancelActionMovement("Shoot")
+			log("[FakeShot] pending shot cancelled; possession retained")
+			return
+		end
+		lastShootPressAt = now
+
 		shootActionSequence += 1
-		pendingShootActionId = string.format("%d:%d:%d", localPlayer.UserId, shootActionSequence, math.floor(os.clock() * 1000))
+		local actionId = string.format("%d:%d:%d", localPlayer.UserId, shootActionSequence, math.floor(now * 1000))
+		pendingShootActionId = actionId
 		MovementController.BeginActionMovement("Shoot")
-		ControlledBallController.NotifyLocalFootballActionRelease(FootballActionConfig.Shoot.ContactFallbackTime + 0.15)
+
+		local shootContact = shootConfig.Contact
+		local releaseSuppression = if shootContact and shootContact.Enabled == true
+			then shootContact.MaximumWaitSeconds + 0.15
+			else shootConfig.ContactFallbackTime + 0.15
+		ControlledBallController.NotifyLocalFootballActionRelease(releaseSuppression)
 		presentationEvent:Fire({
 			Stage = "Predicted",
 			ActionType = "Shoot",
-			ClientActionId = pendingShootActionId,
-			Timestamp = action.Timestamp or os.clock(),
+			ClientActionId = actionId,
+			Timestamp = action.Timestamp or now,
 		})
-		remote:FireServer({
+
+		local payload = {
 			ActionType = "Shoot",
 			Phase = "Prepare",
-			ClientActionId = pendingShootActionId,
+			ClientActionId = actionId,
 			HoldDuration = action.HoldDuration or 0,
+			ChargePower = getChargePower(action.HoldDuration or 0),
 			AimDirection = getAimDirection(action),
 			MoveMagnitude = action.MoveMagnitude or 0,
-			Timestamp = action.Timestamp or os.clock(),
-		})
+			Timestamp = action.Timestamp or now,
+		}
+
+		-- Sprint-shot buffering. The football is frequently out on a touch when
+		-- Shoot is pressed; sending immediately is what produced the
+		-- controlled-ball-out-of-range rejection before the server's contact
+		-- preparation could ever run.
+		local bufferConfig = shootConfig.Buffer
+		if bufferConfig and bufferConfig.Enabled == true and not isBallStrikeable() then
+			bufferShotRequest(remote, payload, actionId)
+			return
+		end
+		remote:FireServer(payload)
 		return
 	end
 
@@ -234,12 +490,7 @@ local function onFeedback(payload)
 		return
 	end
 
-	if payload.Stage ~= "Prepared" then
-		presentationEvent:Fire({
-			Stage = "Accepted",
-			ActionType = payload.ActionType,
-		})
-	end
+	presentationEvent:Fire(payload)
 	if payload.ActionType == "Shoot"
 		and payload.Stage == "Prepared"
 		and payload.Trajectory == "Clearance"
@@ -256,6 +507,8 @@ local function onFeedback(payload)
 	end
 	if payload.ActionType == "Shoot" and payload.Stage == "Released" then
 		pendingShootActionId = ""
+		bufferedShotToken += 1
+		bufferedShotActive = false
 		AudioController.PlayFootballKick("Shoot")
 	elseif payload.ActionType == "GroundPass" or payload.ActionType == "ThroughPass" or payload.ActionType == "LobPass" then
 		AudioController.PlayFootballKick(payload.ActionType)

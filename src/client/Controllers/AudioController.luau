@@ -1,3 +1,4 @@
+local Players = game:GetService("Players")
 local SoundService = game:GetService("SoundService")
 local TweenService = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -10,6 +11,14 @@ local ControlledBallController = require(script.Parent.ControlledBallController)
 local AudioController = {}
 local initialized = false
 local selectedTrackIndex = 2
+--[[
+	Background music on/off.
+
+	Kept separate from track selection: turning music off must survive changing
+	tracks, and choosing a track must not silently switch music back on.
+]]
+local musicEnabled = true
+local musicChangedEvent = Instance.new("BindableEvent")
 local menuSound: Sound? = nil
 local crowdSound: Sound? = nil
 local clickSound: Sound? = nil
@@ -17,6 +26,7 @@ local dribbleTouchSound: Sound? = nil
 local passSound: Sound? = nil
 local shootSound: Sound? = nil
 local goalNetSound: Sound? = nil
+local matchWhistleSound: Sound? = nil
 local goalCommentarySound: Sound? = nil
 local dribbleConnection: RBXScriptConnection? = nil
 local goalConnection: RBXScriptConnection? = nil
@@ -76,7 +86,7 @@ local function rebuildMenuSound(playAfter: boolean)
 	if menuSound then menuSound:Destroy() end
 	local track = AudioConfig.MenuTracks[selectedTrackIndex]
 	menuSound = track and createSound("Beyond90MenuMusic", track.AssetId, true) or nil
-	if playAfter then fade(menuSound, 0.5) end
+	if playAfter and musicEnabled then fade(menuSound, 0.5) end
 end
 
 function AudioController.Initialize()
@@ -92,6 +102,8 @@ function AudioController.Initialize()
 	shootSound = createSound("Beyond90ShotKick", AudioConfig.Gameplay.Shoot.AssetId, false)
 	goalNetSound = createSound("Beyond90GoalNet", AudioConfig.Gameplay.GoalNet.AssetId, false)
 	goalCommentarySound = createSound("Beyond90GoalCommentary", AudioConfig.Gameplay.GoalCommentary.AssetId, false)
+	matchWhistleSound = createSound("Beyond90MatchStartWhistle", AudioConfig.Match.StartWhistle.AssetId, false)
+	configureEffect(matchWhistleSound, AudioConfig.Match.StartWhistle)
 	configureEffect(dribbleTouchSound, AudioConfig.Gameplay.DribbleTouch)
 	configureEffect(passSound, AudioConfig.Gameplay.Pass)
 	configureEffect(shootSound, AudioConfig.Gameplay.Shoot)
@@ -111,7 +123,11 @@ end
 
 function AudioController.EnterMenu()
 	fade(crowdSound, 0, true)
-	fade(menuSound, 0.5)
+	if musicEnabled then
+		fade(menuSound, 0.5)
+	else
+		fade(menuSound, 0, true)
+	end
 end
 
 function AudioController.EnterGameplay()
@@ -140,6 +156,44 @@ end
 
 function AudioController.GetMenuTrackIndex(): number
 	return selectedTrackIndex
+end
+
+--[[
+	Background music toggle.
+
+	Only the menu music is affected. Crowd ambience, the whistle and every
+	gameplay SFX are match audio, not background music, and stay as they are.
+]]
+function AudioController.SetMusicEnabled(enabled: boolean)
+	enabled = enabled == true
+	if musicEnabled == enabled then
+		return
+	end
+	musicEnabled = enabled
+	if enabled then
+		-- Only resume if we are actually on a menu screen; entering gameplay
+		-- fades this out again on its own.
+		if Players.LocalPlayer:GetAttribute("Beyond90ClientExperienceState") ~= "Gameplay" then
+			fade(menuSound, 0.5)
+		end
+	else
+		fade(menuSound, 0, true)
+	end
+	musicChangedEvent:Fire(enabled)
+end
+
+function AudioController.IsMusicEnabled(): boolean
+	return musicEnabled
+end
+
+function AudioController.GetMusicChangedEvent(): BindableEvent
+	return musicChangedEvent
+end
+
+-- Only MatchPresentationController calls this, so the whistle can never be
+-- doubled by a second system reacting to the same match-start event.
+function AudioController.PlayMatchStartWhistle()
+	playEffect(matchWhistleSound)
 end
 
 function AudioController.PlayClick()

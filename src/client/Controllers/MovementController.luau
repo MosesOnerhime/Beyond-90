@@ -15,6 +15,9 @@ local MovementController = {}
 local localPlayer = Players.LocalPlayer
 local movementConfig = PlayerConfig.Movement
 local locomotionConfig = PlayerConfig.Locomotion
+local MatchRulesConfig = require(ReplicatedStorage.Shared.Config.MatchRulesConfig)
+local StaminaConfig = require(ReplicatedStorage.Shared.Config.StaminaConfig)
+local AnimationConfig = require(ReplicatedStorage.Shared.Config.AnimationConfig)
 local inputConfig = PlayerConfig.Input
 local applyStepName = "Beyond90Locomotion"
 
@@ -276,9 +279,29 @@ log = function(message: string)
 	print(string.format("%s[Client][Movement] %s", GameConfig.LogPrefix, message))
 end
 
+--[[
+	STAMINA (§46, §47).
+
+	The ceiling is published by the server on the character, so the client never
+	decides how fit it is -- it only reads an authoritative number. A tired
+	footballer's SPRINT is capped; jogging is untouched, so fatigue slows a
+	player down without taking the game away from them.
+]]
+local function getStaminaSprintCeiling(): number
+	if StaminaConfig.Enabled ~= true then
+		return movementConfig.SprintSpeed
+	end
+	local character = currentHumanoid and currentHumanoid.Parent
+	local ceiling = character and character:GetAttribute(StaminaConfig.Attributes.SprintCeiling)
+	if typeof(ceiling) ~= "number" then
+		return movementConfig.SprintSpeed
+	end
+	return math.clamp(ceiling, movementConfig.BaseSpeed, movementConfig.SprintSpeed)
+end
+
 local function getTargetSpeed(): number
 	if sprintRequested then
-		return movementConfig.SprintSpeed
+		return getStaminaSprintCeiling()
 	end
 
 	return movementConfig.BaseSpeed
@@ -298,9 +321,23 @@ local function getFacingDirection(): Vector3
 	return Vector3.new(0, 0, -1)
 end
 
+--[[
+	Is another system currently turning the body? (§73)
+
+	True while AnimationController is driving a transition's yaw. Nothing here may
+	write orientation during that window, or the two fight and the turn stutters.
+]]
+local function animationOwnsRotation(): boolean
+	return localPlayer:GetAttribute(AnimationConfig.RotationAuthorityAttribute)
+		== AnimationConfig.RotationAuthorityAnimation
+end
+
 local function applyMovementSettings(humanoid: Humanoid)
 	humanoid.WalkSpeed = if locomotionBound then math.max(locomotionState.SmoothedSpeed, 0) else getTargetSpeed()
-	humanoid.AutoRotate = movementConfig.AutoRotate
+	-- Never re-enable AutoRotate underneath a driven turn (§73).
+	if not animationOwnsRotation() then
+		humanoid.AutoRotate = movementConfig.AutoRotate
+	end
 	humanoid.UseJumpPower = true
 	humanoid.JumpPower = movementConfig.JumpPower
 	humanoid.JumpHeight = movementConfig.JumpHeight
@@ -608,6 +645,146 @@ local function getLooseBallAssist(manualDirection: Vector3, manualMagnitude: num
 	return if magnitude > 0.05 then blended.Unit else Vector3.zero, magnitude, "LooseBall", 1 - manualOverride
 end
 
+--[[
+	PRESS ASSISTANCE (§41, §42).
+
+	DefendingController registers a provider rather than being required here,
+	which keeps the dependency one-way: defending knows about movement, movement
+	does not know about defending.
+]]
+local pressStateProvider: (() -> any)? = nil
+
+function MovementController.SetPressStateProvider(provider: (() -> any)?)
+	pressStateProvider = provider
+end
+
+--[[
+	Goalkeeper positioning assistance.
+
+	Registered the same way the press assist is, because it is the same kind of
+	thing: a bounded correction toward a target the player has not contradicted.
+	Keeping it in the ordinary locomotion pipeline rather than in a separate
+	goalkeeper movement path means a keeper accelerates, turns and stops with the
+	weight every other footballer has.
+]]
+local goalkeeperStateProvider: (() -> any)? = nil
+
+function MovementController.SetGoalkeeperStateProvider(provider: (() -> any)?)
+	goalkeeperStateProvider = provider
+end
+
+local function getGoalkeeperAssist(manualDirection: Vector3, manualMagnitude: number): (Vector3, number, boolean)
+	if not goalkeeperStateProvider or not currentRootPart then
+		return manualDirection, manualMagnitude, false
+	end
+	local state = goalkeeperStateProvider()
+	if not state then
+		return manualDirection, manualMagnitude, false
+	end
+	--[[
+		A committed dive is server-driven physical movement, and a held ball is
+		stationary by definition. Steering during either would fight the server
+		for control of the same character.
+	]]
+	if state.Frozen then
+		return Vector3.zero, 0, true
+	end
+	if not state.TargetPosition then
+		return manualDirection, manualMagnitude, false
+	end
+
+	--[[
+		THE PLAYER ALWAYS WINS.
+
+		Any real input returns unchanged. Coming for a cross, narrowing the angle
+		or simply standing somewhere else is a goalkeeping decision, and the one
+		thing assistance must never do is take a decision back.
+	]]
+	local config = state.Config
+	if manualMagnitude > 0.12 then
+		return manualDirection, manualMagnitude, false
+	end
+
+	local offset = BallControlMath.GetHorizontal(state.TargetPosition - currentRootPart.Position)
+	local distance = offset.Magnitude
+	if distance <= config.PositionAssistDeadzone
+		or distance > config.PositionAssistMaximumDistance
+	then
+		-- Settled, or deliberately far from the line. Either way, do nothing.
+		return manualDirection, manualMagnitude, false
+	end
+
+	--[[
+		Drift, not a sprint home: the assist speed is a fraction of the keeper's
+		own top speed, eased down as it arrives, so it reads as a keeper adjusting
+		their feet rather than as the game moving them.
+	]]
+	local approach = math.clamp(distance / math.max(config.PositionAssistDeadzone * 3, 0.01), 0.25, 1)
+	local magnitude = math.clamp(
+		config.PositionAssistSpeed / math.max(movementConfig.BaseSpeed, 1) * approach,
+		0,
+		1
+	)
+	return offset.Unit, magnitude, true
+end
+
+--[[
+	Steer toward the press target while V is held.
+
+	Bounded exactly like reception assistance: capped magnitude, and manual input
+	blends it out entirely, so the player can always pull out of an approach they
+	do not want. Nothing here raises the speed ceiling -- the result feeds the
+	ordinary locomotion model, so acceleration, turning, injury and stamina all
+	still apply.
+]]
+local function getPressAssist(manualDirection: Vector3, manualMagnitude: number): (Vector3, number, boolean)
+	if not pressStateProvider or not currentRootPart then
+		return manualDirection, manualMagnitude, false
+	end
+	local state = pressStateProvider()
+	if not state or not state.TargetPosition then
+		return manualDirection, manualMagnitude, false
+	end
+	local config = state.Config
+
+	local offset = BallControlMath.GetHorizontal(state.TargetPosition - currentRootPart.Position)
+	local distance = offset.Magnitude
+	if distance <= config.HoldDistance then
+		--[[
+			Close enough. The assist deliberately stops driving here so the player
+			is never pushed into the carrier -- arriving is the assist's job, the
+			last two studs are the player's.
+		]]
+		return manualDirection, manualMagnitude, true
+	end
+
+	local manualOverride = math.clamp(
+		manualMagnitude / math.max(config.ManualOverrideMagnitude, 0.01),
+		0,
+		1
+	)
+
+	--[[
+		Ease off approaching the hold distance so the arrival is a jockey rather
+		than a collision -- but only once the gap is genuinely closing. While the
+		press is still a sprint the magnitude must be full, or the movement cap
+		holds the footballer below the sprint speed it just requested (§37).
+	]]
+	local maximumMagnitude = if state.ShouldSprint then 1 else config.MaximumMoveMagnitude
+	local approach = maximumMagnitude * math.clamp(
+		(distance - config.HoldDistance) / math.max(config.SlowDistance - config.HoldDistance, 0.01),
+		0.3,
+		1
+	)
+	local assistDirection = offset.Unit
+	local blended = assistDirection * approach * (1 - manualOverride) + manualDirection * manualMagnitude
+	local magnitude = math.clamp(blended.Magnitude, 0, 1)
+	if magnitude <= 0.05 then
+		return Vector3.zero, 0, true
+	end
+	return blended.Unit, magnitude, true
+end
+
 local function updateReceptionFacing(deltaTime: number, phase: string)
 	local ball = getFootball()
 	local config = locomotionConfig.ReceptionAssist
@@ -624,6 +801,14 @@ local function updateReceptionFacing(deltaTime: number, phase: string)
 		receptionFacingActive = false
 		receptionFacingDirection = nil
 		receptionFacingHoldUntil = 0
+		return
+	end
+
+	--[[
+		A driven transition owns orientation while it runs (§73). Reception facing
+		steps aside rather than lerping the body back toward the ball mid-turn.
+	]]
+	if animationOwnsRotation() then
 		return
 	end
 
@@ -688,6 +873,11 @@ local function updateActionFacing(deltaTime: number)
 		return
 	end
 
+	-- Same rule as reception facing: the driven turn wins while it runs (§73).
+	if animationOwnsRotation() then
+		return
+	end
+
 	local current = BallControlMath.SafeUnit(BallControlMath.GetHorizontal(rootPart.CFrame.LookVector), desired)
 	local alpha = 1 - math.exp(-20 * deltaTime)
 	local facing = BallControlMath.SafeUnit(current:Lerp(desired, alpha), desired)
@@ -695,6 +885,49 @@ local function updateActionFacing(deltaTime: number)
 		currentHumanoid.AutoRotate = false
 	end
 	rootPart.CFrame = CFrame.lookAt(rootPart.Position, rootPart.Position + facing, Vector3.yAxis)
+end
+
+--[[
+	Speed multiplier from the server-authoritative injury state.
+	Healthy footballers are unaffected.
+]]
+local function getInjurySpeedScale(): number
+	local character = currentHumanoid and currentHumanoid.Parent
+	local state = character and character:GetAttribute(MatchRulesConfig.Injury.StateAttributeName)
+	if typeof(state) ~= "string" then
+		return 1
+	end
+	local injury = MatchRulesConfig.Injury
+	if state == injury.States.Knocked then
+		return injury.KnockedSpeedScale
+	elseif state == injury.States.Minor then
+		return injury.MinorSpeedScale
+	elseif state == injury.States.Moderate then
+		return injury.ModerateSpeedScale
+	end
+	return 1
+end
+
+--[[
+	Is movement forbidden right now?
+
+	This used to test PreMatch alone, which covered the wait for START MATCH but
+	nothing else. Every restart also has an arranging period -- Stoppage while
+	the award is announced, then RestartSetup while the server places the taker,
+	both teams, the officials and the ball -- and a human who can run during it
+	is standing somewhere the arrangement did not put them by the time the
+	whistle goes.
+
+	The phase list is shared rather than spelled out here, so the client and the
+	server cannot drift apart about when the pitch is being set.
+]]
+local function isMovementLocked(): boolean
+	local folder = ReplicatedStorage:FindFirstChild(MatchRulesConfig.FolderName)
+	if not folder then
+		return false
+	end
+	local phase = folder:GetAttribute(MatchRulesConfig.StateAttributeName)
+	return typeof(phase) == "string" and MatchRulesConfig.MovementLockedPhases[phase] == true
 end
 
 local function updateLocomotion(deltaTime: number)
@@ -708,8 +941,22 @@ local function updateLocomotion(deltaTime: number)
 	inputSource = rawInput.Source
 	local now = os.clock()
 
-	if rawInput.SprintRequested ~= sprintRequested then
-		setSprintRequested(rawInput.SprintRequested)
+	--[[
+		A press that is still closing sprints (§37).
+
+		Routed through the ordinary sprint request rather than by raising a speed
+		cap, so the footballer accelerates, tires and is limited by the stamina
+		ceiling exactly as if the player had held Sprint themselves. The player's
+		own sprint input still wins -- this can only add sprint, never remove it.
+	]]
+	local pressWantsSprint = false
+	if pressStateProvider then
+		local pressState = pressStateProvider()
+		pressWantsSprint = pressState ~= nil and pressState.ShouldSprint == true
+	end
+	local desiredSprint = rawInput.SprintRequested or pressWantsSprint
+	if desiredSprint ~= sprintRequested then
+		setSprintRequested(desiredSprint)
 	end
 
 	local inputDirection = rawInput.MoveDirection
@@ -722,9 +969,28 @@ local function updateLocomotion(deltaTime: number)
 	if receptionPhase == "" then
 		rawDirection, rawMagnitude, receptionPhase, receptionWeight = getLooseBallAssist(rawDirection, rawMagnitude)
 	end
+	local pressAssisting = false
+	local keeperAssisting = false
+	--[[
+		A goalkeeper does not press, and does not chase loose balls the way an
+		outfielder does, so the keeper assist replaces those rather than stacking
+		on top of them.
+	]]
+	if goalkeeperStateProvider and goalkeeperStateProvider() then
+		rawDirection, rawMagnitude, keeperAssisting = getGoalkeeperAssist(rawDirection, rawMagnitude)
+	elseif receptionPhase == "" then
+		rawDirection, rawMagnitude, pressAssisting = getPressAssist(rawDirection, rawMagnitude)
+	end
 	updateReceptionFacing(deltaTime, receptionPhase)
 	updateActionFacing(deltaTime)
-	if localPlayer:GetAttribute("Beyond90MenuOpen") == true then
+	--[[
+		NOTHING MOVES BEFORE THE MATCH STARTS (§25).
+
+		The server holds every footballer at its assembled position as well, so
+		this is the responsive half of a restriction that is genuinely enforced
+		rather than the whole of it.
+	]]
+	if localPlayer:GetAttribute("Beyond90MenuOpen") == true or isMovementLocked() then
 		inputDirection = Vector3.zero
 		inputMagnitude = 0
 		rawDirection = Vector3.zero
@@ -741,6 +1007,10 @@ local function updateLocomotion(deltaTime: number)
 		end
 	elseif receptionPhase ~= "" then
 		movementMode = if receptionPhase == "LooseBall" then "LooseBallAssist" else "ReceptionAssist"
+	elseif keeperAssisting then
+		movementMode = "GoalkeeperAssist"
+	elseif pressAssisting then
+		movementMode = "PressAssist"
 	else
 		movementMode = "Normal"
 	end
@@ -799,7 +1069,12 @@ local function updateLocomotion(deltaTime: number)
 	locomotionState.ReceptionAssistPhase = receptionPhase
 	locomotionState.ReceptionAssistWeight = receptionWeight
 
-	humanoid.WalkSpeed = locomotionState.SmoothedSpeed
+	--[[
+		Injury slows the human footballer exactly as it slows AI (§72). The state
+		is server-authoritative and replicated on the character; the client only
+		reads it.
+	]]
+	humanoid.WalkSpeed = locomotionState.SmoothedSpeed * getInjurySpeedScale()
 
 	if shouldMove then
 		humanoid:Move(locomotionState.SmoothedDirection, false)

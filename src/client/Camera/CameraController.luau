@@ -16,6 +16,7 @@ local localPlayer = Players.LocalPlayer
 local initialized = false
 local activeMode = "Default"
 local toggleConnection: RBXScriptConnection? = nil
+local mouseLockConnection: RBXScriptConnection? = nil
 local characterAddedConnection: RBXScriptConnection? = nil
 local originalCameraType: Enum.CameraType? = nil
 local originalCameraSubject: Instance? = nil
@@ -155,6 +156,14 @@ function CameraController.Initialize()
 
 	initialized = true
 	toggleConnection = InputController.GetCameraToggleEvent().Event:Connect(togglePrimaryMode)
+	-- L only means anything in Pro Camera; Broadcast modes are untouched.
+	mouseLockConnection = InputController.GetCameraLockToggleEvent().Event:Connect(function()
+		if activeMode ~= "ThirdPerson" then
+			return
+		end
+		local locked = ThirdPersonCamera.ToggleMouseLock()
+		log(string.format("ThirdPerson mouse lock -> %s", if locked then "locked" else "free"))
+	end)
 	characterAddedConnection = localPlayer.CharacterAdded:Connect(function()
 		if activeMode == "Default" then
 			task.defer(restoreDefaultCamera)
@@ -164,11 +173,58 @@ function CameraController.Initialize()
 	FirstPersonCamera.Disable()
 	FirstPersonCamera.RestoreLocalCharacterVisibility()
 
-	if CameraConfig.DefaultMode == "Broadcast" then
+	--[[
+		Open in the camera the player chose in Settings (§64), falling back to
+		the project default when they have not chosen one.
+	]]
+	local chosen = localPlayer:GetAttribute(CameraConfig.DefaultCameraAttribute)
+	local valid = false
+	if typeof(chosen) == "string" then
+		for _, entry in CameraConfig.SelectableModes do
+			if entry.Id == chosen then
+				valid = true
+			end
+		end
+	end
+
+	if valid then
+		setMode(chosen)
+	elseif CameraConfig.DefaultMode == "Broadcast" then
 		setMode("Broadcast1")
 	else
 		restoreDefaultCamera()
 	end
+end
+
+-- Called by Settings. Stores the choice and, when a match is already running,
+-- switches immediately so the setting can be felt without re-entering.
+function CameraController.SetDefaultMode(mode: string)
+	local valid = false
+	for _, entry in CameraConfig.SelectableModes do
+		if entry.Id == mode then
+			valid = true
+		end
+	end
+	if not valid then
+		return false
+	end
+	localPlayer:SetAttribute(CameraConfig.DefaultCameraAttribute, mode)
+	if initialized then
+		setMode(mode)
+	end
+	return true
+end
+
+function CameraController.GetDefaultMode(): string
+	local chosen = localPlayer:GetAttribute(CameraConfig.DefaultCameraAttribute)
+	if typeof(chosen) == "string" then
+		for _, entry in CameraConfig.SelectableModes do
+			if entry.Id == chosen then
+				return chosen
+			end
+		end
+	end
+	return CameraConfig.FallbackSelectableMode
 end
 
 function CameraController.SetMode(mode: string)
@@ -220,6 +276,11 @@ function CameraController.Destroy()
 	if toggleConnection then
 		toggleConnection:Disconnect()
 		toggleConnection = nil
+	end
+
+	if mouseLockConnection then
+		mouseLockConnection:Disconnect()
+		mouseLockConnection = nil
 	end
 
 	if characterAddedConnection then
