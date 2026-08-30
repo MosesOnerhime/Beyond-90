@@ -110,7 +110,18 @@ local BallConfig = {
 
 	Control = {
 		AcquireDistance = 5.35,
-		HardControlDistance = 10.75,
+		--[[
+			RETENTION MUST OUTRUN THE LARGEST LEGAL TOUCH.
+
+			At 10.75 there were barely two studs between the maximum legal sprint
+			touch and losing the ball, so an ordinary sprint dribble was dropping
+			possession. Possession should be lost to a defender, a bad touch or a
+			genuine mistake -- never to the dribble the game itself asked for.
+
+			Now comfortably above SprintMaxForwardLead, so a legal touch always
+			has somewhere to land.
+		]]
+		HardControlDistance = 12.5,
 		ControlOriginRadius = 1.1,
 		MinimumControlSeparation = 0.14,
 		MaximumControllableBallSpeed = 36,
@@ -177,6 +188,49 @@ local BallConfig = {
 		ContactLateralTolerance = 2.4,
 		ContactMinimumForwardIntentDot = -0.15,
 		MaxContactVerticalDeltaSpeed = 5,
+
+		--[[
+			REAR LAG.
+
+			The control servo had a correction for the ball getting too far
+			AHEAD -- beyondPeakLead forces a Collect -- and nothing at all for it
+			falling BEHIND. The asymmetry is the defect: the two are not equally
+			harmless.
+
+			A ball a little too far in front is still a dribble; the next touch
+			collects it and the player has lost nothing. A ball that has slipped
+			BEHIND the carrier is a broken one. It cannot be struck (the shot
+			contact window has a deliberately small rear tolerance, as a real
+			foot does), it cannot be passed, it is exposed to any defender
+			arriving from behind, and the servo's ordinary carry gain drags it
+			back so gently that the player spends a second and a half running
+			with the ball trailing at their heels.
+
+			It happens constantly at exactly the moments it hurts most: pushing
+			off from a standstill, changing pace, and coming out of a turn --
+			every case where the player accelerates faster than the ball.
+
+			The correction is what a footballer does about it, which is to stop
+			running away from the ball and hook it back under control. The servo
+			is given sharply more authority the further behind the ball is, so
+			rear lag is recovered in a touch rather than tolerated for a run.
+
+			Deliberately NOT unbounded, and deliberately scaled by how bad the
+			lag is: a small amount of trail is normal football and gets a small
+			correction, while a genuinely lost ball gets a decisive one. A flat
+			high gain would weld the ball to the player's feet.
+		]]
+		RearLag = {
+			Enabled = true,
+			-- Forward lead at which the ball starts counting as trailing. Just
+			-- above zero: level with the player is already too far back.
+			Threshold = 0.45,
+			-- Lead at which the correction is at full strength.
+			FullLag = -2.6,
+			-- Multipliers on the carry servo at full lag.
+			PositionGainScale = 3.4,
+			VelocityDampingScale = 2.2,
+		},
 
 		StationaryLeadDistance = 2.15,
 		StationaryFollowGain = 5,
@@ -253,10 +307,34 @@ local BallConfig = {
 		RecontactPeakLeadFraction = 0.78,
 		LowPeakForwardLeadTarget = 3.0,
 		JogPeakForwardLeadTarget = 4.5,
-		SprintPeakForwardLeadTarget = 7.0,
+		--[[
+			THE SPRINT ENVELOPE HAD TO MOVE WITH THE SPRINT SPEED.
+
+			These values were tuned against SprintSpeed = 28. Raising it to 31
+			(+11%) left them untouched, and every sprint touch then imparted
+			about 11% more than the envelope was built for. The runtime evidence
+			is unambiguous:
+
+				peakForwardLead=9.03, 9.27, 10.50   (max is 8.6)
+				Lead sample server=12.15
+				Control released: hard distance exceeded
+
+			So the ball routinely overshot its own configured maximum, crossed
+			HardControlDistance, and possession was dropped mid-dribble. That is
+			also why shooting appeared broken: the strike is refused when the ball
+			is out of the contact window, and the ball had already run away --
+			`shot-contact-lost` and `controlled-ball-out-of-range` on every
+			attempt.
+
+			Pulled back so the sprint peak sits inside the maximum again, with the
+			pulse reduced rather than the target alone: the pulse is what causes
+			the overshoot, and lowering only the target would leave the ball
+			punching through it on every touch.
+		]]
+		SprintPeakForwardLeadTarget = 6.4,
 		LowMaxForwardLead = 4.1,
 		JogMaxForwardLead = 5.8,
-		SprintMaxForwardLead = 8.6,
+		SprintMaxForwardLead = 8.0,
 		TouchPulseDuration = 0.16,
 		TouchCoastDuration = 0.48,
 		TouchMaxSeparationWait = 0.58,
@@ -265,7 +343,7 @@ local BallConfig = {
 		TouchAirborneWindow = 0.16,
 		LowTouchLeadPulse = 0.75,
 		JogTouchLeadPulse = 2.35,
-		SprintTouchLeadPulse = 4.1,
+		SprintTouchLeadPulse = 3.4,
 		LowTouchSpeedPulse = 2.5,
 		JogTouchSpeedPulse = 7.2,
 		SprintTouchSpeedPulse = 21,

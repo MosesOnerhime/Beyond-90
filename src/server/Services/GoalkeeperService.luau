@@ -8,7 +8,9 @@ local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local GoalkeeperConfig = require(Shared.Config.GoalkeeperConfig)
 local BallControlMath = require(Shared.Football.BallControlMath)
+local MatchRulesConfig = require(Shared.Config.MatchRulesConfig)
 local GoalkeeperPositioning = require(Shared.Football.GoalkeeperPositioning)
+local PitchGeometry = require(Shared.Football.PitchGeometry)
 local TrajectoryPredictor = require(Shared.Football.TrajectoryPredictor)
 
 local AIAnimationService = require(script.Parent.AIAnimationService)
@@ -35,6 +37,7 @@ local heldBy: any = nil
 local heldSince = 0
 local lastSaveAtById: { [number]: number } = {}
 local lastLogAt = 0
+local lastHandlingFoulAt = 0
 
 local function log(message: string)
 	if GoalkeeperConfig.Debug.Enabled then
@@ -119,10 +122,76 @@ function GoalkeeperService.Unregister(actorOrId)
 	lastSaveAtById[id] = nil
 end
 
+--[[
+	Is this keeper standing where their hands are legal?
+
+	The penalty area at their OWN end, which is the -1 longitudinal sign in the
+	team's own frame -- the same test the referee uses to decide whether a foul
+	is a penalty, so "inside the area" means one thing in this codebase rather
+	than two subtly different things.
+
+	Returns true when the geometry is unavailable. A keeper must not be penalised
+	because the pitch has not published its frame yet; the failure mode of a
+	missing pitch should be the old, permissive behaviour.
+]]
+function GoalkeeperService.IsInsideOwnPenaltyArea(actor): boolean
+	if not actor or not actor.RootPart then
+		return true
+	end
+	local frame = RestartService.GetTeamFrame(actor.TeamId)
+	if not frame then
+		return true
+	end
+	local handling = GoalkeeperConfig.Handling
+	local margin = if handling then handling.AreaMargin else 0
+	return PitchGeometry.IsInsidePenaltyArea(
+		frame,
+		actor.RootPart.Position,
+		-1,
+		MatchRulesConfig.Pitch.PenaltyAreaDepth + margin,
+		MatchRulesConfig.Pitch.PenaltyAreaHalfWidth + margin
+	)
+end
+
+--[[
+	The keeper tried to handle the ball outside their own area.
+
+	Refuse it AND report it. Refusing alone would be a silent, inexplicable
+	no-op; reporting alone would leave them holding a ball they are not allowed
+	to touch. Cooldowned so a keeper mashing the catch button outside the box
+	produces one free kick rather than a stream of them.
+]]
+local function penaliseHandling(actor): boolean
+	local handling = GoalkeeperConfig.Handling
+	if not handling or handling.Enabled ~= true then
+		return false
+	end
+	local now = os.clock()
+	if now - lastHandlingFoulAt < handling.FoulCooldown then
+		return false
+	end
+	lastHandlingFoulAt = now
+	local position = if ball then ball.Position else actor.RootPart.Position
+	log(string.format("%s handled outside the area", actor.DisplayName))
+	return MatchRulesService.ReportGoalkeeperHandling(actor, position) == true
+end
+
 -- Secure goalkeeper possession. Deliberately NOT foot-dribble possession: the
 -- football is constrained to the keeper rather than pushed/coasted/collected.
 function GoalkeeperService.Hold(actor): boolean
 	if not ball or heldBy or not actor or not actor.RootPart then
+		return false
+	end
+	--[[
+		HANDS ARE ONLY LEGAL INSIDE THE AREA.
+
+		This is the single choke point for goalkeeper handling -- the AI's claim,
+		a human keeper's assisted gather and every catch off a save all end up
+		here -- so the law only needs stating once, and no future path can
+		accidentally route around it.
+	]]
+	if not GoalkeeperService.IsInsideOwnPenaltyArea(actor) then
+		penaliseHandling(actor)
 		return false
 	end
 	if BallControlService.GetActiveController() or BallControlService.GetActiveAIController() then
@@ -461,8 +530,16 @@ function GoalkeeperService.RequestSave(actor, interceptPoint: Vector3): string
 		* (1 - reachAlpha * 0.5)
 	-- How hard a shot this keeper can hold, rather than only push away (§53).
 	local catchSpeedLimit = bySkill(skill, config.CatchMaximumBallSpeed, config.CatchMaximumBallSpeedAtFullSkill)
+	--[[
+		Outside the area the keeper may still get in the way -- that is just a
+		block, and perfectly legal -- but may not CATCH. Making that an explicit
+		condition here means a keeper who has come out beyond their box parries
+		rather than committing a handling offence, which is what a real keeper
+		does and what the player would expect.
+	]]
 	local canCatch = ballSpeed <= catchSpeedLimit
 		and ball.Position.Y <= actor.RootPart.Position.Y + config.CatchMaximumHeight
+		and GoalkeeperService.IsInsideOwnPenaltyArea(actor)
 		and math.random() <= catchChance
 
 	if canCatch and GoalkeeperService.Hold(actor) then
@@ -741,9 +818,18 @@ local function updateHumanKeeper(actor, deltaTime: number, goal)
 	then
 		local region = GoalkeeperConfig.Region
 		local ballToGoal = BallControlMath.GetHorizontal(ballPosition - goal.MouthCenter).Magnitude
+		--[[
+			The area test is repeated here rather than left to Hold, because this
+			claim is AUTOMATIC. A keeper who has pushed up outside their box
+			should simply not gather the ball; being awarded a free kick against
+			themselves for something they never asked for would be indefensible.
+			A deliberate handle -- a dive or a catch the player pressed for --
+			still reaches Hold and is still penalised.
+		]]
 		if ballToGoal <= region.ClaimRadius
 			and ballPosition.Y <= goal.BottomY + region.ClaimMaximumBallHeight
 			and reach <= human.AssistedClaimRadius
+			and GoalkeeperService.IsInsideOwnPenaltyArea(actor)
 		then
 			GoalkeeperService.Hold(actor)
 		end
@@ -1022,8 +1108,11 @@ function GoalkeeperService.UpdateKeeper(actor, deltaTime: number)
 		local region = GoalkeeperConfig.Region
 		local keeperToBall = BallControlMath.GetHorizontal(ballPosition - actor.RootPart.Position).Magnitude
 		local ballToGoal = BallControlMath.GetHorizontal(ballPosition - goal.MouthCenter).Magnitude
+		-- Same reasoning as the human assisted claim: an automatic gather never
+		-- commits a handling offence.
 		if ballToGoal <= region.ClaimRadius
 			and ballPosition.Y <= goal.BottomY + region.ClaimMaximumBallHeight
+			and GoalkeeperService.IsInsideOwnPenaltyArea(actor)
 		then
 			actor.State = "GoalkeeperClaim"
 			targetSpeed = positioning.RushSpeed

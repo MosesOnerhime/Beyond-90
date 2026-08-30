@@ -11,6 +11,8 @@ local MatchRulesConfig = require(ReplicatedStorage.Shared.Config.MatchRulesConfi
 local GameConfig = require(Shared.Config.GameConfig)
 local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
 
+local CameraShake = require(script.Parent.CameraShake)
+
 local BroadcastCamera = {}
 
 local localPlayer = Players.LocalPlayer
@@ -743,7 +745,9 @@ local function updateCamera(deltaTime: number)
 	local forward = BallControlMath.SafeUnit(smoothedForward :: Vector3, desiredForward)
 
 	camera.CameraType = Enum.CameraType.Scriptable
+	-- Presentation only, applied to the finished frame; see CameraShake.
 	camera.CFrame = CFrame.lookAt(smoothedPosition :: Vector3, (smoothedPosition :: Vector3) + forward)
+		* CameraShake.Step(deltaTime)
 	camera.Focus = CFrame.new(smoothedFocus :: Vector3)
 	camera.FieldOfView = smoothedFOV
 

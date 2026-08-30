@@ -30,10 +30,17 @@ local PositionConfig = require(Shared.Config.PositionConfig)
 local Theme = require(script.Parent.Theme)
 local ReactUI = require(script.Parent.Components.ReactUI)
 
+local AudioController = require(script.Parent.Parent.Controllers.AudioController)
 local CameraController = require(script.Parent.Parent.Camera.CameraController)
+local GameModeConfig = require(ReplicatedStorage.Shared.Config.GameModeConfig)
 local PlayerConfig = require(ReplicatedStorage.Shared.Config.PlayerConfig)
 
 local UIController = {}
+
+-- React's own container inside PlayerGui: a ScreenGui, so it survives respawn.
+-- See UIController.Initialize for why the menu must not be mounted onto
+-- PlayerGui itself, and why this container cannot be a Folder.
+local REACT_CONTAINER_NAME = "Beyond90MenuRoot"
 local localPlayer = Players.LocalPlayer
 local root = nil
 local remoteConnection: RBXScriptConnection? = nil
@@ -127,6 +134,7 @@ local function App(props)
 		DEFAULT CAMERA (§21, §64). Session-scoped: seeded from CameraController,
 		written straight back to it, no persistence layer invented for it.
 	]]
+	local musicVolume, setMusicVolume = React.useState(AudioController.GetMusicVolume())
 	local defaultCamera, setDefaultCamera = React.useState(CameraController.GetDefaultMode())
 
 	--[[
@@ -291,8 +299,21 @@ local function App(props)
 		screenElement = React.createElement(PlayScreen, withPageProps({
 			SelectMode = function(modeId)
 				click()
-				setPendingMode(modeId or "Quick3v3")
-				setScreen("TeamSelect")
+				local mode = modeId or "Quick3v3"
+				setPendingMode(mode)
+				--[[
+					PLAY -> TRAINING opens the TRAINING MENU (§16).
+
+					It used to drop straight into team selection, which is both the
+					wrong destination and a page free practice has no use for. Every
+					other card still goes to team selection, because those modes do
+					pick sides.
+				]]
+				if mode == "TrainingFree" then
+					setScreen("Training")
+				else
+					setScreen("TeamSelect")
+				end
 			end,
 			Unavailable = function()
 				click()
@@ -302,11 +323,24 @@ local function App(props)
 		}))
 	elseif screen == "Training" then
 		screenElement = React.createElement(TrainingScreen, withPageProps({
-			-- Unchanged entry path: team selection, then position, then the match.
+			--[[
+				FREE PRACTICE STARTS IMMEDIATELY (§18).
+
+				No team selection and no position selection: the mode does not use
+				either, and making a player answer two questions they have no
+				stake in before they can touch a ball is exactly the friction this
+				milestone is removing. Modes that DO pick sides still route
+				through team selection.
+			]]
 			OpenTeamSelection = function(modeId)
 				click()
-				setPendingMode(modeId or "TrainingFree")
-				setScreen("TeamSelect")
+				local mode = modeId or "TrainingFree"
+				setPendingMode(mode)
+				if GameModeConfig.Uses(mode, "RequiresTeamSelection") then
+					setScreen("TeamSelect")
+				else
+					callbacks.EnterMode(mode, "Home")
+				end
 			end,
 			ComingSoon = function()
 				click()
@@ -381,6 +415,13 @@ local function App(props)
 				setSelectedTrack(index)
 				callbacks.SetMenuTrack(index)
 			end,
+			MusicVolume = musicVolume,
+			SetMusicVolume = function(value)
+				-- Applied live, then mirrored into state so the label and the
+				-- knob follow the drag rather than lagging a frame behind it.
+				AudioController.SetMusicVolume(value)
+				setMusicVolume(AudioController.GetMusicVolume())
+			end,
 			MusicEnabled = musicEnabled,
 			SetMusicEnabled = function(enabled)
 				click()
@@ -402,55 +443,63 @@ local function App(props)
 		screenElement = React.createElement(LoadingScreen, loading)
 	end
 
-	return React.createElement("ScreenGui", {
-		Name = "Beyond90UI",
-		-- HUD geometry explicitly reserves the top-left CoreGui cluster while keeping
-		-- menu and gameplay presentation edge-to-edge.
-		IgnoreGuiInset = true,
-		ResetOnSpawn = false,
-		DisplayOrder = 200,
-		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	--[[
+		The ScreenGui is NOT rendered here -- it is the container React was handed.
+
+		It used to be rendered as this component's root, inside a Folder, and that
+		is why the menu and the HUD disappeared for the rest of the session the
+		moment a player entered a mode for the second time. See
+		UIController.Initialize for the full account; the short version is that
+		`ResetOnSpawn` is a LayerCollector property, a Folder cannot carry it, and
+		PlayerGui therefore reaped the Folder -- and this ScreenGui with it -- on
+		respawn no matter what this element asked for.
+
+		Rendering the Frame directly into a ScreenGui container puts the opt-out on
+		an instance that can actually hold it, and removes a redundant nested
+		LayerCollector rather than adding one. Layering is unchanged: DisplayOrder
+		and IgnoreGuiInset simply moved one level up, onto the instance PlayerGui
+		is looking at.
+	]]
+	return React.createElement("Frame", {
+		ref = rootFrameRef,
+		Name = "Root",
+		Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = if screen == "Gameplay" then 1 else 0, BorderSizePixel = 0,
 	}, {
-		Root = React.createElement("Frame", {
-			ref = rootFrameRef,
-			Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0),
-			BackgroundTransparency = if screen == "Gameplay" then 1 else 0, BorderSizePixel = 0,
+		Screen = screenElement,
+		Toast = toast and React.createElement("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.055),
+			Size = UDim2.fromScale(0.23, 0.082), BackgroundColor3 = Theme.Panel,
+			BackgroundTransparency = 0.02, BorderSizePixel = 0, ZIndex = 300,
 		}, {
-			Screen = screenElement,
-			Toast = toast and React.createElement("Frame", {
-				AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.055),
-				Size = UDim2.fromScale(0.23, 0.082), BackgroundColor3 = Theme.Panel,
-				BackgroundTransparency = 0.02, BorderSizePixel = 0, ZIndex = 300,
-			}, {
-				Corner = ReactUI.Corner(6),
-				Stroke = ReactUI.Stroke(Theme.StrokeBright, 1.25, 0.12),
-				Accent = React.createElement("Frame", { Size = UDim2.fromScale(0.018, 1), BackgroundColor3 = Theme.AccentCyan, BorderSizePixel = 0, ZIndex = 301 }, {
-					Gradient = ReactUI.Gradient(Theme.AccentCyan, Theme.AccentViolet, 90),
-				}),
-				Title = React.createElement("TextLabel", { Position = UDim2.fromScale(0.08, 0.18), Size = UDim2.fromScale(0.84, 0.28), BackgroundTransparency = 1, Font = Theme.Fonts.Navigation, Text = "COMING SOON", TextColor3 = Theme.Text, TextSize = 16, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 301 }),
-				Body = React.createElement("TextLabel", { Position = UDim2.fromScale(0.08, 0.5), Size = UDim2.fromScale(0.84, 0.22), BackgroundTransparency = 1, Font = Theme.Fonts.Caption, Text = "This area is not available in the current milestone.", TextColor3 = Theme.MutedText, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 301 }),
+			Corner = ReactUI.Corner(6),
+			Stroke = ReactUI.Stroke(Theme.StrokeBright, 1.25, 0.12),
+			Accent = React.createElement("Frame", { Size = UDim2.fromScale(0.018, 1), BackgroundColor3 = Theme.AccentCyan, BorderSizePixel = 0, ZIndex = 301 }, {
+				Gradient = ReactUI.Gradient(Theme.AccentCyan, Theme.AccentViolet, 90),
+			}),
+			Title = React.createElement("TextLabel", { Position = UDim2.fromScale(0.08, 0.18), Size = UDim2.fromScale(0.84, 0.28), BackgroundTransparency = 1, Font = Theme.Fonts.Navigation, Text = "COMING SOON", TextColor3 = Theme.Text, TextSize = 16, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 301 }),
+			Body = React.createElement("TextLabel", { Position = UDim2.fromScale(0.08, 0.5), Size = UDim2.fromScale(0.84, 0.22), BackgroundTransparency = 1, Font = Theme.Fonts.Caption, Text = "This area is not available in the current milestone.", TextColor3 = Theme.MutedText, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 301 }),
+		}) or nil,
+		Goal = React.createElement(GoalNotification, { Visible = goalVisible }),
+		--[[
+			The control-scheme prompt sits above every menu screen, and only
+			while the player has not answered it. It is not shown during
+			gameplay: interrupting a live match to ask this would be worse
+			than any default.
+		]]
+		ControlSchemePrompt = (needsSchemeChoice and screen ~= "Gameplay")
+			and React.createElement(ControlSchemeScreen, {
+				Selected = controlScheme,
+				Select = function(next)
+					click()
+					setControlScheme(next, false)
+				end,
+				Confirm = function()
+					click()
+					setControlScheme(controlScheme, true)
+					setNeedsSchemeChoice(false)
+				end,
 			}) or nil,
-			Goal = React.createElement(GoalNotification, { Visible = goalVisible }),
-			--[[
-				The control-scheme prompt sits above every menu screen, and only
-				while the player has not answered it. It is not shown during
-				gameplay: interrupting a live match to ask this would be worse
-				than any default.
-			]]
-			ControlSchemePrompt = (needsSchemeChoice and screen ~= "Gameplay")
-				and React.createElement(ControlSchemeScreen, {
-					Selected = controlScheme,
-					Select = function(next)
-						click()
-						setControlScheme(next, false)
-					end,
-					Confirm = function()
-						click()
-						setControlScheme(controlScheme, true)
-						setNeedsSchemeChoice(false)
-					end,
-				}) or nil,
-		}),
 	})
 end
 
@@ -459,7 +508,80 @@ function UIController.Initialize(callbacks)
 	localPlayer:SetAttribute("Beyond90MenuSurfaceMounted", false)
 	localPlayer:SetAttribute("Beyond90MenuLayoutReady", false)
 	local playerGui = localPlayer:WaitForChild("PlayerGui")
-	root = ReactRoblox.createRoot(playerGui)
+
+	--[[
+		REACT GETS ITS OWN CONTAINER. IT DOES NOT GET PlayerGui.
+
+		`createRoot` takes ownership of whatever it is given and clears it, and
+		it was being given PlayerGui itself -- so mounting the menu destroyed
+		every other GUI the client had, including the startup ident's surface.
+
+		That is the answer to a bug that survived three attempts to fix it from
+		the other end. The symptom was the branding sequence going blank
+		part-way through:
+
+			Drixil stage  coverSize=1170.40002, 550.400024
+			Beyond 90     coverSize=0, 0
+
+		and a re-attach reporting "The Parent property of Beyond90StartupLoading
+		is locked, current parent: NULL". It looked like Roblox reclaiming a
+		ReplicatedFirst loading screen, because that is a real behaviour and it
+		fits the symptom. It was not: it was this line, clearing PlayerGui the
+		moment the menu mounted, roughly four seconds into a seven-second ident.
+		A ReplicatedFirst instance that has been un-parented is locked rather
+		than destroyed, which is why the evidence pointed at Roblox.
+
+		Giving React a container of its own scopes it to its own subtree, and
+		every other client surface now survives it.
+
+		THE CONTAINER IS A ScreenGui, NOT A Folder, AND THAT IS NOT COSMETIC.
+
+		It was a Folder, and that is the whole of the "no loading screen and no
+		HUD after re-entering a mode" bug. `StarterGui.ResetPlayerGuiOnSpawn` is
+		true, so on respawn PlayerGui reaps its children -- sparing only
+		LayerCollectors whose `ResetOnSpawn` is false. `ResetOnSpawn` is defined
+		on LayerCollector. A Folder has no such property, so it cannot opt out,
+		and PlayerGui destroyed it together with the entire menu tree inside it.
+		The `ResetOnSpawn = false` the menu ScreenGui asked for was never even
+		consulted, because PlayerGui was not looking at the menu ScreenGui -- it
+		was looking at the Folder wrapped around it.
+
+		Measured, sampling every frame across a second entry:
+
+			10.76s  ModeLoading  st=ModeLoading  char=false
+			10.86s  GUI-MISSING  st=ModeLoading  char=true
+			16.29s  GUI-MISSING  st=Gameplay     char=true
+
+		-- the surface disappears on the exact frame the character arrives, and
+		never returns, so ShowModeLoading and ShowGameplay were setting state on a
+		tree with nowhere to draw. Nothing was wrong with either of them.
+
+		It survived the FIRST entry because that was the character's first load
+		rather than a respawn, which is exactly why the report was "only after I
+		have already played once and come back".
+
+		So the container carries the opt-out, and the layering properties with it:
+		React renders the root Frame straight into this ScreenGui instead of
+		rendering a second one inside a Folder. One LayerCollector, held by the
+		instance PlayerGui actually inspects.
+	]]
+	local container = playerGui:FindFirstChild(REACT_CONTAINER_NAME)
+	if not container or not container:IsA("ScreenGui") then
+		if container then
+			container:Destroy()
+		end
+		container = Instance.new("ScreenGui")
+		container.Name = REACT_CONTAINER_NAME
+		-- Survive respawn. This is the property the Folder could not hold.
+		container.ResetOnSpawn = false
+		-- HUD geometry explicitly reserves the top-left CoreGui cluster while
+		-- keeping menu and gameplay presentation edge-to-edge.
+		container.IgnoreGuiInset = true
+		container.DisplayOrder = 200
+		container.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+		container.Parent = playerGui
+	end
+	root = ReactRoblox.createRoot(container)
 	root:render(React.createElement(App, { Callbacks = callbacks }))
 	task.spawn(preloadMenuAssets)
 	task.spawn(function()

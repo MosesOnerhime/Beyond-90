@@ -141,13 +141,18 @@ end
 return function(props)
 	local mobile = props.Mobile == true
 	local musicOn = props.MusicEnabled ~= false
+	local musicVolume = math.clamp(
+		if typeof(props.MusicVolume) == "number" then props.MusicVolume else AudioConfig.Music.DefaultVolume,
+		AudioConfig.Music.Minimum,
+		AudioConfig.Music.Maximum
+	)
 
 	local categories = {
 		{ Title = "CONTROLS", Caption = "Input and key bindings" },
 		{ Title = "AUDIO", Caption = "Sound and volume" },
 		{ Title = "CAMERA", Caption = "Camera and view settings" },
 		{ Title = "GAMEPLAY", Caption = "Match and game options" },
-		{ Title = "INTERFACE", Caption = "UI and HUD preferences" },
+		{ Title = "FOOTBALLER", Caption = "Who you play as" },
 	}
 	local selectedCategory, setSelectedCategory = React.useState(1)
 
@@ -439,8 +444,48 @@ return function(props)
 						end,
 					}),
 				}),
-				TrackCaption = MenuKit.Text({
+				--[[
+					MUSIC VOLUME.
+
+					The panel heading has promised "volume levels" all along while
+					offering only an on/off switch, so a player who found the music
+					too loud had exactly one option: silence. The percentage is
+					shown beside the label because a bare track gives no way to
+					tell 30% from 35% at a glance, and this is a value people set
+					once and want to be able to return to.
+
+					Dimmed and non-interactive when the music is off, rather than
+					hidden -- a control that vanishes is harder to find again than
+					one that is visibly unavailable.
+				]]
+				VolumeRow = React.createElement("Frame", {
 					Position = UDim2.fromScale(0.05, 0.44),
+					Size = UDim2.fromScale(0.9, 0.13),
+					BackgroundTransparency = 1,
+					ZIndex = 5,
+				}, {
+					Label = MenuKit.Text({
+						Size = UDim2.fromScale(0.55, 0.5),
+						Text = string.format("Music Volume    %d%%", math.floor(musicVolume * 100 + 0.5)),
+						TextColor3 = if musicOn then Theme.Text else Theme.MutedText,
+						TextSize = MenuKit.Size(mobile, 12),
+						ZIndex = 6,
+					}),
+					Slider = React.createElement(MenuKit.Slider, {
+						Mobile = mobile,
+						AnchorPoint = Vector2.new(1, 0.5),
+						Position = UDim2.fromScale(1, 0.5),
+						Size = UDim2.fromScale(0.42, 1),
+						Value = musicVolume,
+						Step = AudioConfig.Music.Step,
+						ZIndex = 6,
+						OnChanged = if musicOn and props.SetMusicVolume
+							then props.SetMusicVolume
+							else nil,
+					}),
+				}),
+				TrackCaption = MenuKit.Text({
+					Position = UDim2.fromScale(0.05, 0.585),
 					Size = UDim2.fromScale(0.9, 0.09),
 					Font = Theme.Fonts.Caption,
 					Text = "MENU TRACK",
@@ -449,8 +494,8 @@ return function(props)
 					ZIndex = 5,
 				}),
 				Tracks = React.createElement("Frame", {
-					Position = UDim2.fromScale(0.05, 0.54),
-					Size = UDim2.fromScale(0.9, 0.4),
+					Position = UDim2.fromScale(0.05, 0.675),
+					Size = UDim2.fromScale(0.9, 0.29),
 					BackgroundTransparency = 1,
 					ZIndex = 5,
 				}, trackRows),
@@ -577,8 +622,8 @@ return function(props)
 			}, {
 				Heading = React.createElement(MenuKit.PanelHeading, {
 					Mobile = mobile,
-					Title = "INTERFACE",
-					Caption = "UI and HUD preferences.",
+					Title = "FOOTBALLER",
+					Caption = "How you look on the pitch and in the menus.",
 					Position = UDim2.fromScale(0.05, 0.06),
 					Size = UDim2.fromScale(0.9, 0.14),
 					ZIndex = 5,
@@ -587,7 +632,7 @@ return function(props)
 					Position = UDim2.fromScale(0.05, 0.26),
 					Size = UDim2.fromScale(0.9, 0.07),
 					Font = Theme.Fonts.Caption,
-					Text = "YOUR FOOTBALLER",
+					Text = "PLAY AS",
 					TextColor3 = Theme.MutedText,
 					TextSize = MenuKit.Size(mobile, 11),
 					TextXAlignment = Enum.TextXAlignment.Left,
@@ -603,7 +648,17 @@ return function(props)
 					Position = UDim2.fromScale(0.05, 0.48),
 					Size = UDim2.fromScale(0.9, 0.16),
 					Font = Theme.Fonts.Caption,
-					Text = "Every footballer is built to the same height, so nobody gains reach or stride from their avatar. Applies from your next match.",
+					--[[
+						The wording now says what the setting actually does.
+
+						It read as an interface preference -- something about menus
+						-- when it is the single choice of who you are on the
+						pitch. It governs the footballer you play matches as, the
+						one shown in the main menu, and every appearance of you in
+						the game. Saying so is the difference between a player
+						finding this setting and never looking for it.
+					]]
+					Text = "This is the footballer you play as everywhere -- in matches, in training and in the menu. Every footballer is built to the same height, so nobody gains reach or stride from their avatar. Takes effect from your next match.",
 					TextColor3 = Theme.MutedText,
 					TextSize = MenuKit.Size(mobile, 11),
 					TextWrapped = true,

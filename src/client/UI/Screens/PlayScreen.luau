@@ -237,23 +237,34 @@ local function PlayScreen(props)
 		`Quick3v3` and `TrainingFree` are the two mode ids GameModeService
 		actually accepts.
 	]]
+	--[[
+		TRAINING FIRST.
+
+		It is the mode that is finished, the one a new player should meet first,
+		and the one an existing player returns to most while the match modes are
+		still being built. Ordering a list by how impressive a mode sounds rather
+		than by how often it is wanted is a menu serving itself.
+
+		It also carries the FEATURED treatment for the same reason -- the largest
+		card on the page should be the thing the page most wants you to do.
+	]]
 	local matches = {
-		{
-			Title = "QUICK 3V3",
-			Detail = "Human-first match with AI filling any empty slots.",
-			Format = "3v3",
-			Icon = Assets.Navigation.Play,
-			Available = true,
-			Featured = true,
-			ModeId = "Quick3v3",
-		},
 		{
 			Title = "TRAINING",
 			Detail = "Free practice on the pitch. Drills, shooting and control.",
 			Format = "SOLO",
 			Icon = Assets.Navigation.Training,
 			Available = true,
+			Featured = true,
 			ModeId = "TrainingFree",
+		},
+		{
+			Title = "QUICK 3V3",
+			Detail = "Human-first match with AI filling any empty slots.",
+			Format = "3v3",
+			Icon = Assets.Navigation.Play,
+			Available = true,
+			ModeId = "Quick3v3",
 		},
 		{
 			Title = "RANKED MATCH",

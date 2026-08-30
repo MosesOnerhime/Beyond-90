@@ -3,9 +3,9 @@
 	Fouls.
 
 	Adapted from GameplayFootball's `Referee::TripNotice`. The source scores a
-	sliding tackle by summing three independent terms; Beyond 90 has no slide
-	tackle yet (§84 excludes it), so the same three terms are applied to the
-	standing challenge that does exist:
+	sliding tackle by summing three independent terms, and Beyond 90 now applies
+	the same three terms to both challenges it has -- the standing tackle and the
+	slide:
 
 		mistiming    the challenge did not win the ball
 		contact      it reached the opponent anyway
@@ -15,6 +15,12 @@
 	A foul is never random. Every term comes from the same challenge geometry the
 	tackle evaluator already measured, so a clean front tackle can never produce
 	one and a mistimed lunge through the back of an opponent always does.
+
+	A SLIDE IS NOT JUDGED BY DIFFERENT RULES. DefendingService scales the severity
+	this returns rather than passing different geometry, so going to ground is
+	measured on exactly the same mistiming, contact and angle as staying on your
+	feet, and simply carries more consequence for the same mistake -- which is
+	what the laws of the game actually say about it.
 
 	Pure module.
 ]]

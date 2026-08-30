@@ -27,6 +27,7 @@ local GameConfig = require(Shared.Config.GameConfig)
 local OffsideEvaluator = require(Shared.Football.OffsideEvaluator)
 local PitchGeometry = require(Shared.Football.PitchGeometry)
 local PositionConfig = require(Shared.Config.PositionConfig)
+local GameModeConfig = require(Shared.Config.GameModeConfig)
 local RefereeConfig = require(Shared.Config.RefereeConfig)
 local CollisionGroupConfig = require(Shared.Config.CollisionGroupConfig)
 
@@ -709,7 +710,23 @@ local function step(deltaTime: number)
 		front of the player instead of already being there. The officials are now
 		part of field assembly and are torn down only when the match itself ends.
 	]]
+	--[[
+		A mode that does not use officials does not get officials.
+
+		This used to spawn a referee and two assistants for any match state that
+		was not Idle, with no notion of which mode was running -- which is why a
+		free-practice session had three officials standing on it.
+	]]
 	local matchState = MatchService.GetState()
+	if not GameModeConfig.Uses(MatchService.GetMode(), "UsesOfficials") then
+		if model then
+			destroyCharacter()
+		end
+		if #assistants > 0 then
+			destroyAssistants()
+		end
+		return
+	end
 	if matchState == "Idle" then
 		if model then
 			destroyCharacter()

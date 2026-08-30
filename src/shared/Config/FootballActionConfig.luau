@@ -468,10 +468,68 @@ local FootballActionConfig = {
 		-- visibly swing through empty space.
 		Contact = {
 			Enabled = true,
-			-- The football is reachable for a strike inside this radius.
-			ContactRadius = 4.6,
-			-- Forward window relative to the player's control direction.
-			MaximumForwardLead = 4.4,
+			--[[
+				THE STRIKE WINDOW MUST TRACK THE DRIBBLE, OR SHOTS WHIFF.
+
+				This was the single largest gameplay defect in the build: shooting
+				while running produced a swing at nothing.
+
+				The cause was two systems disagreeing about one number. The strike
+				window was authored against JOGGING touches -- BallConfig's
+				JogPeakForwardLeadTarget is 4.5, and the forward window here was
+				4.4, which matches almost exactly. Sprint carry was later widened
+				so the ball is pushed 7.0 studs ahead at pace and may reach 8.6.
+				Nothing here changed. So at sprint the ball spent most of every
+				touch cycle 7 studs out, outside both a 4.6-stud contact radius
+				and a 4.4-stud forward window; the strike could only land in the
+				brief part of the cycle where the ball came back, and otherwise
+				waited until it expired. The result on screen is a player running
+				through the ball without kicking it.
+
+				Two changes fix it properly rather than by inflating a radius:
+
+				1. THE WINDOW IS DERIVED FROM SPEED, spanning the same range the
+				   dribble uses. At rest the window is tight, because a stationary
+				   player genuinely does have the ball at their feet and a
+				   generous radius would let them strike a ball they are not
+				   near. At sprint it opens to cover the sprint carry, because
+				   the ball being out in front IS what sprint dribbling is.
+
+				2. THE STRIKE IS JUDGED WHERE THE BALL WILL BE, not where it is.
+				   A footballer running onto a ball swings at the point their
+				   foot will meet it. When player and ball are travelling forward
+				   at similar speed the gap between them is stable, and it is
+				   only the instantaneous snapshot that makes it look unreachable.
+				   Evaluating relative motion a fraction of a second ahead is what
+				   makes a running strike land.
+
+				Both are bounded and neither lets a player strike a ball that is
+				genuinely someone else's: possession is still required, and the
+				lateral and rear windows are unchanged.
+			]]
+			-- The speed at which the sprint end of the window applies. Matches
+			-- PlayerConfig.Movement.SprintSpeed; below it the window interpolates.
+			SprintReferenceSpeed = 31,
+			-- Reachable radius, at rest and at full sprint. The sprint value
+			-- covers BallConfig SprintMaxForwardLead (8.6) with a small margin,
+			-- because a ball at the far end of a legal sprint touch is still the
+			-- player's ball and must still be strikeable.
+			ContactRadiusAtRest = 4.6,
+			ContactRadiusSprint = 9.4,
+			-- Forward window relative to the player's control direction. The
+			-- sprint value sits just above BallConfig SprintMaxForwardLead.
+			MaximumForwardLeadAtRest = 4.4,
+			MaximumForwardLeadSprint = 9,
+			--[[
+				How far ahead the strike is judged.
+
+				One touch-cycle poll is 1/30s and a strike animation has not been
+				authored yet, so this is the honest latency between deciding to
+				shoot and the foot arriving. Small on purpose: it is enough to
+				close the gap on a ball the player is running onto, and far too
+				short to let them strike a ball that is genuinely running away.
+			]]
+			StrikeLookaheadSeconds = 0.09,
 			MaximumBehindLead = 1.6,
 			MaximumLateralOffset = 2.9,
 			MaximumHeight = 1.9,
@@ -486,8 +544,16 @@ local FootballActionConfig = {
 			PollInterval = 1 / 30,
 			-- Bounded orientation assistance toward the contact point while waiting.
 			FacingAssistDegreesPerSecond = 320,
-			-- Give up if the ball leaves any recoverable range.
-			AbandonDistance = 11,
+			--[[
+				Give up only once the ball is genuinely unrecoverable.
+
+				This has to sit above BallConfig's HardControlDistance: while the
+				player still HAS the ball, a pending shot must wait rather than be
+				thrown away. At 13 against a retention distance of 12.5 the margin
+				was half a stud, and the logs are full of `shot-contact-lost` on
+				balls the player had not actually lost.
+			]]
+			AbandonDistance = 15,
 		},
 	},
 
@@ -515,5 +581,43 @@ local FootballActionConfig = {
 		ReceiverMarkerHeight = 4.2,
 	},
 }
+
+--[[
+	THE STRIKE WINDOW, IN ONE PLACE.
+
+	The window opens with the footballer's speed -- see the long note on
+	Shoot.Contact for why -- and BOTH the client's local check and the server's
+	authoritative one have to use the identical numbers. When they were computed
+	separately they drifted the moment the keys changed, and the client half
+	crashed outright reading a field that no longer existed:
+
+		FootballActionController:190: attempt to compare nil < number
+
+	which took shooting with it entirely, standing still included. One function
+	both sides call makes that class of mistake impossible rather than merely
+	unlikely.
+
+	Returns the reachable radius, the forward window and the lateral window for a
+	footballer moving at `speed`.
+]]
+function FootballActionConfig.GetShotContactWindow(speed: number): (number, number, number)
+	local contact = FootballActionConfig.Shoot.Contact
+	local alpha = math.clamp(
+		(speed or 0) / math.max(contact.SprintReferenceSpeed, 1),
+		0,
+		1
+	)
+	local radius = contact.ContactRadiusAtRest
+		+ (contact.ContactRadiusSprint - contact.ContactRadiusAtRest) * alpha
+	local forward = contact.MaximumForwardLeadAtRest
+		+ (contact.MaximumForwardLeadSprint - contact.MaximumForwardLeadAtRest) * alpha
+	--[[
+		The lateral window widens far less than the forward one. A sprint touch
+		is pushed AHEAD, not sideways, so a ball well off to one side is still
+		not a ball this player can strike.
+	]]
+	local lateral = contact.MaximumLateralOffset * (1 + 0.35 * alpha)
+	return radius, forward, lateral
+end
 
 return FootballActionConfig

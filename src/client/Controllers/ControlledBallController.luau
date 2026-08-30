@@ -282,7 +282,15 @@ local function getStrikePreparationLead(): number?
 	if not prep or prep.Enabled ~= true then
 		return nil
 	end
-	return shoot.Contact.MaximumForwardLead * prep.LeadScale
+	--[[
+		Deliberately the AT-REST window, not the speed-scaled one.
+
+		Strike preparation exists to bring the ball TO THE FOOT so the shot can
+		be struck sooner. Scaling it up with speed would defeat the purpose: it
+		would pull the ball to a lead the player is already at, and prepare
+		nothing.
+	]]
+	return shoot.Contact.MaximumForwardLeadAtRest * prep.LeadScale
 end
 
 local function getLeadDistance(locomotionState): number
@@ -1073,6 +1081,33 @@ local function applyPossessionServo(ball: BasePart, rootPart: BasePart, locomoti
 			targetError += lateral * wander
 			positionGain *= dribbling.Skill.LowSkillRecoveryScale
 				+ (1 - dribbling.Skill.LowSkillRecoveryScale) * skill
+		end
+	end
+
+	--[[
+		THE BALL HAS FALLEN BEHIND: RECOVER IT.
+
+		The mirror of the beyondPeakLead correction immediately below, which has
+		always handled the ball getting too far in FRONT. Rear lag had no
+		equivalent, and the two are not equally harmless -- see the long note on
+		BallConfig.Control.RearLag. A trailing ball cannot be struck, passed or
+		shielded, and the ordinary carry gain recovers it far too slowly.
+
+		Applied as extra servo authority rather than as a new control mode, so
+		the touch rhythm, the phase machine and the skill-based control error all
+		continue to work exactly as they did; the ball simply comes back to the
+		foot at the pace a footballer would bring it back.
+	]]
+	local rearLag = controlConfig.RearLag
+	if rearLag and rearLag.Enabled == true and controlMode ~= "Capture" and not controlledRestActive then
+		local lagAlpha = math.clamp(
+			(rearLag.Threshold - leadBeforeTarget) / math.max(rearLag.Threshold - rearLag.FullLag, 1e-4),
+			0,
+			1
+		)
+		if lagAlpha > 0 then
+			positionGain *= 1 + (rearLag.PositionGainScale - 1) * lagAlpha
+			velocityDamping *= 1 + (rearLag.VelocityDampingScale - 1) * lagAlpha
 		end
 	end
 

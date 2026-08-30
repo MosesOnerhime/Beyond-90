@@ -162,7 +162,28 @@ local AnimationConfig = {
 		},
 
 		DirectionChange180 = {
-			Enabled = true,
+			--[[
+				OFF FOR NOW.
+
+				The clip is authored as a single right-hand turn and Roblox has no
+				runtime skeletal mirroring, so half of all reversals -- every one
+				that goes left -- are played at a reduced blend weight against the
+				direction the body is actually travelling. `UnmirroredClipWeight`
+				below is the compensation for that, and a weight of 0.55 is an
+				admission that the asset is wrong for the case rather than a fix
+				for it.
+
+				With this disabled the reversal falls through to ordinary
+				locomotion, which turns correctly in both directions because it is
+				driven by gameplay yaw rather than by an authored clip. A plain
+				turn reads better than a turn leaning the wrong way.
+
+				Everything else stays: the trigger, the handedness resolution and
+				the driven-rotation handoff are all still here and all still
+				correct. Set this back to true once a dedicated left-turn asset
+				exists and `UnmirroredClipWeight` can go to 1.
+			]]
+			Enabled = false,
 			-- A genuine reversal while already travelling. Curved running must not
 			-- reach this threshold.
 			MinimumSpeed = 11,
@@ -411,16 +432,32 @@ local AnimationConfig = {
 		FallbackDuration = 0.8,
 
 		--[[
-			Above this speed a keeper is RUNNING, not guarding.
+			Above this speed a keeper is MOVING, not guarding.
 
 			The keeper vocabulary is a set-position one: idle, idle with the ball,
 			a lateral guard step. It reads correctly while the keeper is holding
-			their line and looks wrong the moment they sprint out for a through
-			ball, so past this speed the ordinary outfield locomotion set takes
-			over. A goalkeeper coming for a cross should run like a footballer,
-			because that is what they are doing.
+			their line and looks wrong the moment they travel, so past this speed
+			the ordinary outfield locomotion set takes over.
+
+			This was 7, and 7 is not a guard step -- it is a jog. The runtime log
+			is unambiguous:
+
+				State -> KeeperIdle family=Goalkeeper speed=6.8
+				State -> KeeperIdle family=Goalkeeper speed=6.0
+				State -> KeeperIdle family=Goalkeeper speed=7.0
+
+			-- a keeper travelling at nearly half top speed with an IDLE clip on,
+			so the body slid across the six-yard box with its feet planted. The
+			threshold has to sit just above an actual shuffle, not just below a
+			jog. Jog speed is 16, so a couple of studs per second is the honest
+			boundary between adjusting your feet and going somewhere.
+
+			Past it the directional locomotion set now genuinely works for a
+			keeper, because their facing is pinned to the ball rather than to
+			their travel direction: backing off plays the backward clip and
+			stepping across plays the lateral ones.
 		]]
-		RunThreshold = 7,
+		RunThreshold = 2.6,
 	},
 
 	AirbornePresentation = {

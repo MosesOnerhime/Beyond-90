@@ -20,6 +20,7 @@ local BallControlMath = require(Shared.Football.BallControlMath)
 local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local MatchConfig = require(Shared.Config.MatchConfig)
+local GameModeConfig = require(Shared.Config.GameModeConfig)
 local MatchRulesConfig = require(Shared.Config.MatchRulesConfig)
 local OffsideEvaluator = require(Shared.Football.OffsideEvaluator)
 local PitchGeometry = require(Shared.Football.PitchGeometry)
@@ -438,6 +439,17 @@ local function resolvePendingFoul()
 	local config = MatchRulesConfig.Foul.Advantage
 	local elapsed = os.clock() - pendingFoul.At
 
+	--[[
+		Some offences have no advantage to play.
+
+		Advantage exists because play is still flowing and the fouled side may be
+		better off left alone. A goalkeeper who has just picked the ball up
+		outside their area has stopped play by definition -- the ball is in their
+		hands -- so waiting to see what happens next would only produce a
+		suspended, motionless match.
+	]]
+	if pendingFoul.Immediate ~= true then
+
 	if config.Enabled == true and elapsed < config.EvaluateAfter then
 		return false
 	end
@@ -454,10 +466,12 @@ local function resolvePendingFoul()
 		end
 	end
 
+	end
+
 	local decision = pendingFoul
 	pendingFoul = nil
 
-	if config.Enabled == true and elapsed >= config.AbandonAfter then
+	if decision.Immediate ~= true and config.Enabled == true and elapsed >= config.AbandonAfter then
 		-- Advantage ran long enough; the foul is dropped entirely.
 		log("Advantage played; foul dropped")
 		return false
@@ -527,6 +541,50 @@ function MatchRulesService.ReportFoul(offender, victim, decision)
 		decision.Type
 	))
 	announce("Foul", decision.Type, victim.TeamId)
+end
+
+--[[
+	A goalkeeper handled the ball outside their own penalty area.
+
+	Reported separately from a challenge because it has no victim: nobody was
+	fouled, the offence is against the law rather than against an opponent. The
+	awarded team is therefore derived from the offender's, and the restart spot
+	is where the handling happened rather than where anybody was standing.
+
+	Marked Immediate so the advantage window is skipped -- see resolvePendingFoul.
+]]
+function MatchRulesService.ReportGoalkeeperHandling(offender, position: Vector3): boolean
+	if not MatchRulesService.AllowsFootballActions() then
+		return false
+	end
+	if pendingFoul then
+		return false
+	end
+	local awardedTo = FootballTeamConfig.GetOpponent(offender.TeamId)
+	if not awardedTo then
+		return false
+	end
+	local now = os.clock()
+	lastFoulAt = now
+	pendingFoul = {
+		At = now,
+		Type = "Handling",
+		Severity = MatchRulesConfig.Foul.Severity.FoulThreshold,
+		OffenderId = offender.Id,
+		OffenderTeamId = offender.TeamId,
+		VictimId = 0,
+		VictimTeamId = awardedTo,
+		Position = position,
+		Immediate = true,
+	}
+	log(string.format(
+		"Handling outside the area: %s (%s); free kick to %s",
+		offender.DisplayName,
+		offender.TeamId,
+		awardedTo
+	))
+	announce("Foul", "Handling", awardedTo)
+	return true
 end
 
 --[[
@@ -782,8 +840,27 @@ local function step(deltaTime: number)
 		Stamina runs before every early return, because it must keep recovering
 		during stoppages, half time and pre-match -- those are exactly when a
 		footballer gets their breath back (§45).
+
+		WHICH PHASE STAMINA IS TOLD ABOUT MATTERS, and getting it wrong silently
+		switched fatigue off entirely.
+
+		StaminaService drains only while the phase is Playing and recovers in
+		every other phase -- correct for an officiated match, where any other
+		phase genuinely is a stoppage. But a mode with no match rules never
+		reaches Playing at all: free practice sits at Idle forever by design, so
+		every footballer in it was permanently "resting" and sprinting cost
+		nothing. Measured: three seconds of unbroken 31 studs/s sprinting drained
+		0.0 stamina.
+
+		Play in such a mode is never stopped, so it is always live. Saying so
+		here -- where the mode's rules status is already known -- keeps
+		StaminaService a pure physical system that does not have to reason about
+		game modes.
 	]]
-	StaminaService.Update(deltaTime, phase)
+	local staminaPhase = if GameModeConfig.Uses(MatchService.GetMode(), "UsesMatchRules")
+		then phase
+		else Phases.Playing
+	StaminaService.Update(deltaTime, staminaPhase)
 
 	if not MatchService.IsPlaying() then
 		--[[
@@ -808,6 +885,28 @@ local function step(deltaTime: number)
 			clearOffsideSnapshot()
 			clockSeconds = 0
 			period = MatchRulesConfig.Periods.FirstHalf
+			publish()
+		end
+		return
+	end
+
+	--[[
+		A mode that does not use match rules is not governed by them.
+
+		Free practice was running the whole officiating layer -- kick-off,
+		restarts, the clock, offside, fouls -- which is what put a START MATCH gate
+		and a kick-off in front of someone who asked to kick a ball about. The
+		rules simply stand down for such a mode, rather than every individual rule
+		learning to make an exception.
+	]]
+	if not GameModeConfig.Uses(MatchService.GetMode(), "UsesMatchRules") then
+		if phase ~= Phases.Idle then
+			setPhase(Phases.Idle)
+			buffer = nil
+			pendingFoul = nil
+			RestartService.Clear()
+			clearOffsideSnapshot()
+			clockSeconds = 0
 			publish()
 		end
 		return

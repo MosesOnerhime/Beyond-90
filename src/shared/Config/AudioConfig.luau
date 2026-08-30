@@ -1,5 +1,29 @@
 local AudioConfig = {
 	FadeSeconds = 0.75,
+
+	--[[
+		MENU MUSIC VOLUME.
+
+		The menu track used to come in at 0.5 and it sat far too loud over the
+		menu -- loud enough that it competed with the branding sting rather than
+		sitting under it. The default is now 0.3, which is where the mix wants it.
+
+		It is also a SETTING now, so a player can put it where they like without
+		having to choose between "as loud as this" and "off". Session scoped and
+		stored on the player: persistence is a later milestone, and a value that
+		only lasts the session is much better than no control at all.
+
+		Only the menu music reads this. Crowd ambience, the whistle and every
+		gameplay SFX are match audio, not background music, and are untouched.
+	]]
+	Music = {
+		DefaultVolume = 0.3,
+		Minimum = 0,
+		Maximum = 1,
+		AttributeName = "Beyond90MusicVolume",
+		-- Granularity of the slider, so dragging lands on tidy percentages.
+		Step = 0.05,
+	},
 	Startup = {
 		AssetId = "115017291331516",
 		LocalSource = "assets/audio/sfx/B90_Startup_Logo_Sting.mp3",

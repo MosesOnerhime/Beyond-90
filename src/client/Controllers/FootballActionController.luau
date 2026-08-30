@@ -185,17 +185,29 @@ local function isBallStrikeable(): boolean
 	if not rootPart or not rootPart:IsA("BasePart") then
 		return false
 	end
+	--[[
+		The SAME window the server will apply, from the same function, judged the
+		same way -- where the foot will meet the ball rather than where the ball
+		is this instant. A local check that disagrees with the authoritative one
+		either blocks a legal shot or predicts one that is about to be refused.
+	]]
 	local contact = FootballActionConfig.Shoot.Contact
+	local playerVelocity = BallControlMath.GetHorizontal(rootPart.AssemblyLinearVelocity)
+	local contactRadius, maximumForwardLead, maximumLateral =
+		FootballActionConfig.GetShotContactWindow(playerVelocity.Magnitude)
+
+	local relativeVelocity = BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity) - playerVelocity
 	local toBall = BallControlMath.GetHorizontal(ball.Position - rootPart.Position)
-	if toBall.Magnitude > contact.ContactRadius then
+		+ relativeVelocity * contact.StrikeLookaheadSeconds
+	if toBall.Magnitude > contactRadius then
 		return false
 	end
 	local controlDirection = BallControlMath.SafeUnit(
-		BallControlMath.GetHorizontal(rootPart.AssemblyLinearVelocity),
+		playerVelocity,
 		BallControlMath.GetHorizontal(rootPart.CFrame.LookVector)
 	)
 	local forwardLead = toBall:Dot(controlDirection)
-	if forwardLead > contact.MaximumForwardLead or forwardLead < -contact.MaximumBehindLead then
+	if forwardLead > maximumForwardLead or forwardLead < -contact.MaximumBehindLead then
 		return false
 	end
 	local lateral = (toBall - controlDirection * forwardLead).Magnitude

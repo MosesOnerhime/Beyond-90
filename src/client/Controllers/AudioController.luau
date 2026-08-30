@@ -86,7 +86,7 @@ local function rebuildMenuSound(playAfter: boolean)
 	if menuSound then menuSound:Destroy() end
 	local track = AudioConfig.MenuTracks[selectedTrackIndex]
 	menuSound = track and createSound("Beyond90MenuMusic", track.AssetId, true) or nil
-	if playAfter and musicEnabled then fade(menuSound, 0.5) end
+	if playAfter and musicEnabled then fade(menuSound, AudioController.GetMusicVolume()) end
 end
 
 function AudioController.Initialize()
@@ -124,7 +124,7 @@ end
 function AudioController.EnterMenu()
 	fade(crowdSound, 0, true)
 	if musicEnabled then
-		fade(menuSound, 0.5)
+		fade(menuSound, AudioController.GetMusicVolume())
 	else
 		fade(menuSound, 0, true)
 	end
@@ -164,6 +164,49 @@ end
 	Only the menu music is affected. Crowd ambience, the whistle and every
 	gameplay SFX are match audio, not background music, and stay as they are.
 ]]
+--[[
+	The player's chosen menu-music level, 0-1.
+
+	Read through one accessor so nothing takes the raw attribute and forgets to
+	clamp it, and so the default lives in config rather than being repeated as a
+	literal at each call site -- which is how the old hardcoded 0.5 ended up
+	being the de facto mix.
+]]
+function AudioController.GetMusicVolume(): number
+	local stored = Players.LocalPlayer:GetAttribute(AudioConfig.Music.AttributeName)
+	if typeof(stored) ~= "number" then
+		return AudioConfig.Music.DefaultVolume
+	end
+	return math.clamp(stored, AudioConfig.Music.Minimum, AudioConfig.Music.Maximum)
+end
+
+--[[
+	Set the level, and hear it immediately.
+
+	A volume slider that only takes effect on the next track is not a volume
+	slider, so this applies straight to the live sound rather than waiting for
+	the next fade -- but only while the menu music should actually be audible,
+	so it can never resurrect music the player turned off or override the
+	fade-out on the way into a match.
+]]
+function AudioController.SetMusicVolume(volume: number)
+	if typeof(volume) ~= "number" then
+		return
+	end
+	local clamped = math.clamp(volume, AudioConfig.Music.Minimum, AudioConfig.Music.Maximum)
+	Players.LocalPlayer:SetAttribute(AudioConfig.Music.AttributeName, clamped)
+	if musicEnabled
+		and menuSound
+		and Players.LocalPlayer:GetAttribute("Beyond90ClientExperienceState") ~= "Gameplay"
+	then
+		menuSound.Volume = clamped
+		if clamped > 0 and not menuSound.IsPlaying then
+			menuSound:Play()
+		end
+	end
+	musicChangedEvent:Fire(musicEnabled)
+end
+
 function AudioController.SetMusicEnabled(enabled: boolean)
 	enabled = enabled == true
 	if musicEnabled == enabled then
@@ -174,7 +217,7 @@ function AudioController.SetMusicEnabled(enabled: boolean)
 		-- Only resume if we are actually on a menu screen; entering gameplay
 		-- fades this out again on its own.
 		if Players.LocalPlayer:GetAttribute("Beyond90ClientExperienceState") ~= "Gameplay" then
-			fade(menuSound, 0.5)
+			fade(menuSound, AudioController.GetMusicVolume())
 		end
 	else
 		fade(menuSound, 0, true)

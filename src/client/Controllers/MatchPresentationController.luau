@@ -6,6 +6,7 @@ local TweenService = game:GetService("TweenService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local GameConfig = require(Shared.Config.GameConfig)
+local GameModeConfig = require(Shared.Config.GameModeConfig)
 local MatchConfig = require(Shared.Config.MatchConfig)
 local AudioController = require(script.Parent.AudioController)
 
@@ -259,6 +260,19 @@ local function onStateChanged()
 
 	if state ~= MatchConfig.States.Starting then
 		lastAnnouncedState = state or ""
+	end
+
+	--[[
+		A mode that does not use a START MATCH gate does not show one.
+
+		Free practice has no kick-off to hold and no rules to arm, so a START
+		MATCH card in front of it is a door with no wall around it -- the player
+		is already on the pitch with the ball. The mode is read from the player's
+		own selected mode, which the server sets before the character spawns.
+	]]
+	if not GameModeConfig.Uses(localPlayer:GetAttribute("Beyond90SelectedGameMode"), "RequiresStartMatch") then
+		setButtonState(false, false)
+		return
 	end
 
 	if state == MatchConfig.States.WaitingForPlayers then

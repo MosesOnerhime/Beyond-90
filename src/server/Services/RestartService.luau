@@ -30,6 +30,17 @@ local PitchService = require(script.Parent.PitchService)
 
 local RestartService = {}
 
+--[[
+	Who takes a penalty. See the taker-selection block for why this is not
+	simply "whoever is nearest the ball".
+
+	The preference is a distance bonus rather than a hard filter: it is larger
+	than any pitch, so a forward always outranks a non-forward, while a team with
+	no forward available still produces a taker instead of none.
+]]
+local PENALTY_TAKER_SLOT = "FWD"
+local PENALTY_TAKER_PREFERENCE = 1e6
+
 local ball: BasePart? = nil
 
 local active: { [string]: any }? = nil
@@ -316,7 +327,8 @@ end
 
 	So the taker faces where the ball is most likely to GO:
 
-		Kick-off / free kick / goal kick   the attacking goal -- upfield
+		Kick-off                           their OWN half -- see below
+		Free kick / goal kick              the attacking goal -- upfield
 		Penalty                            the goal being shot at
 		Corner                             the goal mouth being crossed into
 		Throw-in                           infield, because the thrower is
@@ -353,6 +365,29 @@ local function getTakerFacingPoint(
 			blended = BallControlMath.SafeUnit(infield * 0.75 + upfield * 0.25, infield)
 		end
 		return ballPosition + blended * 30
+	end
+
+	--[[
+		A KICK-OFF IS PLAYED BACKWARDS.
+
+		Every other restart is aimed upfield, and treating kick-off as one more
+		of them stood the taker on the centre spot facing the opposition goal
+		with his own team behind him -- backing his own half, with no team-mate
+		in front of him to find. The runtime consequence was a kick-off passed
+		141 studs to the taker's own GOALKEEPER, because the only thing the pass
+		resolver could see in the facing cone was the length of the pitch:
+
+			[Pass] type=GroundPass receiver=HOME_AI_91 distance=141.0
+
+		Real kick-offs are rolled back into the taker's own half to a team-mate
+		who is already square. Facing is the default aim here, so the taker faces
+		where the ball is actually going: back the way they came.
+	]]
+	if restart == restarts.Kickoff and attackingGoal then
+		return ballPosition + BallControlMath.SafeUnit(
+			BallControlMath.GetHorizontal(ballPosition - attackingGoal.MouthCenter),
+			if frame then -frame.Forward else Vector3.zAxis
+		) * 30
 	end
 
 	if attackingGoal then
@@ -458,10 +493,30 @@ function RestartService.Prepare(restart: string, takingTeamId: string, ballPosit
 
 				placeActor(actor, target, ballPosition, placedPositions)
 
-				-- Taker: the closest outfielder on the taking team. A goal kick is
-				-- the keeper's, which the keeper branch above has already placed.
+				--[[
+					Taker: the closest outfielder on the taking team -- EXCEPT for a
+					penalty, which the forward takes.
+
+					Distance is the right rule for a free kick or a throw-in, where
+					whoever is nearest the ball gets on with it. It is the wrong
+					rule for a penalty: the ball is placed on the spot and everyone
+					walks to it, so "closest" is an accident of where the foul
+					happened, and it handed the biggest single moment in a match to
+					whichever defender happened to be jogging back through the box.
+
+					A penalty is given to the player most likely to score it, and in
+					Beyond 90's formations that is the forward. The preference is
+					expressed as a rank rather than by excluding everyone else, so a
+					side with no forward on the pitch still gets a taker.
+				]]
 				if taking and not isKeeper then
 					local distance = BallControlMath.GetHorizontal(target - ballPosition).Magnitude
+					if restart == MatchRulesConfig.Restarts.Penalty
+						and actor.PositionSlotId == PENALTY_TAKER_SLOT
+					then
+						-- Forwards sort ahead of everyone; nearest forward wins.
+						distance -= PENALTY_TAKER_PREFERENCE
+					end
 					if distance < takerDistance then
 						takerDistance = distance
 						takerActor = actor
@@ -505,6 +560,42 @@ function RestartService.Prepare(restart: string, takingTeamId: string, ballPosit
 	end
 
 	-- Stand the taker over the ball, on the side that makes sense for the restart.
+	--[[
+		A RESTART WITHOUT A TAKER CANNOT BE TAKEN.
+
+		The selection above only considers OUTFIELDERS on the taking side, which
+		is right -- a kick-off is not the keeper's job. But it leaves a real gap:
+		a side with no outfielder registered at that moment, because the team is
+		short, a slot is mid-handoff between a human and the AI, or the only
+		footballer present is the goalkeeper, produced `taker=none`. Nobody was
+		given the ball, so the whistle went and the restart simply never happened.
+
+		The fallback is what football does in the same situation: SOMEBODY takes
+		it. The nearest available footballer on the taking side, keeper included,
+		is better than a match that has stopped.
+	]]
+	if not takerActor then
+		local fallbackDistance = math.huge
+		for _, actor in byTeam[takingTeamId] or {} do
+			if actor.RootPart and actor.RootPart.Parent then
+				local distance = BallControlMath.GetHorizontal(
+					actor.RootPart.Position - ballPosition
+				).Magnitude
+				if distance < fallbackDistance then
+					fallbackDistance = distance
+					takerActor = actor
+				end
+			end
+		end
+		if takerActor then
+			log(string.format(
+				"No outfielder available for %s; %s takes it",
+				restart,
+				takerActor.DisplayName
+			))
+		end
+	end
+
 	if takerActor then
 		local frame = getTeamFrame(takingTeamId)
 		local offsetDistance = if restart == MatchRulesConfig.Restarts.Penalty

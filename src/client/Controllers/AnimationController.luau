@@ -1,3 +1,4 @@
+local ContentProvider = game:GetService("ContentProvider")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -360,13 +361,53 @@ local function loadTrack(slot: string, animationId: string, trackName: string, p
 	log(string.format("Loaded %s asset=%s priority=%s looped=%s", trackName, animationId, priority.Name, tostring(looped)))
 	task.delay(2, function()
 		local record = activeTracks[slot]
-		if record and record.Track == track then
-			localPlayer:SetAttribute("Beyond90AnimationLength" .. slot, track.Length)
-
-			if track.Length <= 0 then
-				warnLog(string.format("%s asset=%s still reports length=0", trackName, animationId))
-			end
+		if not record or record.Track ~= track then
+			return
 		end
+		localPlayer:SetAttribute("Beyond90AnimationLength" .. slot, track.Length)
+		if track.Length > 0 then
+			return
+		end
+
+		--[[
+			A TRACK REPORTING LENGTH 0 IS AN ASSET THAT NEVER ARRIVED.
+
+			LoadAnimation returns immediately and the keyframe data streams in
+			afterwards, so a length of zero two seconds later means the fetch
+			did not complete -- not that the clip is empty. Until now this only
+			warned, and the track stayed permanently useless: every action using
+			it fell back to a fixed duration and played nothing, which is the
+			"animation does not play" class of report.
+
+			So try once more, and this time PRELOAD FIRST. PreloadAsync blocks
+			until the asset is actually resolved, which is the difference between
+			asking again and asking again with any reason to expect a different
+			answer.
+
+			Exactly one retry. A genuinely broken or moderated asset must not
+			produce an endless reload loop, and the warning below is then the
+			honest outcome: this clip is not going to play, and the fallback
+			duration is what keeps the action timing correct without it.
+		]]
+		task.spawn(function()
+			local preloadOk = pcall(function()
+				ContentProvider:PreloadAsync({ record.Animation })
+			end)
+			local current = activeTracks[slot]
+			if not current or current.Track ~= track then
+				return
+			end
+			if track.Length > 0 then
+				localPlayer:SetAttribute("Beyond90AnimationLength" .. slot, track.Length)
+				return
+			end
+			warnLog(string.format(
+				"%s asset=%s still reports length=0 after preload (preloaded=%s); actions will use their fallback duration",
+				trackName,
+				animationId,
+				tostring(preloadOk)
+			))
+		end)
 	end)
 end
 
@@ -1422,8 +1463,17 @@ local function updateGoalkeeperAnimation(rootPart: BasePart, speed: number, delt
 		return false
 	end
 
-	-- Running out is footballer movement, not goalkeeping.
-	if speed > keeperConfig.RunThreshold and model:GetAttribute(GoalkeeperConfig.Attributes.Holding) ~= true then
+	--[[
+		Moving is footballer movement, not goalkeeping -- INCLUDING WITH THE BALL.
+
+		The holding test that used to be here kept a keeper on the static
+		`KeeperIdleWithBall` pose no matter how fast they moved, which was
+		harmless only while holding also froze them in place. It does not any
+		more: a keeper who has caught the ball walks it out to the edge of their
+		box, and doing that in a standing pose is a footballer gliding across the
+		grass. Moving feet with the wrong arms beats a statue on rails.
+	]]
+	if speed > keeperConfig.RunThreshold then
 		if keeperPresentationActive then
 			stopFamily("Keeper", keeperConfig.FadeOutTime)
 			keeperPresentationActive = false

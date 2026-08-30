@@ -4,3 +4,8 @@ Packages/
 
 # Local visual-QA captures (never committed, never uploaded)
 scratchpad/
+
+# Rojo build output. The filesystem project is the source of truth, so a built
+# place file is always a generated artifact -- no .rbxl/.rbxlx is tracked.
+*.rbxl
+*.rbxlx

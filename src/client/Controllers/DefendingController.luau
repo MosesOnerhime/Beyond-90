@@ -10,9 +10,7 @@ local GoalkeeperConfig = require(Shared.Config.GoalkeeperConfig)
 local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
 local GameConfig = require(Shared.Config.GameConfig)
-local PositionConfig = require(Shared.Config.PositionConfig)
 local BallControlMath = require(Shared.Football.BallControlMath)
-local TackleEvaluator = require(Shared.Football.TackleEvaluator)
 
 local InputController = require(script.Parent:WaitForChild("InputController"))
 local MovementController = require(script.Parent:WaitForChild("MovementController"))
@@ -20,20 +18,35 @@ local MovementController = require(script.Parent:WaitForChild("MovementControlle
 --[[
 	Client half of defending.
 
-	HOLD-V PRESS (§41). V is held rather than tapped. While it is down the
-	footballer keeps closing on the ball carrier and challenges by itself the
-	moment the geometry becomes legal, so the player does not have to guess the
-	exact frame to press. Releasing V stops the assistance immediately.
+	THREE DEFENSIVE VERBS, NOT ONE.
 
-	The assistance is deliberately bounded (§42): it approaches, faces and times
-	the challenge. It never teleports, never exceeds normal speed, never ignores
-	acceleration or stamina, never wins the ball by fiat, and yields to manual
-	movement input. The human still chooses WHOM to press and from which side.
+	The supplied eFootball capture shows the model this is built on, and its
+	defensive control set is explicit about it: MATCH UP, DASH & PRESSURE and
+	TACKLE are three separate things a defender does, and the game gives them
+	three separate controls. They are separate because they are separate football
+	decisions with different risks -- containing is safe and wins nothing,
+	dashing wins the ball back sooner and is beaten by a turn, tackling ends the
+	situation one way or the other.
 
-	Prediction runs the same TackleEvaluator the server runs, on replicated
-	positions -- so the assist waits for a genuinely legal angle instead of
-	firing challenges that will be rejected. The server remains authoritative;
-	this is local prediction, not local authority.
+	Beyond 90 maps all three onto the one defensive input, by duration and by
+	whether sprint is also held:
+
+	    TAP                    -> TACKLE. An immediate challenge, unchanged.
+	    HOLD                   -> MATCH UP. Contain the carrier: close, then hold
+	                              a jockeying position goal-side of them and mirror
+	                              their movement. Never challenges by itself.
+	    HOLD + SPRINT          -> DASH & PRESSURE. The same containment with the
+	                              standoff pulled in and the speed cap lifted.
+
+	What is deliberately absent is the automatic challenge the hold used to make.
+	It made pressing a lunge, which is not what pressing is, and it decided a
+	football question -- when to commit -- that AGENTS.md reserves to the player.
+	The long note on DefendingConfig.Press.AutoTackleScore sets that out in full.
+
+	The assistance is bounded (§42): it approaches, positions and faces. It never
+	teleports, never exceeds normal speed, never ignores acceleration or stamina,
+	never wins the ball by fiat, and yields to manual movement input. The human
+	chooses whom to press, from which side, and when to go.
 ]]
 local DefendingController = {}
 
@@ -46,7 +59,11 @@ local pressUntil = 0
 
 local pressHeld = false
 local pressHeldSince = 0
+-- DASH & PRESSURE: containment with sprint also held. See DefendingConfig.Press.
+local pressDashing = false
 local lastTackleRequestAt = 0
+-- Double-tap detection for the slide. See DefendingConfig.Slide.
+local lastTapAt = 0
 local pressTargetPosition: Vector3? = nil
 local pressCarrierId: number? = nil
 
@@ -141,7 +158,7 @@ end
 	rather than chasing their back, and approach from a slight angle so the two
 	footballers do not try to occupy the same space.
 ]]
-local function resolvePressTarget(rootPart: BasePart, carrierRoot: BasePart): Vector3
+local function resolvePressTarget(rootPart: BasePart, carrierRoot: BasePart, dashRequested: boolean): Vector3
 	local carrierPosition = carrierRoot.Position
 	local defendedGoalId = localPlayer:GetAttribute(FootballTeamConfig.DefendedGoalAttributeName)
 	local goalPosition: Vector3? = nil
@@ -210,51 +227,43 @@ local function resolvePressTarget(rootPart: BasePart, carrierRoot: BasePart): Ve
 			+ recoveryLateral * (recoverySide * config.RecoveryLateralOffset)
 	end
 
+	--[[
+		MATCH UP.
+
+		Once the defender is close enough to actually be pressing, the target
+		stops being "get to the carrier" and becomes "hold a position in front of
+		them". Square and goal-side, at jockeying distance, leading their
+		sideways movement slightly so a change of direction does not beat the
+		containment outright.
+
+		The angled approach offset is dropped here on purpose. Approaching at an
+		angle is how you arrive without being run past; STANDING at an angle
+		leaves an open side, and a contained carrier will take it.
+	]]
+	local contain = config.Contain
+	local gap = fromCarrier.Magnitude
+	if contain.Enabled == true and gap <= contain.ContainRange then
+		local dash = config.Dash
+		local standoff = if dashRequested and dash.Enabled == true
+			then dash.StandoffDistance
+			else contain.StandoffDistance
+		standoff = math.max(standoff, contain.MinimumBodyGap)
+
+		local carrierLateralVelocity = BallControlMath.GetHorizontal(carrierRoot.AssemblyLinearVelocity)
+		-- Only the component ACROSS the goal line is worth leading; leading their
+		-- forward run just means standing where they already are not.
+		local lateralSpeed = carrierLateralVelocity:Dot(lateralAxis)
+		local lead = math.clamp(
+			lateralSpeed * contain.LateralLeadSeconds,
+			-contain.MaximumLateralLead,
+			contain.MaximumLateralLead
+		)
+		return carrierPosition + goalDirection * standoff + lateralAxis * lead
+	end
+
 	return carrierPosition
 		+ goalDirection * config.GoalSideStandoff
 		+ lateralAxis * (side * config.ApproachLateralOffset)
-end
-
---[[
-	Is the challenge on right now?
-
-	Runs the SAME evaluator the server runs. Predicting with the real rule rather
-	than a rough distance test is what stops the assist tackling through a back
-	and burning the cooldown on attempts that cannot succeed.
-]]
-local function shouldChallenge(rootPart: BasePart, carrierRoot: BasePart, ball: BasePart): boolean
-	if os.clock() - lastTackleRequestAt < DefendingConfig.Tackle.Cooldown then
-		return false
-	end
-	--[[
-		The evaluator reads FacingDirection, not Facing. Passing the wrong key made
-		challenger.FacingDirection nil, which GetHorizontal then indexed -- the
-		BallControlMath:6 error that fired every frame V was held. The server call
-		in DefendingService uses FacingDirection, so this now matches it exactly and
-		the local prediction sees the same geometry the server will.
-	]]
-	local result = TackleEvaluator.Evaluate(
-		{
-			Position = rootPart.Position,
-			Velocity = rootPart.AssemblyLinearVelocity,
-			FacingDirection = rootPart.CFrame.LookVector,
-			TackleSkill = PositionConfig.GetSkill(
-				localPlayer:GetAttribute(PositionConfig.SlotAttributeName),
-				"Tackling"
-			),
-		},
-		{
-			Position = carrierRoot.Position,
-			Velocity = carrierRoot.AssemblyLinearVelocity,
-			FacingDirection = carrierRoot.CFrame.LookVector,
-		},
-		ball.Position,
-		DefendingConfig.Tackle
-	)
-	if not result or not result.Valid then
-		return false
-	end
-	return result.Score >= DefendingConfig.Press.AutoTackleScore
 end
 
 local function requestTackle()
@@ -266,10 +275,42 @@ local function requestTackle()
 	requestRemote:FireServer({ ActionType = DefendingConfig.Tackle.ActionType })
 end
 
+--[[
+	The slide.
+
+	Nothing is predicted locally. A slide commits the body and can concede a free
+	kick, so the server owns both the launch and the outcome -- guessing at either
+	and being corrected would be worse than the small latency of asking.
+]]
+local function requestSlideTackle()
+	if not requestRemote then
+		return
+	end
+	lastTackleRequestAt = os.clock()
+	requestRemote:FireServer({ ActionType = DefendingConfig.Slide.ActionType })
+end
+
+--[[
+	Is this footballer committed to a slide right now?
+
+	The server writes the window; the client only reads it. That ordering matters:
+	a client that decided its own slide had ended could act during the recovery
+	the server is still enforcing.
+]]
+local function isSliding(): boolean
+	local character = localPlayer.Character
+	if not character then
+		return false
+	end
+	local until_ = character:GetAttribute(DefendingConfig.Slide.SlidingAttribute)
+	return typeof(until_) == "number" and os.clock() < until_
+end
+
 local function stopPress()
 	pressHeld = false
 	pressTargetPosition = nil
 	pressCarrierId = nil
+	pressDashing = false
 end
 
 --[[
@@ -281,6 +322,15 @@ end
 ]]
 local function updatePress()
 	if not pressHeld then
+		return
+	end
+	--[[
+		A committed slide overrides everything. Steering out of a slide is
+		precisely what makes it a free challenge instead of a risk, so the
+		assistance stands down entirely for its duration.
+	]]
+	if isSliding() then
+		pressTargetPosition = nil
 		return
 	end
 	local ball = getFootball()
@@ -322,21 +372,37 @@ local function updatePress()
 		return
 	end
 
+	--[[
+		DASH & PRESSURE is the same containment with sprint also held.
+
+		Read from the ordinary sprint input rather than given a binding of its
+		own: "press harder" is not a new verb, it is pressing while running, and
+		the player already knows which control means run.
+	]]
+	local inputState = InputController.GetInputState()
+	pressDashing = inputState ~= nil and inputState.SprintRequested == true
+
 	if carrierRoot then
-		pressTargetPosition = resolvePressTarget(rootPart, carrierRoot)
+		pressTargetPosition = resolvePressTarget(rootPart, carrierRoot, pressDashing)
 	else
 		pressTargetPosition = ball.Position
 	end
 
-	-- Face the contest, so the challenge is legal when it comes.
+	-- Face the contest, so a challenge is legal the instant the player asks for
+	-- one, and so containment is squared up to the carrier rather than side-on.
 	local toBall = BallControlMath.GetHorizontal(ball.Position - rootPart.Position)
 	if toBall.Magnitude > 0.5 then
 		MovementController.FaceActionDirection(toBall, 0.12)
 	end
 
-	if carrierRoot and shouldChallenge(rootPart, carrierRoot, ball) then
-		requestTackle()
-	end
+	--[[
+		AND THAT IS ALL IT DOES.
+
+		No automatic challenge. Holding this input contains; taking the ball is
+		the player's decision and their tap. See the long note on AutoTackleScore
+		in DefendingConfig for why the auto-tackle that used to live here was both
+		unlike football and on the wrong side of the assistance line.
+	]]
 end
 
 --[[
@@ -390,14 +456,15 @@ local function onFootballAction(action)
 		return
 	end
 
-	pressHeld = true
-	pressHeldSince = os.clock()
+	-- A footballer already on the floor cannot start another challenge.
+	if isSliding() then
+		return
+	end
 
-	--[[
-		A TAP still challenges immediately. Holding is the assisted press; tapping
-		must stay a direct "tackle now", so an experienced player is never made
-		slower by the assistance being there.
-	]]
+	local now = os.clock()
+	pressHeld = true
+	pressHeldSince = now
+
 	local rootPart = getLocalRoot()
 	if ball and rootPart then
 		local toBall = BallControlMath.GetHorizontal(ball.Position - rootPart.Position)
@@ -405,6 +472,33 @@ local function onFootballAction(action)
 			MovementController.FaceActionDirection(toBall, DefendingConfig.Press.Duration * 0.4)
 		end
 	end
+
+	--[[
+		DOUBLE-TAP SLIDES; A SINGLE TAP TACKLES.
+
+		The second tap inside the window replaces the challenge the first one
+		asked for. It is not additive -- the server's cooldown would have refused
+		a standing tackle immediately followed by a slide anyway, and a player
+		double-tapping means the slide, not both.
+
+		A slide is deliberately harder to ask for than a tackle. It concedes free
+		kicks and puts the defender on the floor, and neither should ever happen
+		because a finger slipped.
+	]]
+	local slide = DefendingConfig.Slide
+	if slide.Enabled == true and now - lastTapAt <= slide.DoubleTapWindow then
+		lastTapAt = 0
+		stopPress()
+		requestSlideTackle()
+		return
+	end
+	lastTapAt = now
+
+	--[[
+		A TAP still challenges immediately. Holding is the containment; tapping
+		must stay a direct "tackle now", so an experienced player is never made
+		slower by the assistance being there.
+	]]
 	requestTackle()
 end
 
@@ -438,15 +532,35 @@ function DefendingController.GetPressState()
 	local distance = if rootPart
 		then BallControlMath.GetHorizontal(pressTargetPosition - rootPart.Position).Magnitude
 		else 0
+	--[[
+		The carrier's position travels with the press state so the movement
+		assist can refuse to drive the defender into their body. Nil when the
+		ball is loose, which is the one case where there is nothing to avoid.
+	]]
+	local carrierRoot = resolveCarrier(ball)
 	return {
 		TargetPosition = pressTargetPosition,
 		BallPosition = ball.Position,
+		CarrierPosition = if carrierRoot then carrierRoot.Position else nil,
 		CarrierId = pressCarrierId,
 		HeldSeconds = os.clock() - pressHeldSince,
 		-- How far there is left to close, so MovementController can decide
 		-- whether this is still a sprint or already a jockey (§37).
 		Distance = distance,
-		ShouldSprint = distance > DefendingConfig.Press.SprintDistance,
+		--[[
+			Sprint while there is still ground to cover, or while the player is
+			explicitly asking for DASH & PRESSURE. Containment itself never
+			sprints -- a defender at top speed cannot turn, which is the whole
+			thing jockeying exists to preserve.
+		]]
+		ShouldSprint = pressDashing or distance > DefendingConfig.Press.SprintDistance,
+		Dashing = pressDashing,
+		--[[
+			Which of the two containment speed caps applies. DASH & PRESSURE is
+			allowed full commitment; MATCH UP is deliberately held below it so the
+			defender stays balanced and able to change direction.
+		]]
+		Containing = distance <= DefendingConfig.Press.Contain.ContainRange,
 		Config = DefendingConfig.Press,
 	}
 end

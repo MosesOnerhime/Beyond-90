@@ -163,40 +163,52 @@ local function onFootballAction(payload)
 end
 
 --[[
-	Positioning assistance.
+	Goalkeeper movement state, for the locomotion pipeline.
 
-	Returned in the same shape MovementController's press assist uses, so the
-	locomotion pipeline treats it as one more source of assisted intent rather
-	than as a special goalkeeper movement mode.
+	NO POSITIONING ASSISTANCE. A HUMAN KEEPER STEERS THEMSELVES.
 
-	Three rules make this assistance rather than automation:
+	This used to drift the player toward the server's published resting position
+	whenever they were not actively steering. It was bounded and overridable, but
+	a player standing still on purpose is making a goalkeeping decision -- angle,
+	depth, whether to hold the line for a cross -- and quietly walking them
+	somewhere else overrules the one thing the role is about. Removed at the
+	player's request, and it is the right call: positioning IS goalkeeping, so
+	assisting it is assisting the skill rather than the execution (AGENTS.md
+	§2, §23).
 
-	  * It only acts when the player is NOT steering. Any real input wins
-	    outright, so coming for a cross or narrowing the angle yourself is always
-	    available.
-	  * It stops inside a deadzone, so the keeper settles instead of jittering on
-	    the spot around a target that moves with the ball.
-	  * It gives up beyond a distance. A keeper who has run to the halfway line
-	    has made a decision, and dragging them home would be the game overruling
-	    it.
+	`RestingPosition` is still published by the server and still used by the AI
+	keeper, which genuinely needs somewhere to stand.
+
+	A DIVE IS STILL FROZEN. HOLDING IS NOT.
+
+	A dive is committed movement the server launched; steering it would fight the
+	server for the same character. Holding was frozen too, on the grounds that it
+	is "stationary by definition" -- which is simply not football. A keeper who
+	has caught the ball walks out of their six-yard box, carries it to the edge
+	and then throws or kicks. Being unable to move at all while holding is the
+	bug the player reported, and this is its whole cause: `Frozen` here becomes
+	`Vector3.zero` in MovementController's assist, so every input was discarded.
+
+	`GoalkeeperService.updateHeldBall` pins the football to the keeper's own root
+	every frame, so it travels with them correctly while they walk.
 ]]
 function GoalkeeperController.GetAssistState()
 	if not GoalkeeperController.IsActive() then
 		return nil
 	end
-	local model = character
-	if not model then
+	if not character then
 		return nil
 	end
-	if GoalkeeperController.IsDiving() or GoalkeeperController.IsHolding() then
-		-- Diving is server-driven; holding is stationary by definition.
+	if GoalkeeperController.IsDiving() then
 		return { Frozen = true }
 	end
-	local resting = model:GetAttribute(GoalkeeperConfig.Attributes.RestingPosition)
-	if typeof(resting) ~= "Vector3" then
-		return nil
-	end
-	return { TargetPosition = resting, Config = GoalkeeperConfig.Human }
+	--[[
+		Deliberately a table with no target: a keeper neither presses nor chases
+		loose balls like an outfielder, and MovementController uses the presence
+		of this state to suppress both. Returning nil would hand the keeper the
+		outfield press assist instead of removing assistance altogether.
+	]]
+	return {}
 end
 
 local function bindCharacter(model: Model)

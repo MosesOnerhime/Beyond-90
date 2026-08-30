@@ -65,10 +65,46 @@ local function AnimatedMenuPlayer()
 	local modelRef = React.useRef(nil)
 	local basePivotRef = React.useRef(nil)
 	local dragRef = React.useRef({ Active = false, X = 0, Yaw = 0 })
+	--[[
+		THE VIEWPORT SHOWS NOTHING UNTIL THE FOOTBALLER IS FINISHED.
+
+		The rig was being presented the moment it was cloned, and the player's
+		own avatar was applied afterwards from a detached `task.spawn`. So the
+		menu showed the stock footballer first and swapped it for the player a
+		moment later -- the "old character shows before my avatar" pop.
+
+		A half-built character is not worth showing. The viewport stays hidden
+		until the description has been applied and the idle is holding, and the
+		first frame anyone sees is the finished footballer.
+	]]
+	local rigReady, setRigReady = React.useState(false)
 	React.useEffect(function()
 		local disposed = false
 		local viewport = viewportRef.current
 		if not viewport then return nil end
+		--[[
+			The avatar fetch starts HERE, before the rig is even cloned, so the
+			web request overlaps the clone and the strip rather than following
+			them. Awaited further down, once there is a humanoid to apply it to.
+		]]
+		local identityConfigEarly = PlayerConfig.Appearance.Identity
+		local chosenSourceEarly = localPlayer:GetAttribute(identityConfigEarly.AttributeName)
+		if typeof(chosenSourceEarly) ~= "string" or not identityConfigEarly.Sources[chosenSourceEarly] then
+			chosenSourceEarly = identityConfigEarly.Default
+		end
+		local wantsAvatar = identityConfigEarly.Enabled == true
+			and chosenSourceEarly == identityConfigEarly.Sources.RobloxAvatar
+		local avatarDescription: HumanoidDescription? = nil
+		local avatarFetchDone = not wantsAvatar
+		if wantsAvatar then
+			task.spawn(function()
+				local okFetch, description = pcall(function()
+					return Players:GetHumanoidDescriptionFromUserId(localPlayer.UserId)
+				end)
+				avatarDescription = if okFetch then description else nil
+				avatarFetchDone = true
+			end)
+		end
 		task.spawn(function()
 			-- Workspace is streaming-enabled. The server clones the exact Workspace
 			-- menu_character into ReplicatedStorage so every client receives the full rig.
@@ -124,52 +160,55 @@ local function AnimatedMenuPlayer()
 				avatar cannot be fetched sees the default footballer, which is
 				exactly what they saw before, rather than an empty viewport.
 			]]
-			local identityConfig = PlayerConfig.Appearance.Identity
-			local chosenSource = localPlayer:GetAttribute(identityConfig.AttributeName)
-			if typeof(chosenSource) ~= "string" or not identityConfig.Sources[chosenSource] then
-				chosenSource = identityConfig.Default
+			--[[
+				THE MENU FOOTBALLER IS YOU -- BEFORE IT IS EVER SEEN.
+
+				This used to run detached, so the stock rig was already on screen
+				when the player's avatar landed on top of it. It is now awaited in
+				line: the fetch was started before the clone, so by this point it
+				has usually already returned and the wait costs nothing.
+
+				The wait is bounded. A slow or failing avatar service costs a short
+				delay and then shows the default footballer -- exactly what was
+				shown before this feature existed -- rather than holding the menu.
+			]]
+			if wantsAvatar and humanoid then
+				local fetchWaitStartedAt = os.clock()
+				while not avatarFetchDone and os.clock() - fetchWaitStartedAt < 4 and not disposed do
+					task.wait()
+				end
+				if not avatarFetchDone then
+					warn("[Beyond90][UI] Menu avatar fetch timed out; showing the default footballer")
+				end
 			end
-			if humanoid and identityConfig.Enabled == true
-				and chosenSource == identityConfig.Sources.RobloxAvatar
-			then
-				task.spawn(function()
-					local okFetch, description = pcall(function()
-						return Players:GetHumanoidDescriptionFromUserId(localPlayer.UserId)
-					end)
-					if disposed or not okFetch or not description then
-						if description then description:Destroy() end
-						return
-					end
-					-- Same rule as on the pitch: the face is the player's, the
-					-- frame is everyone's, so the menu shows the footballer they
-					-- will actually be.
-					for _, property in { "HeightScale", "WidthScale", "DepthScale", "HeadScale", "BodyTypeScale", "ProportionScale" } do
-						pcall(function()
-							(description :: any)[property] = 1
-						end)
-					end
+			local description = avatarDescription
+			if description and humanoid and not disposed then
+				-- Same rule as on the pitch: the face is the player's, the frame
+				-- is everyone's, so the menu shows the footballer they will be.
+				for _, property in { "HeightScale", "WidthScale", "DepthScale", "HeadScale", "BodyTypeScale", "ProportionScale" } do
 					pcall(function()
-						humanoid:ApplyDescription(description)
+						(description :: any)[property] = 1
 					end)
-					description:Destroy()
-					if disposed or not model.Parent then
-						return
-					end
-					-- Accessories change the bounding box, so re-seat the model on
-					-- the floor and re-cache the pivot the drag rotation uses.
-					for _, descendant in model:GetDescendants() do
-						if descendant:IsA("BasePart") then
-							descendant.Anchored = descendant == root
-							descendant.CanCollide = false
-							descendant.CanTouch = false
-							descendant.CanQuery = false
-						end
-					end
-					local reCFrame, reSize = model:GetBoundingBox()
-					model:PivotTo(model:GetPivot() + Vector3.new(0, -(reCFrame.Position.Y - reSize.Y / 2), 0))
-					basePivotRef.current = model:GetPivot()
+				end
+				pcall(function()
+					humanoid:ApplyDescription(description)
 				end)
+				-- Accessories change the bounding box, so the parts added by the
+				-- description need the same treatment the cloned ones got.
+				for _, descendant in model:GetDescendants() do
+					if descendant:IsA("BasePart") then
+						descendant.Anchored = descendant == root
+						descendant.CanCollide = false
+						descendant.CanTouch = false
+						descendant.CanQuery = false
+					end
+				end
 			end
+			if description then
+				description:Destroy()
+			end
+			avatarDescription = nil
+
 			model:PivotTo(CFrame.Angles(0, math.rad(135), 0))
 			local boundingCFrame, boundingSize = model:GetBoundingBox()
 			model:PivotTo(model:GetPivot() + Vector3.new(0, -(boundingCFrame.Position.Y - boundingSize.Y / 2), 0))
@@ -225,12 +264,23 @@ local function AnimatedMenuPlayer()
 						warn("[Beyond90][UI] Menu footballer idle did not load in time; revealing anyway")
 					end
 					Players.LocalPlayer:SetAttribute("Beyond90MenuCharacterReady", true)
+					if not disposed then setRigReady(true) end
 				end
 				animation:Destroy()
 			end
 			if not humanoid then
 				-- No rig to animate; do not hold the reveal open for it.
 				Players.LocalPlayer:SetAttribute("Beyond90MenuCharacterReady", true)
+				if not disposed then setRigReady(true) end
+			end
+			--[[
+				Belt and braces: nothing above is allowed to leave the viewport
+				permanently blank. If the animation branch fell through -- a rig
+				with a humanoid but no loadable idle -- the footballer is still
+				finished and should still be shown.
+			]]
+			if not disposed then
+				setRigReady(true)
 			end
 		end)
 		return function()
@@ -242,6 +292,8 @@ local function AnimatedMenuPlayer()
 	end, {})
 	return React.createElement("ViewportFrame", {
 		ref = viewportRef,
+		-- Hidden until the footballer is the player's own and holding its idle.
+		Visible = rigReady,
 		AnchorPoint = Vector2.new(0.5, 1),
 		Position = UDim2.fromScale(0.61, 0.79),
 		Size = UDim2.fromScale(0.37, 0.8),

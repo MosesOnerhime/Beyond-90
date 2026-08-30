@@ -58,6 +58,7 @@ local BallConfig = require(Shared.Config.BallConfig)
 local CameraConfig = require(Shared.Config.CameraConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local BallControlMath = require(Shared.Football.BallControlMath)
+local CameraShake = require(script.Parent.CameraShake)
 
 local ThirdPersonCamera = {}
 
@@ -68,6 +69,15 @@ local characterAddedConnection: RBXScriptConnection? = nil
 local renderConnection: RBXScriptConnection? = nil
 local mouseLocked = false
 local previousMouseBehavior: Enum.MouseBehavior? = nil
+--[[
+	Mouse-lock ownership while interactive UI is open.
+
+	`uiSuspendedLock` remembers whether the lock was ON when a cursor-driven
+	screen took over, so it can be handed back exactly as it was afterwards --
+	rather than being restored to a default the player never chose.
+]]
+local uiSuspendedLock = false
+local menuOpenConnection: RBXScriptConnection? = nil
 
 -- Smoothed camera state. Nil until the first frame, so the camera starts where
 -- it belongs instead of easing in from wherever the previous mode left it.
@@ -85,6 +95,12 @@ local currentRig = {
 }
 local mouseYaw = 0
 local mousePitch = config.OnBall.Pitch
+-- Framing: where the controlled footballer currently sits in the frame, and how
+-- far the ball has pulled that away from the configured composition.
+local framingShiftX = 0
+local framingShiftY = 0
+-- How far open the view currently is, 0 = preset, 1 = fully widened.
+local widenAlpha = 0
 
 local function getCurrentHumanoid(): Humanoid?
 	local character = localPlayer.Character
@@ -162,6 +178,58 @@ local function getPlayDirection(rootPart: BasePart, ball: BasePart?): Vector3
 	)
 end
 
+--[[
+	COMPOSITION.
+
+	Given a camera that is looking straight at `subject`, what rotation puts the
+	subject at normalized screen position (sx, sy) instead of dead centre?
+
+	Derived rather than tuned. In camera space the forward axis is -Z, so a
+	direction d projects to normalized device coordinates
+
+	    u = (d.x / -d.z) / tan(hFov/2)      v = (d.y / -d.z) / tan(vFov/2)
+
+	with u = +1 at the right edge and v = +1 at the top. Rotating the camera by
+	yaw t then pitch p sends the subject's direction to
+
+	    d = (cos p * sin t, -sin p, -cos p * cos t)
+
+	so u = tan t / tanH and v = -tan p / (cos t * tanV), which inverts cleanly to
+	the two angles below. Being exact matters: it means the composition holds at
+	any field of view and any viewport shape, including a phone in landscape,
+	instead of drifting as soon as either changes.
+]]
+local function framingRotation(fov: number, viewport: Vector2, sx: number, sy: number): CFrame
+	local tanV = math.tan(math.rad(fov) * 0.5)
+	local aspect = if viewport.Y > 0 then viewport.X / viewport.Y else 16 / 9
+	local tanH = tanV * aspect
+	local u = sx * 2 - 1
+	local v = 1 - sy * 2
+	local yaw = math.atan(u * tanH)
+	local pitch = -math.atan(v * tanV * math.cos(yaw))
+	return CFrame.Angles(pitch, yaw, 0)
+end
+
+--[[
+	Where does `point` land on screen, given a camera CFrame and lens?
+
+	Used to ask the only question the framing actually cares about: is the
+	football still inside the dead zone? Returns nil when the point is behind the
+	camera, which the caller must treat as "definitely outside".
+]]
+local function projectToScreen(cameraCFrame: CFrame, fov: number, viewport: Vector2, point: Vector3): (number?, number?)
+	local local_ = cameraCFrame:PointToObjectSpace(point)
+	if local_.Z >= -0.05 then
+		return nil, nil
+	end
+	local tanV = math.tan(math.rad(fov) * 0.5)
+	local aspect = if viewport.Y > 0 then viewport.X / viewport.Y else 16 / 9
+	local tanH = tanV * aspect
+	local u = (local_.X / -local_.Z) / tanH
+	local v = (local_.Y / -local_.Z) / tanV
+	return (u + 1) * 0.5, (1 - v) * 0.5
+end
+
 local function updateCamera(deltaTime: number)
 	local camera = Workspace.CurrentCamera
 	local rootPart = getRootPart()
@@ -179,11 +247,36 @@ local function updateCamera(deltaTime: number)
 	local small = isSmallViewport(camera)
 	local mobile = config.Mobile
 	local rigAlpha = expAlpha(config.RigResponsiveness, deltaTime)
-	currentRig.Distance += (targetRig.Distance * (if small then mobile.DistanceScale else 1) - currentRig.Distance) * rigAlpha
-	currentRig.Height += (targetRig.Height * (if small then mobile.HeightScale else 1) - currentRig.Height) * rigAlpha
+
+	--[[
+		HOW FAR AWAY IS PLAY?
+
+		Distance to the football, blended slowly into `widenAlpha`. This is a
+		SEPARATE question from possession -- a footballer without the ball may be
+		right next to it or at the other end of the pitch, and those want very
+		different framing -- which is why it scales the preset rather than being
+		folded into it.
+	]]
+	local widening = config.Widening
+	local ballDistance = if ball
+		then BallControlMath.GetHorizontal(ball.Position - rootPart.Position).Magnitude
+		else 0
+	local widenTarget = math.clamp(
+		(ballDistance - widening.StartDistance) / math.max(widening.FullDistance - widening.StartDistance, 1),
+		0,
+		1
+	)
+	widenAlpha += (widenTarget - widenAlpha) * expAlpha(widening.Responsiveness, deltaTime)
+	local widenDistance = 1 + (widening.DistanceScale - 1) * widenAlpha
+	local widenHeight = 1 + (widening.HeightScale - 1) * widenAlpha
+
+	currentRig.Distance += (targetRig.Distance * widenDistance * (if small then mobile.DistanceScale else 1) - currentRig.Distance) * rigAlpha
+	currentRig.Height += (targetRig.Height * widenHeight * (if small then mobile.HeightScale else 1) - currentRig.Height) * rigAlpha
 	currentRig.Pitch += (targetRig.Pitch - currentRig.Pitch) * rigAlpha
 	currentRig.LookAhead += (targetRig.LookAhead - currentRig.LookAhead) * rigAlpha
-	local targetFOV = targetRig.FOV + (if small then mobile.FOVBonus else 0)
+	local targetFOV = targetRig.FOV
+		+ widening.FOVBonus * widenAlpha
+		+ (if small then mobile.FOVBonus else 0)
 
 	--[[
 		YAW AND PITCH.
@@ -204,8 +297,21 @@ local function updateCamera(deltaTime: number)
 		currentYaw = mouseYaw
 		currentPitch = mousePitch
 	else
+		--[[
+			YAW DEAD ZONE.
+
+			Inside a few degrees of where the camera already points, the camera
+			simply does not turn. Dribbling is a continuous stream of small
+			heading corrections and answering all of them is what makes a
+			following camera feel unsettled -- the reference capture holds a
+			steady line through exactly the sort of touches that were swinging
+			this view. Outside the dead zone it tracks normally.
+		]]
 		local targetYaw = math.atan2(-playDirection.X, -playDirection.Z)
-		currentYaw = lerpAngle(currentYaw, targetYaw, expAlpha(config.YawResponsiveness, deltaTime))
+		local yawError = (targetYaw - currentYaw + math.pi) % (2 * math.pi) - math.pi
+		if math.abs(yawError) > math.rad(config.YawDeadZoneDegrees) then
+			currentYaw = lerpAngle(currentYaw, targetYaw, expAlpha(config.YawResponsiveness, deltaTime))
+		end
 		-- Keep the manual yaw in step, so toggling the mouse lock on does not
 		-- snap the view somewhere else.
 		mouseYaw = currentYaw
@@ -224,16 +330,19 @@ local function updateCamera(deltaTime: number)
 		less on it, where the player and the ball are in the same place anyway.
 	]]
 	local anchor = rootPart.Position
-	local focusTarget = anchor + forward * currentRig.LookAhead
-	if ball then
-		local weight = if onBall then config.BallFocusWeightOnBall else config.BallFocusWeightOffBall
-		local pull = (ball.Position - focusTarget) * weight
-		local flat = BallControlMath.GetHorizontal(pull)
-		if flat.Magnitude > config.MaximumBallFocusOffset then
-			flat = flat.Unit * config.MaximumBallFocusOffset
-		end
-		focusTarget += flat
-	end
+	--[[
+		The aim point is the footballer, nudged ahead of them.
+
+		The football no longer PULLS THE AIM. It used to, and that is what made
+		the composition unpredictable: the ball dragged the centre of the frame
+		around, so where the player appeared on screen depended on where the ball
+		happened to be. The reference does the opposite -- the footballer holds a
+		consistent place in the frame and the camera pans to keep the ball in
+		shot. That is what the framing shift below does instead, and it is why
+		this is now a short, fixed look-ahead rather than a large one competing
+		with a ball weight.
+	]]
+	local focusTarget = anchor + forward * currentRig.LookAhead + Vector3.yAxis * 2
 
 	local positionTarget = anchor
 		+ back * currentRig.Distance
@@ -258,7 +367,54 @@ local function updateCamera(deltaTime: number)
 
 	camera.CameraType = Enum.CameraType.Scriptable
 	camera.FieldOfView = currentFOV
-	camera.CFrame = CFrame.lookAt(currentPosition :: Vector3, currentFocus :: Vector3)
+
+	--[[
+		THE COMPOSITION, AND THE DEAD ZONE THAT PROTECTS IT.
+
+		Start from the reference framing, project the football through it, and
+		only if the ball has left the dead zone does the framing give way -- and
+		then only as far as the clamp allows. The footballer therefore holds a
+		stable place in the frame during ordinary play and yields it, smoothly
+		and partially, when the ball genuinely needs the room.
+
+		Mouse look is exempt from the ball shift. While the player is aiming the
+		camera themselves, a camera that also pans on its own is fighting them.
+	]]
+	local framing = config.Framing
+	local viewport = camera.ViewportSize
+	local baseCFrame = CFrame.lookAt(currentPosition :: Vector3, currentFocus :: Vector3)
+
+	local desiredShiftX, desiredShiftY = 0, 0
+	if ball and not mouseLocked then
+		local composed = baseCFrame * framingRotation(currentFOV, viewport, framing.SubjectX, framing.SubjectY)
+		local ballX, ballY = projectToScreen(composed, currentFOV, viewport, ball.Position)
+		if ballX ~= nil and ballY ~= nil then
+			local halfX = framing.DeadZoneX * 0.5
+			local halfY = framing.DeadZoneY * 0.5
+			local overX = ballX - 0.5
+			local overY = ballY - 0.5
+			-- Only the part of the error that is OUTSIDE the dead zone counts.
+			overX = if math.abs(overX) > halfX then overX - halfX * math.sign(overX) else 0
+			overY = if math.abs(overY) > halfY then overY - halfY * math.sign(overY) else 0
+			desiredShiftX = math.clamp(overX, -framing.MaximumBallShiftX, framing.MaximumBallShiftX)
+			desiredShiftY = math.clamp(overY, -framing.MaximumBallShiftY, framing.MaximumBallShiftY)
+		end
+	end
+	local shiftAlpha = expAlpha(framing.ShiftResponsiveness, deltaTime)
+	framingShiftX += (desiredShiftX - framingShiftX) * shiftAlpha
+	framingShiftY += (desiredShiftY - framingShiftY) * shiftAlpha
+
+	local subjectX = math.clamp(framing.SubjectX + framingShiftX, 0.12, 0.88)
+	local subjectY = math.clamp(framing.SubjectY + framingShiftY, 0.2, 0.9)
+	--[[
+		Shake is applied LAST, to the composed result, and is never written back
+		into any smoothed state. That is what makes it presentation-only: the
+		camera's position, aim and framing are already final by this point, so
+		nothing about aiming a shot or judging a pass can be affected by it.
+	]]
+	camera.CFrame = baseCFrame
+		* framingRotation(currentFOV, viewport, subjectX, subjectY)
+		* CameraShake.Step(deltaTime)
 end
 
 local function resetSmoothing()
@@ -280,6 +436,9 @@ local function resetSmoothing()
 	currentRig.Height = config.OnBall.Height
 	currentRig.Pitch = config.OnBall.Pitch
 	currentRig.LookAhead = config.OnBall.LookAhead
+	framingShiftX = 0
+	framingShiftY = 0
+	widenAlpha = 0
 end
 
 local function configureCamera()
@@ -316,6 +475,39 @@ local function applyMouseLock(locked: boolean)
 	localPlayer:SetAttribute("Beyond90ThirdPersonMouseLocked", mouseLocked)
 end
 
+--[[
+	INTERACTIVE UI OWNS THE CURSOR WHILE IT IS OPEN.
+
+	Pro Camera locks the mouse to the centre of the screen and consumes its raw
+	delta to aim. That is right during play and wrong the instant a screen the
+	player has to CLICK appears: the cursor is invisible, pinned to the middle,
+	and every attempt to move it aims the camera instead. A player who opens
+	settings mid-match cannot press anything.
+
+	So the lock is released while such a screen is up, and restored to whatever
+	the player actually had when it closes. Nothing here decides WHETHER a menu
+	is open -- it reads the same flag the movement and action controllers already
+	stand down on, so all three agree by construction about when the player is in
+	a menu rather than in a match.
+]]
+local function onMenuOpenChanged()
+	if not active or config.MouseLockEnabled ~= true then
+		return
+	end
+	local menuOpen = localPlayer:GetAttribute("Beyond90MenuOpen") == true
+	if menuOpen then
+		if mouseLocked then
+			uiSuspendedLock = true
+			applyMouseLock(false)
+		end
+		return
+	end
+	if uiSuspendedLock then
+		uiSuspendedLock = false
+		applyMouseLock(true)
+	end
+end
+
 function ThirdPersonCamera.ToggleMouseLock(): boolean
 	if not active then
 		return false
@@ -342,6 +534,11 @@ function ThirdPersonCamera.Enable()
 			task.defer(configureCamera)
 		end
 	end)
+	uiSuspendedLock = false
+	menuOpenConnection = localPlayer:GetAttributeChangedSignal("Beyond90MenuOpen"):Connect(onMenuOpenChanged)
+	-- Apply the current state immediately: the camera may be enabled while a
+	-- menu is already up, and starting locked behind a menu is the same bug.
+	onMenuOpenChanged()
 	renderConnection = RunService.RenderStepped:Connect(updateCamera)
 end
 
@@ -361,6 +558,11 @@ function ThirdPersonCamera.Disable()
 		UserInputService.MouseIconEnabled = true
 	end
 	mouseLocked = false
+	uiSuspendedLock = false
+	if menuOpenConnection then
+		menuOpenConnection:Disconnect()
+		menuOpenConnection = nil
+	end
 	localPlayer:SetAttribute("Beyond90ThirdPersonMouseLocked", nil)
 	active = false
 
@@ -376,6 +578,8 @@ function ThirdPersonCamera.Disable()
 	end
 	currentPosition = nil
 	currentFocus = nil
+	-- A shake started under this camera must not leak into the next one.
+	CameraShake.Clear()
 
 	if characterAddedConnection then
 		characterAddedConnection:Disconnect()

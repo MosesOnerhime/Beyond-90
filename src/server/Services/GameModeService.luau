@@ -81,7 +81,18 @@ function GameModeService.Initialize()
 		local requestedMode = if typeof(request) == "table" then request.Mode else request
 		local requestedTeam = if typeof(request) == "table" then FootballTeamConfig.Normalize(request.TeamId) else nil
 		local definition = typeof(requestedMode) == "string" and GameModeConfig.Modes[requestedMode] or nil
-		local needsTeam = requestedMode == "TrainingFree" or requestedMode == "Quick3v3"
+		--[[
+			Only a mode that actually picks sides needs a team.
+
+			Free practice does not, so it no longer refuses to start without one --
+			it takes the default side and gets the player onto the pitch, which is
+			the whole point of the mode.
+		]]
+		local needsTeam = GameModeConfig.Uses(requestedMode, "RequiresTeamSelection")
+			and (requestedMode == "TrainingFree" or requestedMode == "Quick3v3")
+		if not needsTeam and not requestedTeam then
+			requestedTeam = FootballTeamConfig.Normalize("Home")
+		end
 		if not definition or definition.Enabled ~= true or needsTeam and not requestedTeam then
 			return
 		end

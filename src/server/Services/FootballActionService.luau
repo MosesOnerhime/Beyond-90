@@ -512,27 +512,78 @@ local function getShotContactState(player: Player, ball: BasePart)
 	if not rootPart then
 		return "abandon", nil
 	end
-	local toBall = BallControlMath.GetHorizontal(ball.Position - rootPart.Position)
+	local playerVelocity = BallControlMath.GetHorizontal(rootPart.AssemblyLinearVelocity)
+	local speed = playerVelocity.Magnitude
+
+	--[[
+		WHERE THE FOOT WILL MEET THE BALL.
+
+		Both bodies are moving, so the gap that matters is the gap a fraction of
+		a second from now -- which is when the strike actually happens. Running
+		onto the ball closes that gap; a ball genuinely running away opens it,
+		and this correctly refuses that one.
+	]]
+	local lookahead = contactConfig.StrikeLookaheadSeconds
+	local relativeVelocity = BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity) - playerVelocity
+	local toBall = BallControlMath.GetHorizontal(ball.Position - rootPart.Position) + relativeVelocity * lookahead
 	local distance = toBall.Magnitude
+
+	--[[
+		The window opens with speed, spanning exactly the range the dribble
+		carries the ball across, and comes from the SHARED helper so the client's
+		local prediction cannot drift from this decision.
+	]]
+	local contactRadius, maximumForwardLead, maximumLateral =
+		FootballActionConfig.GetShotContactWindow(speed)
+
 	if distance > contactConfig.AbandonDistance then
 		return "abandon", rootPart
 	end
-	if math.abs(ball.Position.Y - rootPart.Position.Y) > contactConfig.MaximumHeight + rootPart.Size.Y then
+	--[[
+		A BALL IS STRIKEABLE RELATIVE TO THE FOOT, NOT TO THE ROOT'S CENTRE.
+
+		This single comparison is why shooting stopped working entirely --
+		standing still, with the ball at the feet, on a stationary pitch.
+
+		It measured the ball against the ROOT CENTRE and allowed
+		`MaximumHeight + rootPart.Size.Y` = 1.9 + 2.0 = 3.9 studs. But the root
+		centre of a standing footballer sits roughly hip height plus half the
+		root above the ground, and once the forced 8.27-stud scaling was removed
+		the rig reports hipHeight 4.064 with the root at Y 5.565-5.660. A ball
+		resting on the turf has its centre at about 0.975. The gap is therefore
+		~4.6 studs against a 3.9 allowance, so the test failed CONSTANTLY:
+
+			playerSpeed=0.00  lead=2.25  phase=Settle  ->  shot-expired
+
+		A ball perfectly at the player's feet, refused. Every shot then either
+		waited out its window (`shot-expired`) or had the wait closed under it
+		(`shot-contact-lost`).
+
+		The allowance was never really about the root; it is about how high off
+		the ground a footballer can strike a ball. So measure it from the SOLE.
+		That is what MaximumHeight has always meant, it is scale-independent, and
+		it cannot silently break again the next time the rig's proportions change
+		-- which is exactly how it broke this time.
+	]]
+	local humanoid = rootPart.Parent and rootPart.Parent:FindFirstChildOfClass("Humanoid")
+	local hipHeight = if humanoid then humanoid.HipHeight else 0
+	local soleY = rootPart.Position.Y - hipHeight - rootPart.Size.Y * 0.5
+	if ball.Position.Y - soleY > contactConfig.MaximumHeight + BallConfig.Radius then
 		return "wait", rootPart
 	end
-	if distance > contactConfig.ContactRadius then
+	if distance > contactRadius then
 		return "wait", rootPart
 	end
 	local controlDirection = BallControlMath.SafeUnit(
-		BallControlMath.GetHorizontal(rootPart.AssemblyLinearVelocity),
+		playerVelocity,
 		BallControlMath.GetHorizontal(rootPart.CFrame.LookVector)
 	)
 	local forwardLead = toBall:Dot(controlDirection)
-	if forwardLead > contactConfig.MaximumForwardLead or forwardLead < -contactConfig.MaximumBehindLead then
+	if forwardLead > maximumForwardLead or forwardLead < -contactConfig.MaximumBehindLead then
 		return "wait", rootPart
 	end
 	local lateral = (toBall - controlDirection * forwardLead).Magnitude
-	if lateral > contactConfig.MaximumLateralOffset then
+	if lateral > maximumLateral then
 		return "wait", rootPart
 	end
 	return "contact", rootPart

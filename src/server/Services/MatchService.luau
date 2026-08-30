@@ -231,6 +231,12 @@ function MatchService.IsPlaying(): boolean
 	return state == MatchConfig.States.Playing
 end
 
+-- Which mode the current session is running. Services read this to ask the
+-- mode what it uses, rather than hardcoding mode ids of their own.
+function MatchService.GetMode(): string?
+	return currentMode
+end
+
 function MatchService.GetState(): string
 	return state
 end

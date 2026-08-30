@@ -30,6 +30,31 @@ local AIConfig = {
 		Possession = "Beyond90AIHasPossession",
 	},
 
+	--[[
+		WHERE A FOOTBALLER'S ROOT SITS WHEN IT IS PLACED ON THE PITCH.
+
+		This was a bare `+ 5` written inline at two call sites, and it is the
+		reason everybody in a 3v3 started the match standing IN the grass. The
+		grounding validator measured it precisely:
+
+			3v3       rootY=5.200  leftFootBottomY=0.171  clearanceError=-0.459
+			Training  rootY=5.565  leftFootBottomY=0.477  clearanceError=-0.153
+
+		The pitch surface sits at 0.2 and the target clearance is 0.130 above
+		ground level 0.500, so the feet want to land at 0.630 -- which puts the
+		root 5.459 above the surface, not 5.000. Everyone placed by the match
+		assembly was therefore sunk almost half a stud into the turf before a
+		ball had been kicked, which is what the glitch before kick-off looks
+		like.
+
+		A constant is legitimate here BECAUSE every footballer is built to the
+		same standardised rig (see PlayerConfig.Appearance) -- but it has to be
+		the right constant, named, and stated once rather than guessed twice.
+	]]
+	Spawn = {
+		RootHeightAboveSurface = 5.46,
+	},
+
 	Cadence = {
 		PerceptionInterval = 0.15,
 		ReactionDelay = 0.18,
@@ -342,6 +367,25 @@ local AIConfig = {
 			holding on progressively less attractive rather than forbidding it.
 		]]
 		LongPossessionSeconds = 5,
+		--[[
+			A HARD CEILING ON HOW LONG AN AI MAY CARRY.
+
+			LongPossessionSeconds relaxes the pass thresholds as possession wears
+			on, and squaring the factor means it builds slowly and then bites --
+			which is the right shape. What it cannot do is guarantee an outcome:
+			the factor is clamped at 1 after five seconds, so a carrier whose
+			options are all genuinely poor gets no further relief and simply
+			dribbles, indefinitely, until somebody takes it off them.
+
+			That is what the long-carry reports look like on the pitch: one bot
+			running with the ball while nine team-mates make runs nobody uses.
+
+			Past this ceiling the carrier must do something. It takes the best
+			pass on offer whatever the odds, and clears if there is genuinely
+			nothing. Both are ordinary football actions through the ordinary
+			validated paths -- this only removes the option of doing neither.
+		]]
+		MaximumCarrySeconds = 9,
 		LongPossessionThresholdRelief = 0.05,
 		LongPossessionMinimumRelief = 0.1,
 

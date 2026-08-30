@@ -18,6 +18,7 @@
 	Nothing here talks to a service or holds state. Screens own their data; this
 	owns how it looks.
 ]]
+local UserInputService = game:GetService("UserInputService")
 local GuiService = game:GetService("GuiService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -154,6 +155,120 @@ function MenuKit.ProgressBar(props)
 				props.GradientStart or Theme.AccentCyan,
 				props.GradientEnd or Theme.AccentViolet
 			),
+		}),
+	})
+end
+
+--[[
+	A SLIDER.
+
+	Built on the ProgressBar treatment rather than as a new visual language --
+	same track colour, same corner radius, same accent gradient on the fill --
+	so a value the player can drag reads as the same family of control as a value
+	they can only look at. That is "reuse before create" applied to the one place
+	the design system genuinely had a gap.
+
+	Interaction is deliberately plain: press or drag anywhere on the track and
+	the value follows the pointer. That works identically for a mouse and for a
+	thumb, which is why there is no separate touch path -- Roblox's InputBegan /
+	InputChanged already unify them.
+
+	The whole row is the hit area, not just the visible bar, so the touch target
+	comfortably clears the 44-pixel minimum even though the bar itself is thin.
+]]
+function MenuKit.Slider(props)
+	local fill = math.clamp(props.Value or 0, 0, 1)
+	local mobile = props.Mobile == true
+	local trackRef = React.useRef(nil)
+
+	local function valueFromX(x: number)
+		local track = trackRef.current
+		if not track then
+			return nil
+		end
+		local width = track.AbsoluteSize.X
+		if width <= 0 then
+			return nil
+		end
+		local alpha = math.clamp((x - track.AbsolutePosition.X) / width, 0, 1)
+		local step = props.Step
+		if typeof(step) == "number" and step > 0 then
+			alpha = math.floor(alpha / step + 0.5) * step
+		end
+		return math.clamp(alpha, 0, 1)
+	end
+
+	local function commit(x: number)
+		local value = valueFromX(x)
+		if value ~= nil and props.OnChanged then
+			props.OnChanged(value)
+		end
+	end
+
+	return React.createElement("Frame", {
+		AnchorPoint = props.AnchorPoint,
+		Position = props.Position,
+		Size = props.Size,
+		BackgroundTransparency = 1,
+		ZIndex = props.ZIndex or 5,
+	}, {
+		-- Full-height invisible button: the grabbable area, sized for a thumb.
+		Hit = React.createElement("TextButton", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			Text = "",
+			AutoButtonColor = false,
+			ZIndex = (props.ZIndex or 5) + 3,
+			[React.Event.InputBegan] = function(_, input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1
+					or input.UserInputType == Enum.UserInputType.Touch
+				then
+					commit(input.Position.X)
+				end
+			end,
+			[React.Event.InputChanged] = function(_, input)
+				-- Dragging: MouseMovement only counts while the button is held,
+				-- which Roblox reports through the same event for touch.
+				if input.UserInputType == Enum.UserInputType.Touch then
+					commit(input.Position.X)
+				elseif input.UserInputType == Enum.UserInputType.MouseMovement
+					and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+				then
+					commit(input.Position.X)
+				end
+			end,
+		}),
+		Track = React.createElement("Frame", {
+			ref = trackRef,
+			AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.fromScale(0, 0.5),
+			Size = UDim2.new(1, 0, 0, if mobile then 8 else 9),
+			BackgroundColor3 = Color3.fromRGB(24, 33, 62),
+			BorderSizePixel = 0,
+			ZIndex = props.ZIndex or 5,
+		}, {
+			Corner = ReactUI.Corner(20),
+			Fill = React.createElement("Frame", {
+				Size = UDim2.fromScale(fill, 1),
+				BackgroundColor3 = Theme.Accent,
+				BorderSizePixel = 0,
+				ZIndex = (props.ZIndex or 5) + 1,
+				Visible = fill > 0.001,
+			}, {
+				Corner = ReactUI.Corner(20),
+				Gradient = ReactUI.Gradient(Theme.AccentCyan, Theme.AccentViolet),
+			}),
+			Knob = React.createElement("Frame", {
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromScale(fill, 0.5),
+				Size = UDim2.fromOffset(if mobile then 16 else 18, if mobile then 16 else 18),
+				BackgroundColor3 = Theme.Text,
+				BorderSizePixel = 0,
+				ZIndex = (props.ZIndex or 5) + 2,
+			}, {
+				Corner = ReactUI.Corner(100),
+				Stroke = ReactUI.Stroke(Theme.AccentCyan, 1.5, 0.2),
+			}),
 		}),
 	})
 end

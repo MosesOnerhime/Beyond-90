@@ -279,16 +279,34 @@ local GoalkeeperConfig = {
 		DiveCooldown = 0.35,
 
 		--[[
-			Positioning assistance, applied on the client when the player is not
-			steering. It is a DRIFT toward the correct line, not a snap, so a
-			keeper who wants to come off their line can, and one who is not paying
-			attention is still roughly where they should be.
+			HOW FAST THE KEEPER'S BODY TRACKS THE BALL.
+
+			A human keeper's facing is pinned to the football rather than to the
+			direction they are running (MovementController.updateGoalkeeperFacing),
+			so they shuffle across their line and back off toward the goal without
+			ever turning their back on the play -- which is both what a goalkeeper
+			does and what makes the backward and sideways jog clips select at all.
+
+			Eased rather than snapped, at roughly the rate the reception facing
+			uses, so tracking a ball across the box reads as a keeper turning
+			their shoulders and not as the model spinning.
 		]]
-		PositionAssistSpeed = 9,
-		PositionAssistDeadzone = 1.6,
-		-- Beyond this the assist is off; the player has clearly gone somewhere
-		-- deliberately and must walk back themselves.
-		PositionAssistMaximumDistance = 22,
+		FacingResponsiveness = 9,
+
+		--[[
+			POSITIONING ASSISTANCE IS GONE.
+
+			`PositionAssistSpeed`, `PositionAssistDeadzone` and
+			`PositionAssistMaximumDistance` used to drift the player toward the
+			server's resting position whenever they were not steering. Removed at
+			the player's request, and correctly so: angle and depth ARE the
+			goalkeeping skill, so assisting them assists the decision rather than
+			its execution, which is the line AGENTS.md §2 draws. A human keeper now
+			stands exactly where they choose to stand.
+
+			The server still publishes RestingPosition, because the AI keeper
+			needs somewhere to stand.
+		]]
 
 		-- How long the keeper may hold before distribution is forced.
 		HoldPromptSeconds = 0.6,
@@ -313,6 +331,35 @@ local GoalkeeperConfig = {
 		Enabled = true,
 		LogInterval = 2,
 	},
+}
+
+--[[
+	HANDLING OUTSIDE THE PENALTY AREA.
+
+	A goalkeeper's hands are only a privilege inside their own penalty area.
+	Outside it they are an outfield player, and picking the ball up is a direct
+	free kick to the opposition -- one of the few laws in football with no
+	judgement in it at all.
+
+	Nothing here needs a new possession state: the keeper's hold IS the handling,
+	so refusing the hold and awarding the free kick at the same point covers the
+	whole offence. The automatic claims (the AI keeper's, and a human keeper's
+	assisted gather) additionally check the area BEFORE they attempt anything, so
+	a keeper who is simply positioned high up the pitch is never penalised for a
+	ball rolling past them -- only a deliberate handling attempt is.
+]]
+GoalkeeperConfig.Handling = {
+	Enabled = true,
+	--[[
+		Small tolerance on the penalty-area test, in normalized half-length /
+		half-width, so a keeper standing exactly on the line is not punished for
+		replication jitter. Football gives the benefit of the doubt on the line
+		too: the line is part of the area.
+	]]
+	AreaMargin = 0.012,
+	-- Guards against a keeper repeatedly attempting a handle in the same second
+	-- turning into a stream of free kicks.
+	FoulCooldown = 2.5,
 }
 
 return GoalkeeperConfig

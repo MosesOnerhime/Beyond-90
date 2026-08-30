@@ -44,14 +44,62 @@ end)
 player:SetAttribute("Beyond90MenuSurfaceMounted", false)
 player:SetAttribute("Beyond90MenuReady", false)
 
+--[[
+	THE PRESENTATION IS BUILT DETACHED, AND ATTACHED ONLY WHEN IT CAN BE SEEN.
+
+	This is the root cause of "the intro never plays". It took a screen capture
+	to find, because every log said it was working.
+
+	A ScreenGui parented from ReplicatedFirst does not survive as a drawable
+	surface. Traced at the moment the Drixil stage began:
+
+		guiEnabled=true cover=true coverAlpha=0.00 coverSize=0, 0
+
+	Zero pixels wide -- enabled, visible, opaque black, and attached to nothing
+	that is rendered. Every stage then ran perfectly on a canvas with no
+	dimensions, at a healthy 60 FPS, which is exactly why the screen showed the
+	sky straight through where the cover should have been while the log looked
+	clean.
+
+	Three repair attempts failed and each was informative:
+
+	  * re-parenting gives "The Parent property of Beyond90StartupLoading is
+	    locked, current parent: NULL" -- confirming the orphaning outright;
+	  * moving the children fails for the same reason, since ReplicatedFirst
+	    instances are parent-locked wholesale;
+	  * attaching to a freshly found PlayerGui measures correctly at first and
+	    then returns to 0 x 0 a moment later.
+
+	Meanwhile a ScreenGui created once the client is up measures correctly every
+	time. So the fix is to stop attaching early at all: the whole presentation is
+	assembled with no parent -- which is legal, keeps every instance unlocked,
+	and costs nothing -- and is attached to a live PlayerGui only once the client
+	is genuinely rendering.
+
+	Nothing is uncovered in the meantime, because Roblox's own default loading
+	screen is deliberately left up until our cover is proven to have pixels.
+]]
 local playerGui = player:WaitForChild("PlayerGui")
-local gui = Instance.new("ScreenGui")
+
+--[[
+	The ident is built into a CLIENT-OWNED ScreenGui, created by ClientBootstrap.
+
+	See the long note there for why: a ScreenGui parented into PlayerGui by a
+	ReplicatedFirst script is adopted by Roblox as the loading screen and is
+	un-parented and permanently locked the moment loading completes, which is
+	several seconds before a branding sequence has finished. Everything drawn
+	after that point went into an orphan -- visible in the trace as coverSize
+	going from 1170x550 to 0x0 between the two stages.
+
+	Detached until it is attached below, so nothing is ever parented into a
+	PlayerGui that might be discarded.
+]]
+local gui: ScreenGui = Instance.new("ScreenGui")
 gui.Name = "Beyond90StartupLoading"
 gui.IgnoreGuiInset = true
 gui.ResetOnSpawn = false
 gui.DisplayOrder = 2147483647
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
-gui.Parent = playerGui
 
 local background = Instance.new("Frame")
 background.Size = UDim2.fromScale(1, 1)
@@ -59,14 +107,71 @@ background.BackgroundColor3 = Color3.fromRGB(2, 3, 8)
 background.BorderSizePixel = 0
 background.Parent = gui
 
-local backgroundGradient = Instance.new("UIGradient")
-backgroundGradient.Color = ColorSequence.new({
-	ColorSequenceKeypoint.new(0, Color3.fromRGB(2, 3, 8)),
-	ColorSequenceKeypoint.new(0.55, Color3.fromRGB(5, 8, 18)),
-	ColorSequenceKeypoint.new(1, Color3.fromRGB(9, 5, 19)),
-})
-backgroundGradient.Rotation = 18
-backgroundGradient.Parent = background
+--[[
+	Attach the finished surface to whichever PlayerGui is live, and report
+	whether it actually gained pixels.
+]]
+local lastAttachDiagnostic = "not attempted"
+
+local function attachSurface(): boolean
+	local livePlayerGui = player:FindFirstChildOfClass("PlayerGui")
+	if not livePlayerGui then
+		lastAttachDiagnostic = "no live PlayerGui"
+		return false
+	end
+
+	--[[
+		ATTACH INTO THE CLIENT-OWNED SURFACE.
+
+		`Beyond90StartupSurface` is created by ClientBootstrap, which Roblox does
+		not treat specially, so a GUI inside it survives the end of loading. Our
+		own ScreenGui is parented into it rather than into PlayerGui directly --
+		which is the parenting Roblox adopts and then destroys.
+
+		Falls back to PlayerGui if the surface is somehow unavailable. That path
+		is the old behaviour and will still lose the ident at the end of loading,
+		but a first stage that draws beats a sequence that never appears at all.
+	]]
+	local host: Instance = livePlayerGui
+	local clientSurface = livePlayerGui:FindFirstChild("Beyond90StartupSurface")
+	if clientSurface and clientSurface:IsA("ScreenGui") then
+		host = clientSurface
+	end
+
+	if gui.Parent == host then
+		--[[
+			Already attached to the PlayerGui that is live, and still without
+			pixels. Re-setting the same parent achieves nothing, so say so
+			plainly rather than reporting a failed attach that never happened.
+		]]
+		RunService.Heartbeat:Wait()
+		if background.AbsoluteSize.X > 1 and background.AbsoluteSize.Y > 1 then
+			lastAttachDiagnostic = "already attached, has pixels"
+			return true
+		end
+		lastAttachDiagnostic = string.format(
+			"attached to %s but measuring %s (viewport %s)",
+			host.Name,
+			tostring(background.AbsoluteSize),
+			if Workspace.CurrentCamera then tostring(Workspace.CurrentCamera.ViewportSize) else "no camera"
+		)
+		return false
+	end
+	local ok, failure = pcall(function()
+		gui.Parent = host
+	end)
+	if not ok then
+		lastAttachDiagnostic = "parent rejected: " .. tostring(failure)
+		return false
+	end
+	RunService.Heartbeat:Wait()
+	if background.AbsoluteSize.X > 1 and background.AbsoluteSize.Y > 1 then
+		lastAttachDiagnostic = "re-attached, has pixels"
+		return true
+	end
+	lastAttachDiagnostic = string.format("re-attached but measuring %s", tostring(background.AbsoluteSize))
+	return false
+end
 
 --[[
 	Parenting the cover is not the same as the cover having been drawn. Removing
@@ -78,6 +183,43 @@ backgroundGradient.Parent = background
 	inside ReplicatedFirst, before the client has loaded, RenderStepped may not
 	fire at all, and an unconditional wait here hangs the entire startup.
 ]]
+--[[
+	KEEP THE SURFACE ALIVE FOR THE WHOLE SEQUENCE, NOT JUST ITS FIRST FRAME.
+
+	Attaching once and assuming it holds is not enough, and the self-trace caught
+	exactly why. On a cold start the two stages reported:
+
+		Drixil    coverSize=1170.40002, 550.400024
+		Beyond90  coverSize=0, 0
+
+	Same ScreenGui, same Enabled flag, same everything -- and no pixels by the
+	second stage. The PlayerGui that was live when the ident began had been
+	discarded and replaced underneath it, which is the same failure the original
+	attach was written to survive; it simply happens LATER as well as earlier,
+	once the client finishes loading.
+
+	So the surface is re-verified, and re-attached to whatever PlayerGui is live
+	now, before each stage draws. Cheap -- one AbsoluteSize read in the common
+	case -- and it converts a silently invisible ident into one that repairs
+	itself.
+
+	Returns whether the surface has pixels afterwards, so a caller can log the
+	truth rather than assume it.
+]]
+local function ensureSurface(): boolean
+	if background.AbsoluteSize.X > 1 and background.AbsoluteSize.Y > 1 then
+		return true
+	end
+	for _ = 1, 10 do
+		if attachSurface() then
+			return true
+		end
+		task.wait(0.05)
+	end
+	player:SetAttribute("Beyond90StartupSurfaceDiagnostic", lastAttachDiagnostic)
+	return false
+end
+
 local function presentCoverFrames(count: number, timeout: number)
 	local startedAt = os.clock()
 	for _ = 1, count do
@@ -109,8 +251,15 @@ local function presentCoverFrames(count: number, timeout: number)
 	return true
 end
 
-local coverPresented = presentCoverFrames(2, 0.75)
-ReplicatedFirst:RemoveDefaultLoadingScreen()
+--[[
+	ROBLOX'S LOADING SCREEN STAYS UP UNTIL OUR COVER IS REAL.
+
+	Removing it here is what uncovered the world -- the sky flash. Our surface is
+	not even attached yet at this point, so removing Roblox's cover now would
+	leave nothing in front of the camera at all. It is removed further down, the
+	moment our own cover is attached AND measured.
+]]
+local coverPresented = false
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ExperienceConfig = require(Shared.Config.ExperienceConfig)
@@ -228,6 +377,25 @@ local presentsLetters, presentsRow = buildWordmark(
 	math.max(math.floor(10 * brandScaleFactor), 4),
 	0.572
 )
+
+--[[
+	The card's resting position, and the small offset it settles up from.
+
+	Held as values rather than as a UIScale on purpose -- see
+	ExperienceConfig.Intro.DrixilSettleOffset for why scaling this particular
+	content is expensive and moving it is free.
+
+	Both rows share one offset and one duration so the wordmark and PRESENTS
+	arrive as a single card rather than as two independently animated lines.
+]]
+local drixilSettleOffset = math.max(
+	math.floor(ExperienceConfig.Intro.DrixilSettleOffset * brandScaleFactor),
+	1
+)
+local brandRestPosition = brandRow.Position
+local presentsRestPosition = presentsRow.Position
+brandRow.Position = brandRestPosition + UDim2.fromOffset(0, drixilSettleOffset)
+presentsRow.Position = presentsRestPosition + UDim2.fromOffset(0, drixilSettleOffset)
 
 local logo = Instance.new("CanvasGroup")
 logo.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -587,79 +755,278 @@ end)
 --[[
 	THE MENU BUILDS BEHIND THE BRANDING (§10).
 
-	`Beyond90StartupReadyForMenu` is what releases HomeScreen to build its
-	footballer and UIController to mount. It used to be set after the Beyond 90
-	stage had finished, so the menu only STARTED preparing once the branding was
-	over and the player then waited again for it.
+	Its IMAGES are fetched here, because that is pure network work with nothing
+	on screen to show for it and the loading window is free time.
 
-	Released here, the menu mounts, lays out, preloads its images and readies its
-	character while the idents play. It stays fully hidden behind the opaque
-	cover -- the reveal is still gated on the cover fading at the very end -- so
-	nothing is shown early.
+	Its REVEAL is not released here, and that distinction is the bug that was
+	visible as a flash of menu immediately before the ident.
+
+	`Beyond90StartupReadyForMenu` does not merely permit the menu to build -- the
+	menu builds on mount regardless. What it actually does is start HomeScreen's
+	2.25-second reveal tween. Setting it at this point was safe only while the
+	cover was attached from the first instant; now that the cover cannot hold
+	pixels until the client viewport exists, there is a real window here in which
+	Roblox has dropped its own loading screen, our cover is not up yet, and the
+	menu is already fading in. The player sees the menu, and then the intro
+	covers it back up.
+
+	So the release moves to the far side of the attach, below. The menu still
+	spends the entire branding sequence getting ready; it simply cannot begin
+	showing itself until there is something in front of it.
 ]]
-player:SetAttribute("Beyond90StartupReadyForMenu", true)
 task.spawn(preloadMenuAssets)
 
 --[[
-	THE IDENT DOES NOT BEGIN UNTIL THE SCREEN IS ACTUALLY BEING DRAWN.
+	THE IDENT DOES NOT BEGIN UNTIL THE SCREEN IS GENUINELY BEING PRESENTED.
 
-	This was `waitForFrames(2, 0.5)`, and that bound is the reason the branding
-	could play to nobody. RenderStepped does not fire at all inside
-	ReplicatedFirst until the client has finished loading -- the earlier
-	`presentCoverFrames` had to be rewritten onto Heartbeat for exactly that
-	reason -- so a 0.5s budget expires having seen ZERO frames and the sequence
-	starts anyway. The tweens then run against wall clock while the display is
-	still frozen on whatever it last drew, and by the time frames resume the
-	ident has been and gone. The console shows a correct 1.78s Drixil stage; the
-	screen never showed it.
+	This gate has now been wrong twice, in two different ways, and the second way
+	is only visible from an actual screen capture rather than from a log.
 
-	So the gate is now the real condition -- sustained presented frames -- and it
-	is given a budget long enough to actually be met. Two further conditions ride
-	along with it:
+	Attempt one waited for two RenderStepped frames with a 0.5s budget.
+	RenderStepped does not fire at all in ReplicatedFirst before the client has
+	loaded, so the budget expired having seen zero frames and the ident played
+	against a frozen display.
 
-	  * `game:IsLoaded()`, because a DataModel still loading produces exactly the
-	    stutter that makes a staggered type reveal look broken.
-	  * the menu having MOUNTED, because that build is the single heaviest thing
-	    on this client (measured: one 1.43-second frame). Paying it here, against
-	    the black cover, costs nothing visible; paying it during the reveal turns
-	    the fade into a jump.
+	Attempt two waited for six frames. It reported "render ready in 5.19s, 6
+	frames" and looked fixed. Capturing the Studio window during startup shows
+	what that number actually meant: six frames in 5.19 seconds is 1.2 FPS. The
+	session was stepping, but the viewport was not being presented -- Studio was
+	still showing the Edit view, and swapped to the play viewport about seven
+	seconds in, by which point the ident had been and gone.
 
-	None of this serialises the slow part: the asset preload and the menu build
-	were both released above and run underneath this wait.
+	A COUNT of frames cannot tell those apart. A RATE can: a viewport nobody is
+	looking at ticks over at a frame or two per second, and one that is genuinely
+	on screen runs at tens. So this waits for a sustained real frame rate, which
+	is the closest honest proxy available for "a person can see this now", and it
+	is satisfied almost immediately in a real client.
+
+	Note what is deliberately NOT here any more: the menu-mounted condition. The
+	startup contract is supposed to be that the ident begins as soon as the
+	startup UI can render, with the menu building behind it -- gating the ident on
+	the menu inverted that, and stacking readiness conditions onto a brittle intro
+	is what made it fragile in the first place.
 ]]
-local function waitForPresentation(timeout: number): (boolean, number, number)
+local function waitForLivePresentation(timeout: number): (boolean, number, number)
 	local startedAt = os.clock()
+	local healAttempts = 0
+	local lastHealAt = 0
 	local frames = 0
+	local windowStartedAt = os.clock()
+	local windowFrames = 0
+	local bestRate = 0
 	local connection = RunService.RenderStepped:Connect(function()
 		frames += 1
+		windowFrames += 1
 	end)
 	while os.clock() - startedAt < timeout do
-		if frames >= 6
-			and game:IsLoaded()
-			and player:GetAttribute("Beyond90MenuSurfaceMounted") == true
-		then
-			break
+		--[[
+			THE DECISIVE CONDITION: DOES THE COVER HAVE A SIZE?
+
+			This is what was actually wrong, and no amount of frame counting would
+			have found it. Tracing the rendered objects at the moment the Drixil
+			stage began reported:
+
+				guiEnabled=true cover=true coverAlpha=0.00 coverSize=0, 0
+
+			The cover was enabled, opaque and visible -- and zero pixels wide. A
+			ScreenGui's children measure against the viewport, and inside
+			ReplicatedFirst the PlayerGui exists before the client's viewport does,
+			so `Size = fromScale(1, 1)` resolves to nothing. Every stage then ran
+			perfectly, on a canvas with no dimensions, drawing nothing at all --
+			which is exactly why the logs looked healthy while the screen showed the
+			sky straight through where the black cover was supposed to be.
+
+			A non-zero AbsoluteSize is direct evidence that this GUI occupies real
+			pixels. Nothing is allowed to start before it does.
+		]]
+		--[[
+			The surface is still detached at this point, so there is nothing to
+			measure yet. What is being waited for is the CLIENT being live enough
+			that attaching will work -- a real viewport, the DataModel loaded, and
+			a genuine frame rate. The attach and its proof happen immediately
+			after this loop.
+		]]
+		local camera = Workspace.CurrentCamera
+		local laidOut = camera ~= nil and camera.ViewportSize.Y > 1
+
+		--[[
+			And a live frame RATE, not a frame count.
+
+			The previous attempt waited for six frames and reported "6 frames in
+			5.19s" as success. That is 1.2 FPS -- the signature of a viewport that is
+			stepping but not being presented to anyone, which is precisely what
+			Studio does while it is still showing the Edit view. A rate tells the two
+			apart; a count cannot.
+		]]
+		local elapsed = os.clock() - windowStartedAt
+		if elapsed >= 0.4 then
+			local rate = windowFrames / elapsed
+			bestRate = math.max(bestRate, rate)
+			if laidOut and rate >= 12 and game:IsLoaded() then
+				break
+			end
+			windowStartedAt = os.clock()
+			windowFrames = 0
 		end
 		task.wait()
 	end
 	connection:Disconnect()
-	return frames >= 6, frames, os.clock() - startedAt
+	return bestRate >= 12, bestRate, os.clock() - startedAt
 end
 
-local presenting, presentedFrames, presentationWait = waitForPresentation(6)
+local presenting, presentedRate, presentationWait = waitForLivePresentation(12)
+
+--[[
+	ATTACH, and only now stop relying on Roblox's loading screen.
+
+	Retried briefly: the first PlayerGui offered during startup is sometimes the
+	one that gets discarded, and attaching to that is what produced a cover with
+	no pixels. A surface that measures is the only accepted proof.
+]]
+--[[
+	RELEASE THE LOADING-SCREEN SLOT *BEFORE* ATTACHING. THIS ORDER IS THE FIX.
+
+	The ident was playing its first stage correctly and then going blank, and the
+	self-trace and the attach diagnostic together said exactly why:
+
+		Drixil    coverSize=1170.40002, 550.400024
+		Beyond90  coverSize=0, 0
+		attach    "The Parent property of Beyond90StartupLoading is locked,
+		           current parent: NULL, new parent PlayerGui"
+
+	Parent NULL, and locked. Nothing in this script orphaned it -- ROBLOX did.
+
+	A ScreenGui parented into PlayerGui from ReplicatedFirst while Roblox is
+	still managing a loading screen is ADOPTED as that loading screen. Roblox
+	then owns its lifetime: when loading completes it un-parents it and locks the
+	instance, permanently, so it can never be re-attached. The first stage drew
+	because it ran before that moment; everything after it drew into an orphan.
+
+	`RemoveDefaultLoadingScreen` is what hands that slot back. Called FIRST,
+	Roblox has no loading screen to manage, and the GUI attached immediately
+	afterwards is an ordinary ScreenGui with an ordinary lifetime -- ours, for
+	as long as the sequence needs it.
+
+	Nothing is exposed by the reordering. This point is already past
+	`game:IsLoaded()` and a sustained real frame rate, the menu's own root frame
+	is mounted and opaque behind us, and the attach happens in the same frame,
+	so there is no window in which the pitch is visible.
+]]
+ReplicatedFirst:RemoveDefaultLoadingScreen()
+
+--[[
+	Wait, briefly, for the client-owned surface. ClientBootstrap creates it as
+	its very first act, so by this point -- past game:IsLoaded() and a sustained
+	frame rate -- it is normally already there. Bounded, because the fallback of
+	attaching straight to PlayerGui is still better than not drawing at all.
+]]
+do
+	local waitStartedAt = os.clock()
+	while os.clock() - waitStartedAt < 3 do
+		local livePlayerGui = player:FindFirstChildOfClass("PlayerGui")
+		if livePlayerGui and livePlayerGui:FindFirstChild("Beyond90StartupSurface") then
+			break
+		end
+		task.wait(0.05)
+	end
+end
+
+local attached = false
+for _ = 1, 20 do
+	if attachSurface() then
+		attached = true
+		break
+	end
+	task.wait(0.1)
+end
+coverPresented = attached
+if attached then
+	presentCoverFrames(2, 0.75)
+else
+	warn(string.format(
+		"[Beyond90][Client][Startup] Startup surface never gained pixels (%s)",
+		lastAttachDiagnostic
+	))
+end
+
+--[[
+	THE MENU MAY BUILD -- BUT NOT DURING A MOVING FRAME.
+
+	Releasing this is what lets the rest of the client start: StartupFallback is
+	blocked on it, and the moment it clears, ClientBootstrap runs
+	ExperienceFlowController.Initialize(), which mounts the entire React menu
+	tree (Home, its ViewportFrame and the character rig inside it) and builds
+	the audio bank. React's first mount is synchronous, so that is ONE very long
+	frame -- measured at 151ms, roughly nine frames' worth.
+
+	Released here, that frame landed precisely on the Drixil letter reveal,
+	because this line sits immediately before the stage that types the wordmark
+	on. A 151ms freeze in the middle of a 3.2-second type-on is exactly what
+	"the intro stutters" describes, and no amount of making the ANIMATION
+	cheaper can hide a stall that belongs to the whole client.
+
+	So the release moves to the one place in the sequence where a long frame
+	costs nothing: the static hold after every letter has arrived. Nothing is
+	moving then, and there is still roughly five seconds of ident left for the
+	menu to finish building behind -- it currently resolves with time to spare
+	("Menu readiness resolved in 0.00s").
+
+	The failure branch keeps the old behaviour. If the cover never gained
+	pixels there is no animation to protect, and the player must still reach a
+	usable menu.
+]]
+local menuBuildDeferred = coverPresented and presenting
+if not menuBuildDeferred then
+	player:SetAttribute("Beyond90StartupReadyForMenu", true)
+end
 if not presenting then
 	warn(string.format(
-		"[Beyond90][Client][Startup] Only %d frame(s) presented in %.2fs; the ident may not be visible",
-		presentedFrames,
+		"[Beyond90][Client][Startup] Client never reached a live display (cover %s, best %.1f FPS in %.2fs); the ident may not be visible",
+		tostring(background.AbsoluteSize),
+		presentedRate,
 		presentationWait
 	))
 end
+
+--[[
+	SELF-TRACE.
+
+	A log line saying a stage ran is not evidence that anything was on screen --
+	that is precisely the trap the last two attempts fell into. So each stage
+	records what was actually TRUE OF THE RENDERED OBJECTS at the moment it ran,
+	and leaves it on the player where it can be read after the fact.
+]]
+local function traceStage(stage: string, extra: string?)
+	local letter = brandLetters[1]
+	player:SetAttribute("Beyond90StartupTrace_" .. stage, string.format(
+		"guiEnabled=%s cover=%s coverAlpha=%.2f coverSize=%s brandRow=%s letterAlpha=%.2f logoVisible=%s logoAlpha=%.2f %s",
+		tostring(gui.Enabled),
+		tostring(background.Visible),
+		background.BackgroundTransparency,
+		tostring(background.AbsoluteSize),
+		tostring(brandRow.Visible),
+		if letter then letter.TextTransparency else -1,
+		tostring(logo.Visible),
+		logo.GroupTransparency,
+		extra or ""
+	))
+end
+
 print(string.format(
-	"[Beyond90][Client][Startup] Drixil Interactive Presents (render ready in %.2fs, %d frames, menuMounted=%s)",
+	"[Beyond90][Client][Startup] Drixil Interactive Presents (surface %s live in %.2fs at %.1f FPS)",
+	tostring(background.AbsoluteSize),
 	presentationWait,
-	presentedFrames,
-	tostring(player:GetAttribute("Beyond90MenuSurfaceMounted") == true)
+	presentedRate
 ))
+--[[
+	Re-verified here rather than trusted: the attach happened before the client
+	had finished loading, and the PlayerGui it attached to may not be the one
+	that is live now.
+]]
+if not ensureSurface() then
+	warn("[Beyond90][Client][Startup] Drixil stage has no drawable surface")
+end
+traceStage("Drixil")
 --[[
 	The Drixil stage: a staggered type reveal, a hold, then a fade.
 
@@ -701,16 +1068,73 @@ end
 local intro = ExperienceConfig.Intro
 local drixilStartedAt = os.clock()
 
+--[[
+	MEASURE THE STAGE, so "it stutters" becomes a number.
+
+	The stage already reported the frame rate it STARTED at, which is what made
+	the last diagnosis a guess: an average says nothing about a hitch, and a
+	single long frame in the middle of a two-second reveal is exactly what a
+	viewer calls stutter. So track the worst frame the stage actually served.
+
+	One Heartbeat connection holding three numbers -- cheap enough that it
+	cannot become part of the problem it exists to measure.
+]]
+local drixilRevealDoneAt = drixilStartedAt
+	+ #brandLetters * intro.DrixilLetterStagger
+	+ intro.DrixilRevealDuration
+
+local drixilFrames, drixilWorstMoving, drixilWorstStill = 0, 0, 0
+local drixilFrameConnection = RunService.Heartbeat:Connect(function(deltaTime: number)
+	drixilFrames += 1
+	--[[
+		Split at the end of the reveal, because the two windows have completely
+		different tolerances and one number cannot describe both. A long frame
+		while the letters are arriving is the stutter being reported; the same
+		frame during the static hold is invisible and is exactly where the
+		client's own startup work has been moved to.
+	]]
+	if os.clock() < drixilRevealDoneAt then
+		if deltaTime > drixilWorstMoving then
+			drixilWorstMoving = deltaTime
+		end
+	elseif deltaTime > drixilWorstStill then
+		drixilWorstStill = deltaTime
+	end
+end)
+
+--[[
+	The card settles into place as the letters arrive, then stops moving.
+
+	It finishes with the last letter rather than running through the hold. A
+	still card is the point of the hold -- and the less time any motion spends
+	over the heaviest part of startup, the less there is to drop a frame in.
+
+	Quint/Out, so almost all of the travel happens immediately and the last
+	pixel is a long way from the first: that is what reads as settling rather
+	than sliding.
+]]
+local drixilSettleDuration = #brandLetters * intro.DrixilLetterStagger
+	+ intro.DrixilRevealDuration
+tween(brandRow, drixilSettleDuration, { Position = brandRestPosition })
+tween(presentsRow, drixilSettleDuration, { Position = presentsRestPosition })
+
 revealLetters(brandLetters, intro.DrixilRevealDuration, 0, intro.DrixilLetterStagger)
 -- PRESENTS settles under the wordmark once the mark itself has arrived.
 task.delay(#brandLetters * intro.DrixilLetterStagger + 0.12, function()
 	revealLetters(presentsLetters, intro.DrixilRevealDuration * 0.8, 0.12, intro.DrixilLetterStagger * 0.6)
 end)
 
-local drixilHoldUntil = drixilStartedAt
-	+ #brandLetters * intro.DrixilLetterStagger
-	+ intro.DrixilRevealDuration
-	+ intro.DrixilHold
+--[[
+	Every letter has landed and the card has stopped moving. This is the quiet
+	window -- see the release note above for why the rest of the client is
+	deliberately started HERE rather than before the reveal.
+]]
+if menuBuildDeferred then
+	waitUntil(drixilRevealDoneAt)
+	player:SetAttribute("Beyond90StartupReadyForMenu", true)
+end
+
+local drixilHoldUntil = drixilRevealDoneAt + intro.DrixilHold
 waitUntil(drixilHoldUntil)
 fadeLetters(brandLetters, intro.DrixilFadeDuration)
 fadeLetters(presentsLetters, intro.DrixilFadeDuration)
@@ -725,9 +1149,16 @@ waitUntil(drixilHoldUntil + intro.DrixilFadeDuration + 0.05)
 ]]
 brandRow.Visible = false
 presentsRow.Visible = false
+drixilFrameConnection:Disconnect()
+local drixilElapsed = os.clock() - drixilStartedAt
 print(string.format(
-	"[Beyond90][Client][Startup] Drixil stage complete in %.2fs",
-	os.clock() - drixilStartedAt
+	"[Beyond90][Client][Startup] Drixil stage complete in %.2fs (%d frames, %.1f FPS mean, worst frame: reveal %.0fms / hold %.0fms, menuBuildDeferred=%s)",
+	drixilElapsed,
+	drixilFrames,
+	if drixilElapsed > 0 then drixilFrames / drixilElapsed else 0,
+	drixilWorstMoving * 1000,
+	drixilWorstStill * 1000,
+	tostring(menuBuildDeferred)
 ))
 task.wait(intro.StageGap)
 
@@ -768,7 +1199,17 @@ if not logoImageReady then
 		intro.LogoDecodeTimeout
 	))
 end
-print(string.format("[Beyond90][Client][Startup] Beyond 90 stage imageReady=%s", tostring(logoImageReady)))
+-- The stage that was measuring 0x0. See ensureSurface.
+local beyondSurfaceOk = ensureSurface()
+if not beyondSurfaceOk then
+	warn("[Beyond90][Client][Startup] Beyond 90 stage has no drawable surface")
+end
+print(string.format(
+	"[Beyond90][Client][Startup] Beyond 90 stage imageReady=%s surface=%s",
+	tostring(logoImageReady),
+	tostring(background.AbsoluteSize)
+))
+traceStage("Beyond90", string.format("imageReady=%s", tostring(logoImageReady)))
 
 --[[
 	Only NOW does the Beyond 90 group become visible, at full transparency, so
@@ -807,6 +1248,14 @@ waitUntil(beyondFadeStartedAt + intro.BeyondFadeInDuration + intro.BeyondHold
 -- intro logo and the Home screen must never be visible at the same time.
 logo.Visible = false
 logo.GroupTransparency = 1
+
+--[[
+	A beat of black before anything else happens.
+
+	The ident is finished; the menu has not started arriving. Without this the
+	two overlap and the fade-out reads as having been cut off by the handoff.
+]]
+task.wait(intro.PostBeyondHold)
 
 print(string.format(
 	"[Beyond90][Client][Startup] Beyond 90 stage complete in %.2fs (media preload %.2fs)",
@@ -872,6 +1321,9 @@ print(string.format(
 	screen forever. A missed frame only costs a slightly less clean handoff.
 ]]
 waitForFrames(2, 1)
+-- A cover that has lost its surface cannot fade off it, and the handoff would
+-- read as the menu appearing abruptly out of nothing.
+ensureSurface()
 tween(background, ExperienceConfig.StartupHandoffDuration, { BackgroundTransparency = 1 }, Enum.EasingStyle.Sine)
 task.wait(ExperienceConfig.StartupHandoffDuration + 0.05)
 gui:Destroy()

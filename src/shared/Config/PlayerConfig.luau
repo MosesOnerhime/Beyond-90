@@ -1,7 +1,23 @@
 local PlayerConfig = {
 	Movement = {
-		BaseSpeed = 14,
-		SprintSpeed = 28,
+		--[[
+			PACE.
+
+			The pitch is 343 studs long over a 110-metre field, so a stud is
+			about 0.32 metres and these convert cleanly to real football speeds:
+			16 studs/s is roughly 5.1 m/s (a purposeful jog) and 31 studs/s is
+			roughly 10.0 m/s (an elite sprint). The previous 14 and 28 were 4.5
+			and 9.0 -- correct for a club footballer and slightly slow for a
+			GAME, where the reference titles all sit at or above the top of the
+			real range because a match compressed into a few minutes on a
+			readable pitch needs to move.
+
+			AI speeds are derived from these two values, so a pace change moves
+			both sides of the pitch together rather than quietly making bots
+			faster or slower than the humans they play against.
+		]]
+		BaseSpeed = 16,
+		SprintSpeed = 31,
 		JumpEnabled = true,
 		JumpPower = 19,
 		JumpHeight = 0,
@@ -17,10 +33,30 @@ local PlayerConfig = {
 	Locomotion = {
 		RawInputDeadzone = 0.05,
 		StopSpeed = 0.15,
+		--[[
+			STOPPING WAS THE REAL REASON IT FELT SLOW.
+
+			These are seconds to traverse the reference speed, so the old 2.2
+			meant a footballer at full sprint took over two seconds and around 24
+			studs -- nearly eight metres -- to come to a halt. That is skating,
+			and AGENTS.md rules it out in as many words: "stopping should produce
+			visible but short deceleration rather than an instantaneous freeze or
+			long skating motion".
+
+			It is also the single thing most responsible for the game feeling
+			sluggish, more than top speed ever was. Every stop, every check, every
+			change of pace and every arrival at the ball was spent sliding. A
+			player who cannot stop cannot feel fast, however quickly they run.
+
+			At 0.95 a sprint stops in roughly 13 studs -- about four metres, which
+			is what a real footballer needs and what the reference games show.
+			Deceleration is still visible and still has weight; it simply no
+			longer outlasts the moment that caused it.
+		]]
 		AccelerationTime = 0.12,
-		DecelerationTime = 2.2,
+		DecelerationTime = 0.85,
 		SprintAccelerationTime = 0.28,
-		SprintDecelerationTime = 1.7,
+		SprintDecelerationTime = 0.95,
 		TurnAccelerationTime = 0.18,
 		ReverseAccelerationTime = 0.28,
 		TurnSpeedLossAt90 = 0.18,
@@ -32,11 +68,25 @@ local PlayerConfig = {
 			MajorAngleDegrees = 60,
 			SevereAngleDegrees = 120,
 			MinimumPreparationSeconds = 0.08,
-			SmallCorrectionMaximumWaitSeconds = 0.2,
-			JogModerateMaximumWaitSeconds = 0.35,
-			SprintModerateMaximumWaitSeconds = 0.45,
-			JogMaximumWaitSeconds = 0.5,
-			SprintMaximumWaitSeconds = 0.65,
+			--[[
+				CEILINGS ON HOW LONG A TURN MAY WAIT FOR A TOUCH.
+
+				These are fallbacks, not typical waits -- a turn commits as soon
+				as the next contact happens, and usually does. But a ceiling is
+				still a ceiling: at 0.65 seconds a sprint reversal that missed its
+				touch window left the player pointing the old way for two thirds
+				of a second, which reads as the input having been ignored.
+
+				AGENTS.md is explicit that "a 180-degree reversal should not place
+				the player into a long slow-motion state", so every band is pulled
+				in. The preparation minimum is untouched: some preparation is what
+				makes a turn with the ball look like football rather than a pivot.
+			]]
+			SmallCorrectionMaximumWaitSeconds = 0.16,
+			JogModerateMaximumWaitSeconds = 0.26,
+			SprintModerateMaximumWaitSeconds = 0.32,
+			JogMaximumWaitSeconds = 0.36,
+			SprintMaximumWaitSeconds = 0.44,
 			ContactLeadDistance = 3.8,
 			ContactRelativeSpeed = 10,
 		},
@@ -136,7 +186,33 @@ local PlayerConfig = {
 		RemoveBodyPackageParts = false,
 		IntendedHeightStuds = 6,
 		HeightTestOptionsStuds = { 6, 6.25, 6.5 },
-		DevelopmentFootballerScaleEnabled = true,
+
+		--[[
+			HEIGHT IS THE PLATFORM'S TO DECIDE, NOT THIS FILE'S.
+
+			Luau was forcing every footballer to 8.27 studs by measuring the rig
+			after it spawned and calling ScaleTo on the difference. That is the
+			wrong layer to own a body in. Roblox already has one place where an
+			experience declares what its avatars look like -- the Avatar Settings
+			the project owner configures -- and a script that measures the result
+			and overrides it means the setting no longer means anything.
+
+			MEASURED, in this place, at the standardised scales below: the R15
+			build Roblox actually produces is 6.088 studs tall (root part 2.0,
+			hip height 2.642). The forced target was inflating every footballer by
+			roughly 36%, which is also why the pitch, the goals and the ball have
+			all read slightly small next to the players.
+
+			WHAT IS DELIBERATELY KEPT is the STANDARDISED COMPETITIVE BUILD. Every
+			scale immediately above stays pinned to 1, so a player whose own
+			avatar is unusually tall, short, wide or narrow still plays as the
+			same physical footballer as everyone else. That is not cosmetic
+			enforcement -- control distance, tackle reach, shot contact radius,
+			interception reach and body exclusion are all measured in studs from
+			the root part, so a taller collider would be a genuine competitive
+			advantage. Appearance is the player's; the frame is everyone's.
+		]]
+		DevelopmentFootballerScaleEnabled = false,
 		DevelopmentFootballerTargetHeightStuds = 8.27,
 
 		--[[

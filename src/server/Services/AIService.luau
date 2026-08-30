@@ -1049,6 +1049,24 @@ local function decidePossession(actor, teamModel)
 		/ math.max(pitchState.Length * 0.5, 1)
 	local desperate = pitchProgress <= AIConfig.Clearance.DefensiveProgressThreshold
 		and pressure <= AIConfig.Clearance.PressureDistance
+	--[[
+		The carry ceiling. See AIConfig.Decision.MaximumCarrySeconds: relaxing the
+		thresholds is not the same as guaranteeing a decision, and a carrier with
+		uniformly poor options previously had none forced on it.
+	]]
+	if possessionAge >= decision.MaximumCarrySeconds then
+		if receiver then
+			queueAction(actor, "Pass", function()
+				FootballActionService.ExecuteAIPass(actor, receiver, actionType or AIConfig.Passing.ActionType)
+			end)
+		else
+			queueAction(actor, "Clearance", function()
+				FootballActionService.ExecuteAIShot(actor, true)
+			end)
+		end
+		return
+	end
+
 	if desperate and (not receiver or passOdds < decision.PanicPassOdds) then
 		queueAction(actor, "Clearance", function()
 			FootballActionService.ExecuteAIShot(actor, true)
@@ -1091,12 +1109,34 @@ function tryAITackle(actor, teamModel)
 	end
 	if ball:GetAttribute("State") ~= "Controlled" or ball:GetAttribute("GoalkeeperHeld") == true then
 		actor.TackleIntentAt = nil
+		actor.ContainingSince = nil
 		return
 	end
 	local distanceToBall = BallControlMath.GetHorizontal(ball.Position - actor.RootPart.Position).Magnitude
 	if distanceToBall > DefendingConfig.AI.TackleDistance then
 		actor.TackleIntentAt = nil
+		actor.ContainingSince = nil
 		return
+	end
+
+	--[[
+		CONTAIN FIRST, COMMIT SECOND.
+
+		An AI defender that challenges the moment a tackle becomes legal is the
+		same mistake the human press was making, and it is far more visible on
+		the AI because there are ten of them doing it at once. Real defending
+		looks like arriving, holding the carrier up, and then choosing a moment.
+
+		So arriving in range starts a containment clock rather than a challenge.
+		Until it expires the defender is present and in the way -- which is the
+		pressure -- but does not dive in.
+
+		The exception is a genuinely exposed ball. Patience is a response to a
+		carrier who has the ball under control; a heavy touch is not a moment to
+		be patient about, and OpportunistScore lets the AI take it.
+	]]
+	if not actor.ContainingSince then
+		actor.ContainingSince = now
 	end
 	-- Human-like latency: the AI must see the opportunity briefly before acting.
 	if not actor.TackleIntentAt then
@@ -1121,8 +1161,15 @@ function tryAITackle(actor, teamModel)
 		return
 	end
 
+	local contained = now - (actor.ContainingSince or now)
+	local exposed = preview.Score >= DefendingConfig.AI.OpportunistScore
+	if contained < DefendingConfig.AI.MinimumContainSeconds and not exposed then
+		return
+	end
+
 	actor.LastTackleDecisionAt = now
 	actor.TackleIntentAt = nil
+	actor.ContainingSince = nil
 	actor.TackleCommittedUntil = now + DefendingConfig.AI.CommitmentSeconds
 	DefendingService.AttemptTackle(actor)
 end
@@ -1480,13 +1527,14 @@ local function getSpawnPosition(teamId: string, role: string, slotId: string?): 
 		if not PositionConfig.IsGoalkeeper(slotId or "") then
 			local box = SetPieceFormation.GetBox("Kickoff", true, 0, 0)
 			local target = SetPieceFormation.Resolve(frame, anchor, box)
-			return Vector3.new(target.X, target.Y + 5, target.Z), attackDirection
+			return Vector3.new(target.X, target.Y + AIConfig.Spawn.RootHeightAboveSurface, target.Z),
+				attackDirection
 		end
 	end
 
 	local teamModel = teams[teamId]
 	local target = getFormationTarget(temporaryActor, teamModel)
-	return target + Vector3.yAxis * 5, attackDirection
+	return target + Vector3.yAxis * AIConfig.Spawn.RootHeightAboveSurface, attackDirection
 end
 
 local function createAIActor(teamId: string, role: string, slotIndex: number, isGoalkeeper: boolean?, slotId: string?)

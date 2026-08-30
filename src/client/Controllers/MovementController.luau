@@ -15,9 +15,12 @@ local MovementController = {}
 local localPlayer = Players.LocalPlayer
 local movementConfig = PlayerConfig.Movement
 local locomotionConfig = PlayerConfig.Locomotion
+local DefendingConfig = require(ReplicatedStorage.Shared.Config.DefendingConfig)
 local MatchRulesConfig = require(ReplicatedStorage.Shared.Config.MatchRulesConfig)
 local StaminaConfig = require(ReplicatedStorage.Shared.Config.StaminaConfig)
 local AnimationConfig = require(ReplicatedStorage.Shared.Config.AnimationConfig)
+local GoalkeeperConfig = require(ReplicatedStorage.Shared.Config.GoalkeeperConfig)
+local RestartControl = require(ReplicatedStorage.Shared.Football.RestartControl)
 local inputConfig = PlayerConfig.Input
 local applyStepName = "Beyond90Locomotion"
 
@@ -689,43 +692,13 @@ local function getGoalkeeperAssist(manualDirection: Vector3, manualMagnitude: nu
 	if state.Frozen then
 		return Vector3.zero, 0, true
 	end
-	if not state.TargetPosition then
-		return manualDirection, manualMagnitude, false
-	end
-
 	--[[
-		THE PLAYER ALWAYS WINS.
-
-		Any real input returns unchanged. Coming for a cross, narrowing the angle
-		or simply standing somewhere else is a goalkeeping decision, and the one
-		thing assistance must never do is take a decision back.
+		No target: a keeper is not assisted anywhere any more (see
+		GoalkeeperConfig.Human). This state exists purely so the caller knows the
+		local footballer is a keeper and suppresses the outfield press and
+		loose-ball assists, which would otherwise drag them out of their goal.
 	]]
-	local config = state.Config
-	if manualMagnitude > 0.12 then
-		return manualDirection, manualMagnitude, false
-	end
-
-	local offset = BallControlMath.GetHorizontal(state.TargetPosition - currentRootPart.Position)
-	local distance = offset.Magnitude
-	if distance <= config.PositionAssistDeadzone
-		or distance > config.PositionAssistMaximumDistance
-	then
-		-- Settled, or deliberately far from the line. Either way, do nothing.
-		return manualDirection, manualMagnitude, false
-	end
-
-	--[[
-		Drift, not a sprint home: the assist speed is a fraction of the keeper's
-		own top speed, eased down as it arrives, so it reads as a keeper adjusting
-		their feet rather than as the game moving them.
-	]]
-	local approach = math.clamp(distance / math.max(config.PositionAssistDeadzone * 3, 0.01), 0.25, 1)
-	local magnitude = math.clamp(
-		config.PositionAssistSpeed / math.max(movementConfig.BaseSpeed, 1) * approach,
-		0,
-		1
-	)
-	return offset.Unit, magnitude, true
+	return manualDirection, manualMagnitude, false
 end
 
 --[[
@@ -770,13 +743,66 @@ local function getPressAssist(manualDirection: Vector3, manualMagnitude: number)
 		press is still a sprint the magnitude must be full, or the movement cap
 		holds the footballer below the sprint speed it just requested (§37).
 	]]
-	local maximumMagnitude = if state.ShouldSprint then 1 else config.MaximumMoveMagnitude
+	--[[
+		HOW HARD THE DEFENDER IS ALLOWED TO GO.
+
+		Three cases, and they are the three defensive verbs:
+
+		  still closing   -> full magnitude, or the movement cap holds the
+		                     footballer below the sprint speed just requested.
+		  DASH & PRESSURE -> full commitment; the player asked for it.
+		  MATCH UP        -> held below full on purpose. A defender at top speed
+		                     cannot change direction, and being able to change
+		                     direction is the entire point of jockeying. This cap
+		                     is what makes containment feel like balance rather
+		                     than like running at someone.
+	]]
+	local maximumMagnitude
+	if state.ShouldSprint and not state.Containing then
+		maximumMagnitude = 1
+	elseif state.Containing and state.Dashing and config.Dash.Enabled == true then
+		maximumMagnitude = config.Dash.MaximumMoveMagnitude
+	elseif state.Containing and config.Contain.Enabled == true then
+		maximumMagnitude = config.Contain.MaximumMoveMagnitude
+	else
+		maximumMagnitude = config.MaximumMoveMagnitude
+	end
 	local approach = maximumMagnitude * math.clamp(
 		(distance - config.HoldDistance) / math.max(config.SlowDistance - config.HoldDistance, 0.01),
 		0.3,
 		1
 	)
 	local assistDirection = offset.Unit
+
+	--[[
+		NEVER DRIVE INTO THE CARRIER'S BODY.
+
+		Two footballers occupying the same space is not a football interaction --
+		it reads as a physics failure, and it is what the containment standoff is
+		there to prevent. The standoff handles the target; this handles the case
+		the target cannot, which is the carrier running into the defender.
+
+		Only the component of the assist pointing INTO them is removed. The
+		defender can still slide across their line, which is exactly what a
+		contained defender should be doing anyway.
+	]]
+	local carrierPosition = state.CarrierPosition
+	if carrierPosition then
+		local toCarrier = BallControlMath.GetHorizontal(carrierPosition - currentRootPart.Position)
+		local gap = toCarrier.Magnitude
+		local bodyGap = config.Contain.MinimumBodyGap
+		if gap > 0.01 and gap < bodyGap then
+			local into = toCarrier.Unit
+			local closing = assistDirection:Dot(into)
+			if closing > 0 then
+				local corrected = assistDirection - into * closing
+				assistDirection = if corrected.Magnitude > 0.01
+					then corrected.Unit
+					else Vector3.zero
+			end
+		end
+	end
+
 	local blended = assistDirection * approach * (1 - manualOverride) + manualDirection * manualMagnitude
 	local magnitude = math.clamp(blended.Magnitude, 0, 1)
 	if magnitude <= 0.05 then
@@ -858,6 +884,77 @@ local function updateReceptionFacing(deltaTime: number, phase: string)
 	receptionFacingActive = true
 end
 
+--[[
+	A KEEPER FACES THE BALL. THEY DO NOT TURN ROUND TO WALK BACKWARDS.
+
+	Without this the goalkeeper is steered by ordinary locomotion, which rotates
+	the body into whatever direction the player is travelling. Pressing back to
+	drop toward the line spun the keeper 180 degrees and ran them at their own
+	goal facing away from the play, and pressing left or right turned them side
+	on -- both of which are the opposite of what a goalkeeper does. It also meant
+	the directional locomotion set never had anything to choose from: every
+	movement was "forward" once the body had turned to match it.
+
+	Pinning facing to the ball fixes the animation as a consequence rather than
+	as a separate change. The locomotion set already picks its clip from the
+	angle between facing and travel, so a keeper backing off now genuinely IS
+	moving backwards and gets B90_LOC_OffBall_Jog_Backward, and stepping across
+	their goal gets the left/right clips. Nothing here selects an animation; it
+	only stops the body lying about which way it is going.
+
+	Precedence, in the order these run: a driven turn owns rotation outright, a
+	reception or an action (a throw) aims the body deliberately, and this only
+	takes over when none of those are speaking. While HOLDING the ball the
+	keeper is walking out to distribute, which is ordinary footballer movement,
+	so facing is handed back to normal locomotion.
+]]
+local goalkeeperFacingActive = false
+
+local function updateGoalkeeperFacing(deltaTime: number)
+	local rootPart = currentRootPart
+	local model = localPlayer.Character
+	local isKeeper = model ~= nil
+		and model:GetAttribute(GoalkeeperConfig.RoleAttributeName) == GoalkeeperConfig.Role
+	local holding = model ~= nil
+		and model:GetAttribute(GoalkeeperConfig.Attributes.Holding) == true
+
+	if not rootPart or not isKeeper or holding then
+		if goalkeeperFacingActive then
+			goalkeeperFacingActive = false
+			if currentHumanoid and not receptionFacingActive and not animationOwnsRotation() then
+				currentHumanoid.AutoRotate = movementConfig.AutoRotate
+			end
+		end
+		return
+	end
+
+	-- A driven turn or a deliberate reception aim outranks standing guard.
+	if animationOwnsRotation() or receptionFacingActive then
+		return
+	end
+
+	local football = getFootball()
+	if not football then
+		return
+	end
+	local current = BallControlMath.SafeUnit(
+		BallControlMath.GetHorizontal(rootPart.CFrame.LookVector),
+		Vector3.zAxis
+	)
+	local toBall = BallControlMath.GetHorizontal(football.Position - rootPart.Position)
+	if toBall.Magnitude <= 1e-3 then
+		return
+	end
+	local desired = BallControlMath.SafeUnit(toBall, current)
+	local alpha = 1 - math.exp(-GoalkeeperConfig.Human.FacingResponsiveness * deltaTime)
+	local facing = BallControlMath.SafeUnit(current:Lerp(desired, alpha), desired)
+	if currentHumanoid then
+		currentHumanoid.AutoRotate = false
+	end
+	rootPart.CFrame = CFrame.lookAt(rootPart.Position, rootPart.Position + facing, Vector3.yAxis)
+	goalkeeperFacingActive = true
+end
+
 local function updateActionFacing(deltaTime: number)
 	local now = os.clock()
 	local rootPart = currentRootPart
@@ -922,6 +1019,43 @@ end
 	server cannot drift apart about when the pitch is being set.
 ]]
 local function isMovementLocked(): boolean
+	--[[
+		A COMMITTED SLIDE IS ALSO A MOVEMENT LOCK.
+
+		Once a slide has been launched the footballer is going where they were
+		pointed and nowhere else. That commitment is the entire cost of the
+		challenge -- a slide the player could steer, or pull out of, would simply
+		be a standing tackle with extra reach and no downside.
+
+		The window is written by the SERVER, which is what makes this binding:
+		suppressing input here is presentation of a decision already made, not
+		the decision itself, so a client that ignored this would still be unable
+		to act, because the server's recovery is what gates further challenges.
+	]]
+	local character = localPlayer.Character
+	local slidingUntil = character and character:GetAttribute(DefendingConfig.Slide.SlidingAttribute)
+	if typeof(slidingUntil) == "number" and os.clock() < slidingUntil then
+		return true
+	end
+
+	--[[
+		THE TAKER OF A RESTART DOES NOT WALK AWAY FROM IT.
+
+		A restart is held, not carried (see RestartControl): the ball is on its
+		spot and it belongs to the taker until they play it. Nothing was stopping
+		the taker from simply jogging off, which left the football sitting on the
+		centre spot with its owner twenty studs away -- and at kick-off that read
+		as the kick-off never happening at all.
+
+		Locking only the TAKER is the point. Everyone else is free to move into
+		the shape they want before the whistle, exactly as they are in football.
+		The lock lifts the instant the restart is played, because the server
+		clears AwaitingAction at that moment and this reads the same attribute.
+	]]
+	if RestartControl.IsHeldBy(getFootball(), localPlayer.UserId) then
+		return true
+	end
+
 	local folder = ReplicatedStorage:FindFirstChild(MatchRulesConfig.FolderName)
 	if not folder then
 		return false
@@ -981,6 +1115,7 @@ local function updateLocomotion(deltaTime: number)
 	elseif receptionPhase == "" then
 		rawDirection, rawMagnitude, pressAssisting = getPressAssist(rawDirection, rawMagnitude)
 	end
+	updateGoalkeeperFacing(deltaTime)
 	updateReceptionFacing(deltaTime, receptionPhase)
 	updateActionFacing(deltaTime)
 	--[[
