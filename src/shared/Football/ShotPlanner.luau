@@ -287,6 +287,26 @@ function ShotPlanner.Plan(
 	local speedAlpha = math.clamp(distance / math.max(config.ReferenceDistance, 1), 0, 1)
 	local baseHorizontalSpeed = config.MinLaunchSpeed
 		+ (config.MaxLaunchSpeed - config.MinLaunchSpeed) * math.sqrt(speedAlpha)
+
+	--[[
+		HOW HARD IT WAS STRUCK.
+
+		Distance decides how much pace the shot NEEDS to arrive; charge decides
+		how much the striker actually put through it. Both belong here, and only
+		the first was applied before -- see FootballActionConfig.Shoot.Charge.
+		MinimumSpeedScale for what that meant in practice.
+	]]
+	local chargeConfig = config.Charge
+	if chargeConfig and chargeConfig.MinimumSpeedScale then
+		local chargeAlpha = math.clamp(
+			(charge - chargeConfig.MinimumPower)
+				/ math.max(chargeConfig.MaximumPower - chargeConfig.MinimumPower, 1e-3),
+			0, 1
+		)
+		local scale = chargeConfig.MinimumSpeedScale
+			+ (1 - chargeConfig.MinimumSpeedScale) * chargeAlpha
+		baseHorizontalSpeed *= scale
+	end
 	local travelTime = distance / math.max(baseHorizontalSpeed, 1) * (config.FlightTimeScale or 1)
 	local horizontalSpeed = distance / math.max(travelTime, 0.01)
 	local flightGravity = BallConfig.Flight and BallConfig.Flight.EffectiveGravity or Workspace.Gravity

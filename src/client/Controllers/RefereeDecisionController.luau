@@ -84,6 +84,7 @@ local function buildGui()
 
 	local stroke = Instance.new("UIStroke")
 	stroke.Name = "Edge"
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 	stroke.Color = Color3.fromRGB(118, 191, 255)
 	stroke.Thickness = 1.25
 	stroke.Transparency = 1

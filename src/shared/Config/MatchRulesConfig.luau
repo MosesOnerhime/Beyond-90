@@ -120,7 +120,19 @@ local MatchRulesConfig = {
 			-- A kick-off must be PASSED. It may not be dribbled away.
 			Kickoff = { GroundPass = true, ThroughPass = true, LobPass = true },
 			-- The keeper distributes; a driven or lofted ball are both legal.
-			GoalKick = { GroundPass = true, ThroughPass = true, LobPass = true },
+			--[[
+				A goal kick may be PLAYED SHORT or STRUCK LONG.
+
+				`Shoot` was missing, so the keeper's kick-long key was refused
+				with `restart-not-yours` on the one restart it most obviously
+				belongs to -- the player was the taker, and the action was still
+				rejected, because the rejection reads "this action is not legal
+				here" and reports it as though the taker were someone else.
+
+				A goal kick struck with this key is not a shot at goal: see
+				`handleRestartShot`, which sends it long and high upfield.
+			]]
+			GoalKick = { GroundPass = true, ThroughPass = true, LobPass = true, Shoot = true },
 			-- A corner may be crossed, played short, or struck at goal.
 			CornerKick = { GroundPass = true, ThroughPass = true, LobPass = true, Shoot = true },
 			FreeKick = { GroundPass = true, ThroughPass = true, LobPass = true, Shoot = true },
@@ -355,10 +367,22 @@ local MatchRulesConfig = {
 		short; production duration is a single value, not scattered constants.
 	]]
 	Clock = {
-		HalfSeconds = 180,
+		--[[
+			A TEN MINUTE MATCH -- five minutes a half.
+
+			Requested as "extend match time to 10 minutes", read as the whole
+			match rather than each half: development was 240s a half (an eight
+			minute match), so this is a modest extension rather than a jump to
+			twenty. Say so if the intent was ten minutes EACH way and this
+			doubles.
+
+			Production and development are the same value now, so a development
+			match is not quietly a different length from a real one.
+		]]
+		HalfSeconds = 300,
 		-- Long enough to actually play through a development match and see
 		-- several natural restarts, short enough to reach full time in testing.
-		DevelopmentHalfSeconds = 240,
+		DevelopmentHalfSeconds = 300,
 		UseDevelopmentDuration = true,
 		HalfTimeSeconds = 5,
 	},

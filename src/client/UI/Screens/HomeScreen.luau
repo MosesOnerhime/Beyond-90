@@ -2,8 +2,8 @@ local Players = game:GetService("Players")
 local ContentProvider = game:GetService("ContentProvider")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local StarterPlayer = game:GetService("StarterPlayer")
 local TweenService = game:GetService("TweenService")
-local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
 local React = require(ReplicatedStorage.Shared.ReactPackages).React
@@ -13,6 +13,7 @@ local PlayerConfig = require(ReplicatedStorage.Shared.Config.PlayerConfig)
 local Theme = require(script.Parent.Parent.Theme)
 local ReactUI = require(script.Parent.Parent.Components.ReactUI)
 local MenuFooter = require(script.Parent.Parent.Components.MenuFooter)
+local MenuKit = require(script.Parent.Parent.Components.MenuKit)
 local ControlSchemeConfig = require(ReplicatedStorage.Shared.Config.ControlSchemeConfig)
 
 local localPlayer = Players.LocalPlayer
@@ -57,7 +58,9 @@ local function text(props)
 		TextXAlignment = Enum.TextXAlignment.Left,
 	}
 	for key, value in props do merged[key] = value end
-	return React.createElement("TextLabel", merged)
+	-- Through MenuKit so scaled labels pick up the readability floor; see
+	-- MenuKit.Text. The defaults above still win, they are merged first.
+	return MenuKit.Text(merged)
 end
 
 local function AnimatedMenuPlayer()
@@ -106,14 +109,89 @@ local function AnimatedMenuPlayer()
 			end)
 		end
 		task.spawn(function()
-			-- Workspace is streaming-enabled. The server clones the exact Workspace
-			-- menu_character into ReplicatedStorage so every client receives the full rig.
-			local sourceRig = ReplicatedStorage:WaitForChild("Beyond90MenuCharacter", 5)
+			--[[
+				THE MENU FOOTBALLER IS THE ONE YOU ACTUALLY PLAY AS.
+
+				The rig came from `menu_character`, a separate model that is not
+				the body any footballer on the pitch has -- measured, it is 5.92
+				studs against StarterCharacter's own build. That was survivable
+				only while every player wore their Roblox avatar in the menu,
+				because the description replaced almost all of it anyway.
+
+				It stopped being survivable when the Beyond 90 kit became the
+				default footballer: a player who has not changed anything now sees
+				an anonymous rig in the menu and a different body on the pitch.
+				The menu is where a player meets their footballer, so it has to be
+				the same footballer.
+
+				StarterPlayer.StarterCharacter is that body, it replicates to
+				clients, and it is the exact model the AI and the player are both
+				built from. The old sources are kept as fallbacks so a place
+				without a StarterCharacter still shows somebody.
+			]]
+			--[[
+				A ROBLOX AVATAR IS BUILT FROM ITS DESCRIPTION, NOT PAINTED ONTO
+				THE KIT.
+
+				Applying a HumanoidDescription over a cloned StarterCharacter does
+				NOT give you that avatar. ApplyDescription swaps only what the
+				description explicitly overrides and leaves every other part in
+				place, so the kit's own limbs survive underneath. Measured on the
+				live menu rig, wearing a Roblox avatar:
+
+					UpperTorso   = 542765884    the player's      (replaced)
+					LeftUpperLeg = 2337186877   the Beyond 90 kit (survived)
+					Head         = 2337186646   the Beyond 90 kit (survived)
+
+				-- the player's torso and clothes on the kit's legs and head. Not
+				a footballer and not an avatar; a hybrid of the two, and it looked
+				exactly as bad as that sounds.
+
+				CreateHumanoidModelFromDescription builds the whole rig from the
+				description in one step, which is the only way to get the avatar
+				the player actually has. The kit clone stays as the source for
+				everybody NOT wearing their own avatar, where it is correct.
+			]]
+			if wantsAvatar then
+				local waitStartedAt = os.clock()
+				while not avatarFetchDone and os.clock() - waitStartedAt < 4 and not disposed do
+					task.wait()
+				end
+			end
+			local builtFromAvatar = nil
+			if wantsAvatar and avatarDescription and not disposed then
+				local okBuild, built = pcall(function()
+					return Players:CreateHumanoidModelFromDescription(
+						avatarDescription :: HumanoidDescription,
+						Enum.HumanoidRigType.R15
+					)
+				end)
+				if okBuild and built then
+					builtFromAvatar = built
+				else
+					warn("[Beyond90][UI] Could not build the menu avatar; showing the Beyond 90 kit")
+				end
+			end
+
+			-- The kit now lives in ReplicatedStorage (see
+			-- PlayerService.CloneFootballerTemplate for why it left
+			-- StarterCharacter); StarterCharacter stays as a fallback.
+			local sourceRig = builtFromAvatar
+				or ReplicatedStorage:FindFirstChild("Beyond90Kit")
+				or StarterPlayer:FindFirstChild("StarterCharacter")
+			if not (sourceRig and sourceRig:IsA("Model") and sourceRig:FindFirstChildOfClass("Humanoid")) then
+				sourceRig = ReplicatedStorage:WaitForChild("Beyond90MenuCharacter", 5)
+			end
 			if not sourceRig then
 				local workspaceRig = Workspace:FindFirstChild("menu_character")
 				sourceRig = if workspaceRig and workspaceRig:FindFirstChildWhichIsA("BasePart", true) then workspaceRig else nil
 			end
+			-- A rig built from the description is already ours and single-use, so
+			-- it is adopted directly; a shared source (the kit) must be cloned.
 			local ok, model = pcall(function()
+				if builtFromAvatar and sourceRig == builtFromAvatar then
+					return builtFromAvatar
+				end
 				return sourceRig and sourceRig:IsA("Model") and sourceRig:Clone() or nil
 			end)
 			if disposed or not ok or not model then
@@ -178,11 +256,28 @@ local function AnimatedMenuPlayer()
 					task.wait()
 				end
 				if not avatarFetchDone then
-					warn("[Beyond90][UI] Menu avatar fetch timed out; showing the default footballer")
+					warn(
+						"[Beyond90][UI] Menu avatar slow; showing the default footballer "
+							.. "and wearing the avatar when it lands"
+					)
 				end
 			end
-			local description = avatarDescription
-			if description and humanoid and not disposed then
+			--[[
+				Wearing the player's own avatar onto the mounted rig.
+
+				Pulled out of the mount path because a LATE-ARRIVING fetch has to
+				do exactly the same thing -- see the watcher below.
+			]]
+			--[[
+				Set once the camera exists; the watcher below may fire before or
+				after that, so it is checked rather than assumed.
+			]]
+			local reframeAfterLateAvatar: (() -> ())? = nil
+
+			local function wearDescription(description: HumanoidDescription)
+				if not humanoid or disposed or not model.Parent then
+					return
+				end
 				-- Same rule as on the pitch: the face is the player's, the frame
 				-- is everyone's, so the menu shows the footballer they will be.
 				for _, property in { "HeightScale", "WidthScale", "DepthScale", "HeadScale", "BodyTypeScale", "ProportionScale" } do
@@ -204,21 +299,110 @@ local function AnimatedMenuPlayer()
 					end
 				end
 			end
+
+			local description = avatarDescription
+			if builtFromAvatar then
+				-- Already built from this description; re-applying it here is what
+				-- used to layer the avatar over the kit.
+				description = nil
+			end
 			if description then
+				wearDescription(description)
 				description:Destroy()
 			end
 			avatarDescription = nil
 
-			model:PivotTo(CFrame.Angles(0, math.rad(135), 0))
-			local boundingCFrame, boundingSize = model:GetBoundingBox()
-			model:PivotTo(model:GetPivot() + Vector3.new(0, -(boundingCFrame.Position.Y - boundingSize.Y / 2), 0))
+			--[[
+				A LATE AVATAR STILL GETS WORN.
+
+				The waits above are bounded so a slow fetch cannot hold the menu.
+				They used to be bounded AND FINAL: past the deadline the player was
+				shown the stock kit for the rest of the session, even though their
+				avatar landed a moment later. That is what the player saw --
+
+					22:02:07.473  Menu asset preload incomplete (timed out) ... 17 pending
+					22:02:07.473  Menu avatar fetch timed out; showing the default footballer
+
+				-- both timing out on the same tick, because the avatar fetch is
+				queued behind the menu's own asset preload. The deadline was not
+				really the bug; giving up permanently was.
+
+				So the deadline now only decides WHAT IS SHOWN FIRST. If the fetch
+				lands afterwards the rig puts the avatar on then, which is a brief
+				change on a decorative surface rather than a wrong one for the
+				whole session. Bounded by disposal and by the rig still being
+				mounted, so nothing is left running behind a closed menu.
+			]]
+			if wantsAvatar and not avatarFetchDone then
+				task.spawn(function()
+					while not avatarFetchDone and not disposed and model.Parent do
+						task.wait()
+					end
+					local late = avatarDescription
+					avatarDescription = nil
+					if not late then
+						return
+					end
+					if disposed or not model.Parent then
+						late:Destroy()
+						return
+					end
+					wearDescription(late)
+					late:Destroy()
+					-- The avatar just changed the rig's height; stand it back on
+					-- the floor and re-frame the shot around what is now there.
+					if reframeAfterLateAvatar and not disposed and model.Parent then
+						reframeAfterLateAvatar()
+					end
+				end)
+			end
+
+			--[[
+				Stand the rig on the floor and report the height it turned out to
+				be. Separated from the mount path because WEARING AN AVATAR CHANGES
+				THE BOUNDING BOX -- a hat or a hairstyle makes the rig taller -- so
+				a late-arriving avatar has to redo both the ground pivot and the
+				framing that was measured from it, or it floats and gets cropped.
+			]]
+			local function standOnFloor(): number
+				model:PivotTo(CFrame.Angles(0, math.rad(135), 0))
+				local groundCFrame, groundSize = model:GetBoundingBox()
+				model:PivotTo(
+					model:GetPivot() + Vector3.new(0, -(groundCFrame.Position.Y - groundSize.Y / 2), 0)
+				)
+				basePivotRef.current = model:GetPivot()
+				return math.max(groundSize.Y, 0.01)
+			end
+
+			local boundingSizeY = standOnFloor()
 			modelRef.current = model
-			basePivotRef.current = model:GetPivot()
+			--[[
+				FRAME THE FOOTBALLER THAT IS ACTUALLY THERE.
+
+				These numbers were literals tuned against the old 5.92-stud
+				menu_character: eye height 4.35, look-at 4.15, distance 20.5. Point
+				them at a taller rig and the head leaves the frame.
+
+				They are the same shot expressed as ratios of the rig's own
+				measured height, so a 5.92 rig is framed exactly as before and any
+				other rig -- the kit, a tall Roblox avatar, whatever a later
+				milestone puts here -- is framed the same way rather than cropped.
+			]]
 			local camera = Instance.new("Camera")
 			camera.FieldOfView = 21
-			camera.CFrame = CFrame.lookAt(Vector3.new(-0.8, 4.35, 20.5), Vector3.new(0, 4.15, 0))
+			local function frameRig(rigHeight: number)
+				camera.CFrame = CFrame.lookAt(
+					Vector3.new(-0.135 * rigHeight, 0.735 * rigHeight, 3.463 * rigHeight),
+					Vector3.new(0, 0.701 * rigHeight, 0)
+				)
+			end
+			frameRig(boundingSizeY)
 			camera.Parent = viewport
 			viewport.CurrentCamera = camera
+			-- Handed to the late-avatar watcher so it can re-stand and re-frame.
+			reframeAfterLateAvatar = function()
+				frameRig(standOnFloor())
+			end
 			if humanoid then
 				local animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator")
 				animator.Parent = humanoid
@@ -330,12 +514,29 @@ local function AnimatedMenuPlayer()
 end
 
 local function NavigationCard(props)
+	local compact = MenuKit.Compact()
+	--[[
+		HOVER AND FOCUS ARE TRACKED SEPARATELY.
+
+		They used to share one `focused` flag set by MouseEnter and
+		SelectionGained alike, so a controller could not tell which card it was on
+		beyond the same background change a mouse produces -- the distinction
+		docs/ui/UI_AGENT_DECISION_RULES.md section 7 asks for. `active` keeps the
+		shared background treatment; only `focused` draws the ring.
+	]]
+	local hovered, setHovered = React.useState(false)
 	local focused, setFocused = React.useState(false)
+	local active = hovered or focused
 	local buttonRef = React.useRef(nil)
 	local selectionRef = React.useRef(nil)
 	React.useEffect(function()
 		if buttonRef.current and selectionRef.current then
 			buttonRef.current.SelectionImageObject = selectionRef.current
+		end
+		-- Publish upward so the row can wire an explicit focus order; see the
+		-- effect in the Home screen below.
+		if props.Register then
+			props.Register(props.Order, buttonRef.current)
 		end
 		return nil
 	end, {})
@@ -343,38 +544,76 @@ local function NavigationCard(props)
 		ref = buttonRef,
 		LayoutOrder = props.Order,
 		Size = UDim2.new(0.19, 0, 1, 0),
-		BackgroundColor3 = if focused or props.Selected then Theme.PanelSelected else Theme.Panel,
-		BackgroundTransparency = if focused or props.Selected then 0.02 else 0.08,
+		BackgroundColor3 = if active or props.Selected then Theme.PanelSelected else Theme.Panel,
+		BackgroundTransparency = if active or props.Selected then 0.02 else 0.08,
 		BorderSizePixel = 0,
 		AutoButtonColor = false,
 		Selectable = true,
 		Text = "",
 		[React.Event.Activated] = props.OnActivated,
 		[React.Event.MouseEnter] = function()
-			setFocused(true)
+			setHovered(true)
 			if props.OnFocused then props.OnFocused() end
 		end,
-		[React.Event.MouseLeave] = function() setFocused(false) end,
+		[React.Event.MouseLeave] = function() setHovered(false) end,
 		[React.Event.SelectionGained] = function()
 			setFocused(true)
 			if props.OnFocused then props.OnFocused() end
 		end,
 		[React.Event.SelectionLost] = function() setFocused(false) end,
 	}, {
-		Glow = props.Selected and React.createElement("Frame", {
-			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-			Size = UDim2.new(1, 12, 1, 12), BackgroundTransparency = 1, ZIndex = 0,
+		--[[
+			SELECTION IS AN EDGE MARKER, NOT A RING.
+
+			This used to draw up to three outlines at once: a cyan halo on the
+			selected card, a brightened stroke on it, and a second ring on the
+			gamepad-focused one. Rejected by the player -- "I do not like the blue
+			selector round boxes" -- and AGENTS.md section 40 names the same thing
+			in its list of defaults to avoid: glowing borders on every card.
+
+			What replaces it is what sports broadcast and EA FC's own menus use: a
+			solid accent bar down the LEADING EDGE of the active card, with the
+			card surface lifting slightly. It reads instantly at TV distance,
+			survives a bright stadium background, costs one thin rectangle, and
+			leaves the card's own rectangle clean -- which is the "strong
+			rectangular navigation cards" the approved mockup is built on.
+
+			Selected and focused are still distinguishable: the bar is accent blue
+			for the screen you are on, and white for the one the controller is
+			sitting on, which is the same white the selected label uses.
+		]]
+		EdgeMarker = (props.Selected or focused) and React.createElement("Frame", {
+			AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.new(0, 0, 0.5, 0),
+			Size = UDim2.new(0, 4, 0.72, 0),
+			BackgroundColor3 = if focused then Theme.SelectedText else Theme.Accent,
+			BackgroundTransparency = 0,
+			BorderSizePixel = 0,
+			ZIndex = 50,
 		}, {
-			Corner = ReactUI.Corner(7),
-			Stroke = ReactUI.Stroke(Theme.AccentCyan, 4, 0.18),
+			Corner = ReactUI.Corner(2),
 		}) or nil,
+		--[[
+			A SelectionImageObject IS STILL AN ORDINARY CHILD.
+
+			Assigning one does not hide it: Roblox draws it over the selected
+			control AND leaves it rendering where it sits in the hierarchy. A
+			visible Frame here therefore put a permanent ring on all four cards at
+			once, which is what it did until this comment was written.
+
+			So this stays deliberately blank. Its only job is to replace Roblox's
+			default blue selection box with nothing; the edge marker above is the
+			actual indicator.
+		]]
 		SelectionImage = React.createElement("ImageLabel", {
-			ref = selectionRef, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+			ref = selectionRef,
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
 			ImageTransparency = 1,
 		}),
 		Corner = ReactUI.Corner(5),
-		Stroke = ReactUI.Stroke(if props.Selected then Color3.fromRGB(194, 221, 255) else Theme.Stroke,
-			if props.Selected then 2 else 1, if props.Selected then 0.04 else 0.26),
+		-- One quiet stroke in every state. The edge marker carries the selection.
+		Stroke = ReactUI.Stroke(Theme.Stroke, 1, if active or props.Selected then 0.12 else 0.3),
 		Icon = React.createElement("ImageLabel", {
 			Position = UDim2.fromScale(0.05, 0.16),
 			Size = UDim2.fromScale(0.26, 0.68),
@@ -382,15 +621,37 @@ local function NavigationCard(props)
 			Image = props.Icon,
 			ScaleType = Enum.ScaleType.Fit,
 		}),
+		--[[
+			THE SUBTITLE IS DROPPED IN PHONE LANDSCAPE.
+
+			The navigation row is 15% of screen height, so on a 780x360 phone a
+			card is 54px tall and the subtitle's share of that is 16px. Its text
+			wraps to two or three lines and needs 31-41px, so it overflowed the
+			card no matter what size the type was -- measured at 11px:
+
+				"Jump into matche..."  needs 82x31  box 85x16
+
+			docs/ui/UI_RESPONSIVE_INPUT.md section 2 ranks preserving the primary
+			action and readable text above keeping secondary content, and section
+			3 explicitly allows the composition to change on a phone. The title
+			IS the action; the subtitle explains it. So the subtitle goes and the
+			title takes the whole card, centred, at a size that fits.
+
+			Nothing is lost that the player needs: "PLAY", "CLUBS", "PROFILE" and
+			"SETTINGS" are self-describing, which is why they are the labels.
+		]]
 		Title = text({
-			Position = UDim2.fromScale(0.34, 0.23), Size = UDim2.fromScale(0.61, 0.22),
-			Font = Theme.Fonts.Navigation, Text = props.Title, TextSize = if UserInputService.TouchEnabled then 13 else 16,
+			Position = UDim2.fromScale(0.34, if compact then 0.2 else 0.23),
+			Size = UDim2.fromScale(0.61, if compact then 0.6 else 0.22),
+			Font = Theme.Fonts.Navigation, Text = props.Title,
+			TextSize = MenuKit.Size(compact, 16),
+			TextYAlignment = if compact then Enum.TextYAlignment.Center else Enum.TextYAlignment.Top,
 		}),
-		Subtitle = text({
+		Subtitle = not compact and text({
 			Position = UDim2.fromScale(0.34, 0.49), Size = UDim2.fromScale(0.61, 0.3),
 			Font = Enum.Font.Gotham, Text = props.Subtitle, TextColor3 = Theme.MutedText,
-			TextWrapped = true, TextSize = if UserInputService.TouchEnabled then 9 else 11,
-		}),
+			TextWrapped = true, TextSize = MenuKit.Size(compact, 11),
+		}) or nil,
 	})
 end
 
@@ -423,12 +684,12 @@ local function PlayerStat(props)
 		Label = text({
 			Position = UDim2.fromScale(0, 0), Size = UDim2.fromScale(1, 0.4),
 			Font = Enum.Font.GothamMedium, Text = props.Label, TextColor3 = Color3.fromRGB(201, 210, 230),
-			TextSize = if props.Mobile then 6 else 9, TextXAlignment = Enum.TextXAlignment.Center,
+			TextSize = MenuKit.Size(props.Mobile, 11), TextXAlignment = Enum.TextXAlignment.Center,
 		}),
 		Value = text({
 			Position = UDim2.fromScale(0, 0.41), Size = UDim2.fromScale(1, 0.51),
 			Font = Enum.Font.GothamBold, Text = props.Value, TextColor3 = Theme.Text,
-			TextSize = if props.Mobile then 10 else 14, TextXAlignment = Enum.TextXAlignment.Center,
+			TextSize = MenuKit.Size(props.Mobile, 14), TextXAlignment = Enum.TextXAlignment.Center,
 		}),
 	})
 end
@@ -443,7 +704,12 @@ local function HomeScreen(props)
 	local playerBust, setPlayerBust = React.useState("")
 	local selectedNavigation, setSelectedNavigation = React.useState(1)
 	local rootRef = React.useRef(nil)
-	local mobile = UserInputService.TouchEnabled
+	-- Buttons of the navigation row, published by each card so the row can be
+	-- given an explicit gamepad focus order (see the effect below).
+	local navButtonsRef = React.useRef({})
+	-- Phone landscape, decided by the viewport rather than by whether the device
+	-- happens to have a touchscreen; see MenuKit.Compact.
+	local mobile = MenuKit.Compact()
 	React.useEffect(function()
 		task.spawn(function()
 			local headOk, headImage = pcall(function()
@@ -506,8 +772,38 @@ local function HomeScreen(props)
 			Order = index, Title = data[1], Subtitle = data[2], Icon = data[3],
 			OnActivated = data[4], Selected = index == selectedNavigation,
 			OnFocused = function() setSelectedNavigation(index) end,
+			Register = function(order, button)
+				navButtonsRef.current[order] = button
+			end,
 		})
 	end
+
+	--[[
+		AN EXPLICIT FOCUS ORDER ALONG THE NAVIGATION ROW.
+
+		docs/ui/UI_RESPONSIVE_INPUT.md section 7 asks for a deterministic focus
+		order and warns against relying on Roblox's automatic geometric
+		selection. Measured, nothing in the menu set any NextSelection link at
+		all -- 0 of 7 selectable buttons -- so every gamepad move was a guess
+		made from screen positions.
+
+		The row is wired left-to-right and wraps at both ends, so holding a
+		direction cycles rather than dead-ending on the last card. Wired from
+		refs rather than by layout order alone, so it stays correct if a card is
+		hidden or reordered.
+	]]
+	React.useEffect(function()
+		local buttons = navButtonsRef.current
+		local count = #nav
+		for index = 1, count do
+			local button = buttons[index]
+			if button then
+				button.NextSelectionLeft = buttons[if index > 1 then index - 1 else count]
+				button.NextSelectionRight = buttons[if index < count then index + 1 else 1]
+			end
+		end
+		return nil
+	end, {})
 
 	return React.createElement("CanvasGroup", {
 		ref = rootRef,
@@ -609,28 +905,33 @@ local function HomeScreen(props)
 			Size = UDim2.fromScale(if mobile then 0.39 else 0.355, if mobile then 0.43 else 0.4),
 			BackgroundTransparency = 1, ZIndex = 4,
 		}, {
-			Eyebrow = text({ Size = UDim2.fromScale(1, 0.09), Font = Enum.Font.GothamMedium, Text = "CURRENT SEASON", TextColor3 = Theme.AccentCyan, TextSize = if mobile then 10 else 15 }),
-			Title = text({ Position = UDim2.fromScale(0, 0.11), Size = UDim2.fromScale(1, 0.13), Font = Enum.Font.GothamBlack, Text = "SEASON 1 - RISING", TextSize = if mobile then 17 else 27 }),
+			Eyebrow = text({ Size = UDim2.fromScale(1, 0.09), Font = Enum.Font.GothamMedium, Text = "CURRENT SEASON", TextColor3 = Theme.AccentCyan, TextSize = MenuKit.Size(mobile, 15) }),
+			Title = text({ Position = UDim2.fromScale(0, 0.11), Size = UDim2.fromScale(1, 0.13), Font = Enum.Font.GothamBlack, Text = "SEASON 1 - RISING", TextSize = MenuKit.Size(mobile, 27) }),
 			TimeIcon = Assets.Menu.Time ~= "" and React.createElement("ImageLabel", {
 				Position = UDim2.fromScale(0, 0.245), Size = UDim2.fromScale(0.035, 0.07),
 				BackgroundTransparency = 1, Image = Assets.Menu.Time, ScaleType = Enum.ScaleType.Fit,
 			}) or nil,
-			Ends = text({ Position = UDim2.fromScale(0.04, 0.245), Size = UDim2.fromScale(0.6, 0.07), Font = Theme.Fonts.Caption, Text = "ENDS IN 28 DAYS", TextColor3 = Theme.MutedText, TextSize = if mobile then 9 else 13 }),
+			Ends = text({ Position = UDim2.fromScale(0.04, 0.245), Size = UDim2.fromScale(0.6, 0.07), Font = Theme.Fonts.Caption, Text = "ENDS IN 28 DAYS", TextColor3 = Theme.MutedText, TextSize = MenuKit.Size(mobile, 13) }),
 			Panel = glassFrame({ Position = UDim2.fromScale(0, 0.34), Size = UDim2.fromScale(1, 0.66), Transparency = 0.24 }, {
 				Badge = React.createElement("ImageLabel", { Position = UDim2.fromScale(0.025, 0.025), Size = UDim2.fromScale(0.245, 0.53), BackgroundTransparency = 1, Image = Assets.DivisionBadge, ImageColor3 = Color3.fromRGB(205, 218, 238), ScaleType = Enum.ScaleType.Fit }, {
 					TopShade = React.createElement("Frame", { Position = UDim2.fromScale(0.08, 0.02), Size = UDim2.fromScale(0.84, 0.28), BackgroundColor3 = Color3.fromRGB(4, 9, 26), BackgroundTransparency = 0.62, BorderSizePixel = 0 }),
 				}),
-			DivisionCaption = text({ Position = UDim2.fromScale(0.285, 0.075), Size = UDim2.fromScale(0.3, 0.08), Text = "DIVISION", TextColor3 = Theme.MutedText, TextSize = if mobile then 8 else 11 }),
-			Division = text({ Position = UDim2.fromScale(0.285, 0.16), Size = UDim2.fromScale(0.35, 0.1), Font = Theme.Fonts.Navigation, Text = "DIAMOND II", TextSize = if mobile then 12 else 16 }),
-			RatingCaption = text({ Position = UDim2.fromScale(0.285, if mobile then 0.275 else 0.29), Size = UDim2.fromScale(0.25, 0.07), Text = "RATING", TextColor3 = Theme.MutedText, TextSize = if mobile then 8 else 11 }),
+			DivisionCaption = text({ Position = UDim2.fromScale(0.285, 0.075), Size = UDim2.fromScale(0.3, 0.08), Text = "DIVISION", TextColor3 = Theme.MutedText, TextSize = MenuKit.Size(mobile, 11) }),
+			Division = text({ Position = UDim2.fromScale(0.285, 0.16), Size = UDim2.fromScale(0.35, 0.1), Font = Theme.Fonts.Navigation, Text = "DIAMOND II", TextSize = MenuKit.Size(mobile, 16) }),
+			RatingCaption = text({ Position = UDim2.fromScale(0.285, if mobile then 0.275 else 0.29), Size = UDim2.fromScale(0.25, 0.07), Text = "RATING", TextColor3 = Theme.MutedText, TextSize = MenuKit.Size(mobile, 11) }),
 			RatingNetwork = React.createElement("ImageLabel", { Position = UDim2.fromScale(0.285, 0.365), Size = UDim2.fromScale(0.045, 0.075), BackgroundTransparency = 1, Image = Assets.Social.Network, ScaleType = Enum.ScaleType.Fit }),
-			Rating = text({ Position = UDim2.fromScale(0.34, 0.355), Size = UDim2.fromScale(0.25, 0.1), Font = Theme.Fonts.Statistics, Text = "1,286", TextSize = if mobile then 12 else 17 }),
-			Reward = text({ Position = UDim2.fromScale(0.665, 0.065), Size = UDim2.fromScale(0.19, 0.17), Font = Theme.Fonts.Caption, Text = "NEXT REWARD\nDIAMOND I", TextColor3 = Theme.AccentCyan, TextWrapped = true, TextSize = if mobile then 8 else 11 }),
+			Rating = text({ Position = UDim2.fromScale(0.34, 0.355), Size = UDim2.fromScale(0.25, 0.1), Font = Theme.Fonts.Statistics, Text = "1,286", TextSize = MenuKit.Size(mobile, 17) }),
+			Reward = text({ Position = UDim2.fromScale(0.665, 0.065), Size = UDim2.fromScale(0.19, 0.17), Font = Theme.Fonts.Caption, Text = "NEXT REWARD\nDIAMOND I", TextColor3 = Theme.AccentCyan, TextWrapped = true, TextSize = MenuKit.Size(mobile, 11) }),
 				Diamond = React.createElement("ImageLabel", { Position = UDim2.fromScale(0.84, 0.08), Size = UDim2.fromScale(0.12, 0.23), BackgroundTransparency = 1, Image = Assets.Currency.Premium, ScaleType = Enum.ScaleType.Fit }),
 				Progress = React.createElement("Frame", { Position = UDim2.fromScale(0.285, 0.47), Size = UDim2.fromScale(0.54, 0.025), BackgroundColor3 = Theme.Stroke, BorderSizePixel = 0 }, {
 					Fill = React.createElement("Frame", { Size = UDim2.fromScale(0.91, 1), BackgroundColor3 = Theme.Accent, BorderSizePixel = 0 }, { Gradient = ReactUI.Gradient(Theme.AccentViolet, Theme.AccentCyan) }),
 				}),
-			ProgressCount = text({ Position = UDim2.fromScale(0.84, 0.42), Size = UDim2.fromScale(0.14, 0.1), Font = Theme.Fonts.Caption, Text = "1,286 / 1,400", TextColor3 = Theme.Text, TextSize = if mobile then 7 else 10, TextXAlignment = Enum.TextXAlignment.Right }),
+			-- Right-aligned, so a box narrower than the string overflows LEFT across
+			-- the progress bar rather than truncating. At 780x360 "1,286 / 1,400"
+			-- needs 54px of glyphs in a 42px box, so the box widens on compact;
+			-- the right edge stays at 0.98 either way, so nothing moves.
+			ProgressCount = text({ Position = UDim2.fromScale(if mobile then 0.68 else 0.84, 0.42),
+				Size = UDim2.fromScale(if mobile then 0.3 else 0.14, 0.1), Font = Theme.Fonts.Caption, Text = "1,286 / 1,400", TextColor3 = Theme.Text, TextSize = MenuKit.Size(mobile, 10), TextXAlignment = Enum.TextXAlignment.Right }),
 				HighlightsTitle = text({ Position = UDim2.fromScale(0.025, 0.56), Size = UDim2.fromScale(0.5, 0.07), Font = Theme.Fonts.Navigation, Text = "SEASON HIGHLIGHTS", TextColor3 = Theme.Accent, TextScaled = true }),
 				Highlights = React.createElement("Frame", { Position = UDim2.fromScale(0.02, 0.66), Size = UDim2.fromScale(0.96, 0.27), BackgroundTransparency = 1 }, {
 					Layout = React.createElement("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0.02, 0), SortOrder = Enum.SortOrder.LayoutOrder }),
@@ -656,25 +957,41 @@ local function HomeScreen(props)
 				the two overlapped and the label read as printed on the card's top
 				edge rather than labelling it.
 			]]
-			Title = text({ Position = UDim2.fromScale(0.055, 0), Size = UDim2.fromScale(0.9, 0.042), Font = Enum.Font.GothamBold, Text = "FEATURED PLAYER", TextColor3 = Theme.AccentCyan, TextSize = if mobile then 9 else 12 }),
+			Title = text({ Position = UDim2.fromScale(0.055, 0), Size = UDim2.fromScale(0.9, 0.042), Font = Enum.Font.GothamBold, Text = "FEATURED PLAYER", TextColor3 = Theme.AccentCyan, TextSize = MenuKit.Size(mobile, 12) }),
 			Card = React.createElement("ImageLabel", { Position = UDim2.fromScale(0.01, 0.062), Size = UDim2.fromScale(0.98, 0.84), BackgroundTransparency = 1, Image = Assets.FeaturedPlayerFrame, ScaleType = Enum.ScaleType.Stretch, ClipsDescendants = true }, {
 				Portrait = React.createElement("ImageLabel", { Position = UDim2.fromScale(0.18, 0.08), Size = UDim2.fromScale(0.72, 0.54), BackgroundTransparency = 1, Image = if playerBust ~= "" then playerBust else portrait, ScaleType = Enum.ScaleType.Fit, Rotation = 5 }, {
 					Fade = React.createElement("UIGradient", { Rotation = 90, Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(0.65, 0.04), NumberSequenceKeypoint.new(1, 1) }) }),
 				}),
-				Rating = text({ Position = UDim2.fromScale(0.13, 0.13), Size = UDim2.fromScale(0.17, 0.075), Font = Enum.Font.GothamBlack, Text = "92", TextSize = if mobile then 17 else 23, TextXAlignment = Enum.TextXAlignment.Center }),
-				Position = text({ Position = UDim2.fromScale(0.13, 0.205), Size = UDim2.fromScale(0.17, 0.05), Font = Enum.Font.GothamBold, Text = "LW", TextSize = if mobile then 9 else 12, TextXAlignment = Enum.TextXAlignment.Center }),
+				Rating = text({ Position = UDim2.fromScale(0.13, 0.13), Size = UDim2.fromScale(0.17, 0.075), Font = Enum.Font.GothamBlack, Text = "92", TextSize = MenuKit.Size(mobile, 23), TextXAlignment = Enum.TextXAlignment.Center }),
+				Position = text({ Position = UDim2.fromScale(0.13, 0.205), Size = UDim2.fromScale(0.17, 0.05), Font = Enum.Font.GothamBold, Text = "LW", TextSize = MenuKit.Size(mobile, 12), TextXAlignment = Enum.TextXAlignment.Center }),
 				NameRow = React.createElement("Frame", { Position = UDim2.fromScale(0.11, 0.65), Size = UDim2.fromScale(0.78, 0.065), BackgroundTransparency = 1 }, {
 					Country = React.createElement("ImageLabel", { Position = UDim2.fromScale(0.03, 0.12), Size = UDim2.fromScale(0.14, 0.76), BackgroundTransparency = 1, Image = Assets.Menu.NigeriaFlag, ScaleType = Enum.ScaleType.Fit }),
-					Name = text({ Size = UDim2.fromScale(1, 1), Font = Enum.Font.GothamBold, Text = string.upper(localPlayer.DisplayName), TextXAlignment = Enum.TextXAlignment.Center, TextSize = if mobile then 8 else 11, TextTruncate = Enum.TextTruncate.AtEnd }),
+					Name = text({ Size = UDim2.fromScale(1, 1), Font = Enum.Font.GothamBold, Text = string.upper(localPlayer.DisplayName), TextXAlignment = Enum.TextXAlignment.Center, TextSize = MenuKit.Size(mobile, 11), TextTruncate = Enum.TextTruncate.AtEnd }),
 				}),
-				Stats = React.createElement("Frame", { Position = UDim2.fromScale(0.16, 0.725), Size = UDim2.fromScale(0.68, 0.16), BackgroundTransparency = 1 }, {
+				--[[
+					THE SIX-STAT GRID IS DROPPED IN PHONE LANDSCAPE.
+
+					The grid is 68% x 16% of a card that is itself a fifth of the
+					screen, which on a 780x360 phone is 85x29px holding six stats
+					in two rows -- about 28x14px each. It only ever "fit" because
+					the labels were 6px, which is unreadable and is the "tiny stat
+					labels" docs/ui/UI_ACCESSIBILITY_LOCALIZATION.md section 1
+					names directly.
+
+					Six attribute numbers are tertiary decoration on the home
+					screen; section 2's adaptation priority removes that before it
+					compromises readable text. The card keeps what identifies the
+					player -- portrait, rating, position, name -- which is the part
+					that carries meaning at a glance.
+				]]
+				Stats = not mobile and React.createElement("Frame", { Position = UDim2.fromScale(0.16, 0.725), Size = UDim2.fromScale(0.68, 0.16), BackgroundTransparency = 1 }, {
 					PAC = React.createElement(PlayerStat, { Position = UDim2.fromScale(0, 0), Value = "94", Label = "PAC", Mobile = mobile }),
 					SHO = React.createElement(PlayerStat, { Position = UDim2.fromScale(0.37, 0), Value = "91", Label = "SHO", Mobile = mobile }),
 					PAS = React.createElement(PlayerStat, { Position = UDim2.fromScale(0.74, 0), Value = "87", Label = "PAS", Mobile = mobile }),
 					DRI = React.createElement(PlayerStat, { Position = UDim2.fromScale(0, 0.52), Value = "93", Label = "DRI", Mobile = mobile }),
 					DEF = React.createElement(PlayerStat, { Position = UDim2.fromScale(0.37, 0.52), Value = "42", Label = "DEF", Mobile = mobile }),
 					PHY = React.createElement(PlayerStat, { Position = UDim2.fromScale(0.74, 0.52), Value = "81", Label = "PHY", Mobile = mobile }),
-				}),
+				}) or nil,
 			}),
 		}),
 		Navigation = React.createElement("Frame", {
@@ -732,8 +1049,8 @@ local function HomeScreen(props)
 				Fallback = menuPrompt.Back,
 				Label = "OPEN MENU",
 			}),
-			NewsTag = text({ Position = UDim2.fromScale(if mobile then 0.125 else 0.295, 0.22), Size = UDim2.fromScale(if mobile then 0.065 else 0.06, 0.5), Font = Theme.Fonts.Navigation, Text = "NEWS", TextColor3 = Theme.Accent, TextSize = if mobile then 9 else 12 }),
-			News = text({ Position = UDim2.fromScale(if mobile then 0.19 else 0.34, if mobile then 0.08 else 0.22), Size = UDim2.fromScale(if mobile then 0.53 else 0.43, if mobile then 0.84 else 0.5), Font = Enum.Font.Gotham, Text = "Welcome to Beyond 90! Season 1 is live now. Compete, climb the ranks, and become a legend.", TextColor3 = Color3.fromRGB(205, 214, 234), TextSize = if mobile then 8 else 11, TextWrapped = mobile }),
+			NewsTag = text({ Position = UDim2.fromScale(if mobile then 0.125 else 0.295, 0.22), Size = UDim2.fromScale(if mobile then 0.065 else 0.06, 0.5), Font = Theme.Fonts.Navigation, Text = "NEWS", TextColor3 = Theme.Accent, TextSize = MenuKit.Size(mobile, 12) }),
+			News = text({ Position = UDim2.fromScale(if mobile then 0.19 else 0.34, if mobile then 0.08 else 0.22), Size = UDim2.fromScale(if mobile then 0.53 else 0.43, if mobile then 0.84 else 0.5), Font = Enum.Font.Gotham, Text = "Welcome to Beyond 90! Season 1 is live now. Compete, climb the ranks, and become a legend.", TextColor3 = Color3.fromRGB(205, 214, 234), TextSize = MenuKit.Size(mobile, 11), TextWrapped = mobile }),
 			Friends = panel({ Position = UDim2.fromScale(if mobile then 0.755 else 0.825, 0.16), Size = UDim2.fromScale(if mobile then 0.07 else 0.055, 0.64), BackgroundColor3 = Color3.fromRGB(2, 8, 26), BackgroundTransparency = 0.02 }, {
 				Icon = React.createElement("ImageLabel", { Position = UDim2.fromScale(0.08, 0.13), Size = UDim2.fromScale(0.58, 0.74), BackgroundTransparency = 1, Image = Assets.Social.Friends, ScaleType = Enum.ScaleType.Fit }),
 				Count = text({ Position = UDim2.fromScale(0.64, 0.2), Size = UDim2.fromScale(0.25, 0.6), Text = "3", TextSize = 11, TextXAlignment = Enum.TextXAlignment.Center }),

@@ -40,6 +40,14 @@ local recoveryUntilById: { [number]: number } = {}
 local lastInterceptionAtById: { [number]: number } = {}
 local lastSlideAtById: { [number]: number } = {}
 --[[
+	Challenges that have been COMMITTED but not yet resolved.
+
+	id -> { Actor, ActionType, OpensAt, ClosesAt }. See DefendingConfig.ContactWindow
+	for why a challenge occupies a span of time rather than resolving at the
+	instant it was asked for.
+]]
+local pendingChallengeById: { [number]: any } = {}
+--[[
 	Where the football was at the end of the previous tick.
 
 	Interception is judged over the SEGMENT the ball travelled, not from where it
@@ -232,23 +240,16 @@ function DefendingService.PreviewTackle(actor): any
 	)
 end
 
-function DefendingService.AttemptTackle(actor): (boolean, string, any)
-	if not MatchRulesService.AllowsFootballActions() then
-		return false, "match-not-playing", nil
-	end
-	if not actor or not actor.RootPart or not actor.RootPart.Parent then
-		return false, "challenger-invalid", nil
-	end
-	if DefendingService.IsRecovering(actor.Id) then
-		return false, "recovering", nil
-	end
+--[[
+	THE CONTACT, resolved from the sweep rather than from the input.
 
-	local now = os.clock()
-	local lastAt = lastTackleAtById[actor.Id]
-	if lastAt and now - lastAt < DefendingConfig.Tackle.Cooldown then
-		return false, "cooldown", nil
-	end
-
+	Everything below is unchanged from when this ran directly off the button; what
+	changed is WHEN it runs. The eligibility checks that used to sit above it --
+	match state, cooldown, recovery -- now happen once at commit, because by the
+	time this executes the player is already committed and it is too late to
+	decline. See DefendingService.AttemptTackle.
+]]
+local function performTackle(actor, now: number): (boolean, string, any)
 	local ball = getFootball()
 	if not ball then
 		return false, "ball-missing", nil
@@ -273,8 +274,6 @@ function DefendingService.AttemptTackle(actor): (boolean, string, any)
 	if carrier.TeamId ~= nil and carrier.TeamId == actor.TeamId then
 		return false, "carrier-is-teammate", nil
 	end
-
-	lastTackleAtById[actor.Id] = now
 
 	local result = TackleEvaluator.Evaluate(
 		toEvaluatorRecord(actor),
@@ -440,6 +439,162 @@ function DefendingService.AttemptTackle(actor): (boolean, string, any)
 		result.Score, result.Exposure or 0, result.FacingDot or 0, result.BehindDot or 0
 	))
 	return true, result.Outcome, result
+end
+
+--[[
+	COMMITTING TO A CHALLENGE.
+
+	Pressing the button no longer decides anything. It spends the cooldown, starts
+	the animation and opens a contact window; whether the challenge connects is
+	settled over the following fraction of a second by the sweep below.
+
+	That is the whole mechanic. A tackle asked for too early or too late now costs
+	the defender exactly the same commitment and produces nothing, which is what
+	makes timing a skill rather than a range check. It also means a challenge at
+	empty grass is a real possibility with a real price -- previously it returned
+	"no-valid-carrier" for free.
+
+	Both sources agree on this shape; see DefendingConfig.ContactWindow.
+]]
+--[[
+	The same question as PreviewTackle, asked against the SLIDE's geometry.
+
+	A slide reaches further but is far less forgiving about direction, so the two
+	challenges disagree about what is available from the same position. The AI
+	needs to ask about the one it is actually considering.
+]]
+function DefendingService.PreviewSlideTackle(actor): any
+	if not actor or not actor.RootPart or not actor.RootPart.Parent then
+		return nil
+	end
+	local ball = getFootball()
+	if not ball or ball:GetAttribute("State") ~= "Controlled" then
+		return nil
+	end
+	if ball:GetAttribute("GoalkeeperHeld") == true then
+		return nil
+	end
+	local carrierId = ball:GetAttribute("ControllerFootballerId")
+	if typeof(carrierId) ~= "number" or carrierId == 0 or carrierId == actor.Id then
+		return nil
+	end
+	local carrier = FootballerRegistryService.GetActorById(carrierId)
+	if not carrier or not carrier.RootPart or not carrier.RootPart.Parent then
+		return nil
+	end
+	if carrier.TeamId ~= nil and carrier.TeamId == actor.TeamId then
+		return nil
+	end
+	return TackleEvaluator.Evaluate(
+		toEvaluatorRecord(actor),
+		toEvaluatorRecord(carrier),
+		ball.Position,
+		DefendingConfig.Slide.Evaluation
+	)
+end
+
+function DefendingService.AttemptTackle(actor): (boolean, string, any)
+	if not MatchRulesService.AllowsFootballActions() then
+		return false, "match-not-playing", nil
+	end
+	if not actor or not actor.RootPart or not actor.RootPart.Parent then
+		return false, "challenger-invalid", nil
+	end
+	if DefendingService.IsRecovering(actor.Id) then
+		return false, "recovering", nil
+	end
+	if pendingChallengeById[actor.Id] then
+		return false, "already-committed", nil
+	end
+
+	local now = os.clock()
+	local config = DefendingConfig.Tackle
+	local lastAt = lastTackleAtById[actor.Id]
+	if lastAt and now - lastAt < config.Cooldown then
+		return false, "cooldown", nil
+	end
+
+	lastTackleAtById[actor.Id] = now
+	local window = DefendingConfig.ContactWindow
+	local opensAt = now + window.WindupSeconds
+	local closesAt = opensAt + window.ContactWindowSeconds
+	pendingChallengeById[actor.Id] = {
+		Actor = actor,
+		ActionType = config.ActionType,
+		OpensAt = opensAt,
+		ClosesAt = closesAt,
+	}
+	--[[
+		Clients hold the challenge animation and suppress movement input for the
+		duration. The server owns the commitment: a client that ignores the
+		attribute gains nothing, because the recovery applied on resolution is what
+		actually gates the next action.
+	]]
+	if actor.Character then
+		actor.Character:SetAttribute(window.CommittedAttribute, closesAt)
+	end
+	-- Plays on COMMIT, not on resolution: the leg goes before anyone knows
+	-- whether it connects, which is the whole point of the window.
+	if actor.IsAI then
+		AIAnimationService.PlayAction(actor, "StandingTackle")
+	end
+	return true, "committed", nil
+end
+
+--[[
+	RESOLVING COMMITTED CHALLENGES.
+
+	Once the windup has elapsed, each tick asks whether contact is available --
+	using the same preview the AI uses to decide, so the question the sweep asks
+	and the question a defender asks are literally the same one. The first tick
+	that says yes resolves the challenge. If none does, it resolves anyway when
+	the window closes, and that resolution is the miss: recovery is applied and
+	the ordinary foul check still runs, because a challenge that connected with a
+	player and not the ball is exactly the case fouls exist for.
+]]
+local function updatePendingChallenges()
+	local now = os.clock()
+	for id, entry in pendingChallengeById do
+		local actor = entry.Actor
+		if not actor or not actor.RootPart or not actor.RootPart.Parent then
+			pendingChallengeById[id] = nil
+			continue
+		end
+		if now < entry.OpensAt then
+			continue
+		end
+
+		local preview = DefendingService.PreviewTackle(actor)
+		local contactAvailable = preview ~= nil and preview.Valid == true and preview.Outcome ~= "Missed"
+		local expired = now >= entry.ClosesAt
+		if not contactAvailable and not expired then
+			continue
+		end
+
+		pendingChallengeById[id] = nil
+		if actor.Character then
+			actor.Character:SetAttribute(DefendingConfig.ContactWindow.CommittedAttribute, nil)
+		end
+
+		local accepted, reason, result = performTackle(actor, now)
+		if not accepted then
+			--[[
+				The window closed with nothing won. performTackle only applies
+				recovery on the paths it actually reached, so a challenge that found
+				no carrier at all would otherwise cost nothing -- which is the free
+				look this mechanic exists to remove.
+			]]
+			if (recoveryUntilById[id] or 0) <= now then
+				recoveryUntilById[id] = now + DefendingConfig.Tackle.FailedRecoverySeconds
+			end
+			if reason == "no-valid-carrier" then
+				reason = "no-contact"
+			end
+		end
+		if actor.Player then
+			sendFeedback(actor, accepted, reason, result, entry.ActionType)
+		end
+	end
 end
 
 --[[
@@ -666,6 +821,11 @@ function DefendingService.AttemptSlideTackle(actor): (boolean, string, any)
 		]]
 		actor.Character:SetAttribute(config.SlidingAttribute, now + config.SlideSeconds)
 	end
+	-- The tackler's own animation. A no-op until the clip exists; see
+	-- AnimationConfig.Actions.SlideTackle.
+	if actor.IsAI then
+		AIAnimationService.PlayAction(actor, "SlideTackle")
+	end
 
 	if not carrier or not carrier.RootPart or not carrier.RootPart.Parent
 		or (carrier.TeamId ~= nil and carrier.TeamId == actor.TeamId)
@@ -782,10 +942,20 @@ local function onDefensiveRequest(player: Player, payload)
 	local accepted, reason, result
 	if isSlide then
 		accepted, reason, result = DefendingService.AttemptSlideTackle(actor)
+		sendFeedback(actor, accepted, reason, result, actionType)
 	else
 		accepted, reason, result = DefendingService.AttemptTackle(actor)
+		--[[
+			A standing tackle now reports twice as far as the player is concerned:
+			nothing here on a successful commit, and the real outcome from the sweep
+			when the contact window resolves. Only a REJECTED commit -- cooldown,
+			recovery, match state -- answers immediately, because there is nothing
+			still to come.
+		]]
+		if not accepted then
+			sendFeedback(actor, accepted, reason, result, actionType)
+		end
 	end
-	sendFeedback(actor, accepted, reason, result, actionType)
 end
 
 function DefendingService.Initialize()
@@ -808,6 +978,7 @@ function DefendingService.Initialize()
 		recoveryUntilById[player.UserId] = nil
 		lastInterceptionAtById[player.UserId] = nil
 		lastSlideAtById[player.UserId] = nil
+		pendingChallengeById[player.UserId] = nil
 	end)
 
 	--[[
@@ -821,6 +992,11 @@ function DefendingService.Initialize()
 		local ok, failure = pcall(updateInterceptions)
 		if not ok then
 			warn("[Beyond90][Server][Defending] Interception sweep failed: " .. tostring(failure))
+		end
+		-- Committed challenges resolve on the same tick; see updatePendingChallenges.
+		local challengeOk, challengeFailure = pcall(updatePendingChallenges)
+		if not challengeOk then
+			warn("[Beyond90][Server][Defending] Challenge sweep failed: " .. tostring(challengeFailure))
 		end
 	end)
 end

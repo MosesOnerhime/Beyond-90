@@ -319,6 +319,29 @@ local function isLocalGoalkeeper(): boolean
 		and model:GetAttribute(GoalkeeperConfig.RoleAttributeName) == GoalkeeperConfig.Role
 end
 
+--[[
+	IS THE KEEPER'S OWN HANDLING ABOUT TO TAKE THIS INPUT?
+
+	Only while the keeper actually HAS the ball. Refusing every attacking action
+	for anyone wearing the gloves meant a keeper could not kick a ball that was
+	sitting on the grass -- including their own GOAL KICK, where the keeper is
+	the nominated taker and the ball is placed at their feet. Pass and shoot were
+	both swallowed: this controller declined them because the player is a keeper,
+	and the keeper's own reroute declined them because there was nothing in his
+	hands. The restart then timed out and was abandoned.
+
+	With the ball in hand, distribution and the drop kick belong to the keeper's
+	controller and this one stands aside. With the ball on the ground, a keeper
+	kicks it exactly like any other footballer.
+]]
+local function goalkeeperHandlingOwnsInput(): boolean
+	if not isLocalGoalkeeper() then
+		return false
+	end
+	local model = localPlayer.Character
+	return model ~= nil and model:GetAttribute(GoalkeeperConfig.Attributes.Holding) == true
+end
+
 local function onFootballAction(action)
 	local remote = requestRemote
 
@@ -348,7 +371,7 @@ local function onFootballAction(action)
 		passing pipeline. Letting the attacking actions through as well would
 		send two competing requests for one press.
 	]]
-	if isLocalGoalkeeper() then
+	if goalkeeperHandlingOwnsInput() then
 		return
 	end
 

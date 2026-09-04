@@ -104,33 +104,43 @@ local DefendingConfig = {
 		GoalSideStandoff = 3.4,
 		ApproachLateralOffset = 2.4,
 		--[[
-			PRESSING IS CONTAINMENT. IT IS NOT A TACKLE.
+			PRESSING RUNS THE CARRIER DOWN AND CHALLENGES WHEN IT CAN.
 
-			The press used to challenge automatically as soon as a locally
-			predicted tackle scored above this threshold, and that is the whole of
-			why it did not read as football. Two separate things were wrong with
-			it.
+			This has been both ways and the reasoning for each is worth keeping,
+			because the disagreement was real and the resolution is not a
+			coin-flip.
 
-			It was not what defending looks like. Watch the supplied eFootball
-			capture: the defensive controls are three DISTINCT things -- MATCH UP,
-			DASH & PRESSURE and TACKLE -- and holding the contain button does not
-			produce a tackle at any point. The defender stays in front of the
-			carrier, goal-side, matching them step for step and refusing to dive
-			in. That is the pressure. Winning the ball is a separate decision the
-			defender takes when they judge the moment, and diving in when the
-			moment is not there is precisely the mistake the containment is
-			protecting them from.
+			IT USED TO AUTO-CHALLENGE, and was changed to pure containment on two
+			grounds. First, an observation from the earlier eFootball capture that
+			the defensive controls are three distinct things -- MATCH UP, DASH &
+			PRESSURE and TACKLE -- and that holding contain there does not produce
+			a tackle. Second, that deciding when to commit took a football decision
+			from the player, which AGENTS.md section 2 names explicitly.
 
-			And it took a football decision away from the player. AGENTS.md draws
-			the line in as many words -- assistance may execute the player's
-			intent, it may not choose it, and "whether to tackle" is named
-			explicitly among the decisions that must stay the player's. An assist
-			that decided when to commit was on the wrong side of that line.
+			IT AUTO-CHALLENGES AGAIN, by design decision, and both grounds are
+			answered rather than overruled.
 
-			So holding this input now CONTAINS, and only that. Tapping it tackles,
-			exactly as it always has, so a player who wants the challenge is never
-			slower for the containment existing. The threshold below is retained
-			for the AI presser, which does still have to decide for itself.
+			On the footage: the observation stands, but it was read too narrowly.
+			The three controls remain three distinct things here -- a TAP still
+			tackles at a moment of the player's exact choosing, and that is a
+			different act from holding. What changed is that the hold is no longer
+			required to be passive to stay distinct from the tap.
+
+			On the decision: AGENTS.md section 2 now carries a subsection, "A Held
+			Input Is Itself A Decision", written after this argument. A sustained
+			input is a choice the player is making continuously, and releasing it
+			ends the behaviour at once. Holding a press is a request to win the
+			ball back, not a request to stand nearby.
+
+			The genuine risk in the old version -- that it read as a lunge -- is
+			answered by geometry rather than by removing the feature. The challenge
+			is gated on the ball-duel angle, so one whose path runs through the
+			carrier's body is never requested. See
+			TackleEvaluator.BallDuelLikeliness, a close port of the test
+			GameplayFootball gates its own automatic challenge on.
+
+			This threshold is retained for the AI presser, which has always had to
+			decide for itself.
 		]]
 		AutoTackleScore = 0.56,
 
@@ -151,7 +161,24 @@ local DefendingConfig = {
 		Contain = {
 			Enabled = true,
 			-- Inside this gap the press stops approaching and starts containing.
-			ContainRange = 13,
+			--[[
+				WAS 13, WHICH MADE THE PRESS A JOG.
+
+				Containment caps the defender at MaximumMoveMagnitude and forbids
+				sprinting, on purpose -- a defender at top speed cannot turn. But
+				starting it 13 studs out meant the whole APPROACH was capped too,
+				so holding the press produced a defender jogging at 72% from a
+				distance where he should be closing the ground flat out. Reported
+				as "the automatic sprinting does not work", and it is the same
+				cause as "he doesn't get round to a good position": the curved
+				recovery approach exists, it was just never run at pace.
+
+				Now it begins just outside the standoff the defender is trying to
+				hold (5.6), so the sequence is sprint the ground down, then settle
+				into the jockey on arrival -- which is the eFootball behaviour the
+				milestone is reproducing.
+			]]
+			ContainRange = 8,
 			StandoffDistance = 5.6,
 			--[[
 				A hard floor on how close the target may be to the carrier's
@@ -202,7 +229,29 @@ local DefendingConfig = {
 			drops back to a jockey so the defender can react to a change of
 			direction instead of running past the carrier.
 		]]
-		SprintDistance = 11,
+		--[[
+			HOLDING THE PRESS IS A CHASE, NOT A WALK.
+
+			This was 11: the defender only sprinted while further than that from
+			the carrier, and jogged the rest of the way in. Requested change --
+			holding the press should run the carrier down the way Dash & Pressure
+			does in eFootball, so the sprint now covers effectively the whole
+			approach and only lifts once the defender is on top of the carrier.
+
+			The jockey speed cap below still applies inside ContainRange, so this
+			does not turn containment itself into a sprint -- a defender at top
+			speed cannot turn, which is the thing jockeying exists to preserve.
+		]]
+		SprintDistance = 2.5,
+
+		--[[
+			How long a held press waits between challenge requests.
+
+			Covers the server's own recovery after a refused or missed challenge,
+			so the hold keeps trying without flooding the remote with requests
+			that cannot succeed yet.
+		]]
+		AutoChallengeIntervalSeconds = 0.45,
 		--[[
 			ROUTING AROUND, NOT THROUGH (§38).
 
@@ -223,8 +272,26 @@ local DefendingConfig = {
 		-- Assistance stops helping once inside this distance so the player is not
 		-- driven into the carrier automatically.
 		HoldDistance = 4.2,
-		SlowDistance = 9,
-		MaximumMoveMagnitude = 0.85,
+		--[[
+			WAS 9, WHICH BLED SPEED OFF THE WHOLE CHASE.
+
+			The assist scales its magnitude down between SlowDistance and
+			HoldDistance so the defender settles onto the press point instead of
+			running through it. At 9 that deceleration started while the defender
+			was still most of a chase away, and bottomed out at 30% -- so a press
+			that was allowed to sprint still crawled the last stretch.
+
+			Pulled in to just outside the hold point: the defender now runs the
+			ground down and decelerates late, which is both faster and closer to
+			how a real press arrives.
+		]]
+		SlowDistance = 5.6,
+		--[[
+			Was 0.85. A press that the game has decided should sprint has no
+			reason to be held below full: the jockey cap inside ContainRange is
+			what keeps a contained defender balanced, and that still applies.
+		]]
+		MaximumMoveMagnitude = 1,
 		ManualOverrideMagnitude = 0.9,
 		FacingResponsiveness = 11,
 		Duration = 1.35,
@@ -259,6 +326,35 @@ local DefendingConfig = {
 		The values that are not listed here are inherited from the standing
 		Tackle, so the two cannot drift apart on the terms they share.
 	]]
+	--[[
+		THE CONTACT WINDOW (Milestone 6.8).
+
+		A challenge is a committed action that is contestable over a span of time,
+		not a test taken at the instant the button is pressed. Two sources agree on
+		this from different directions: GameplayFootball registers a tackle only
+		while the actor is inside an animation frame window
+		(`match.cpp:1835-1838`, frames 5-28), and the eFootball reference footage
+		shows roughly a second from committed approach to won ball with about half
+		of that in physical contact
+		(docs/research/gameplay-football/ai/03-pressing-and-tackling.md, A3/B1).
+
+		Windup is the part that cannot be taken back -- the leg is already going.
+		The contact window is how long afterwards the challenge can still connect.
+		Together they are what makes a tackle MISTIMEABLE: too early and the
+		carrier has not arrived, too late and they are gone, and in both cases the
+		defender has spent the commitment either way.
+
+		Deliberately short. Beyond 90 leans arcade, and a long window would read as
+		a magnet rather than a challenge.
+	]]
+	ContactWindow = {
+		WindupSeconds = 0.08,
+		ContactWindowSeconds = 0.28,
+		-- Clients read this to hold the challenge animation and suppress input
+		-- for its duration. The server owns the commitment.
+		CommittedAttribute = "Beyond90ChallengeUntil",
+	},
+
 	Slide = {
 		ActionType = "SlideTackle",
 		Enabled = true,
@@ -444,14 +540,75 @@ local DefendingConfig = {
 
 	AI = {
 		Enabled = true,
+
+		--[[
+			WHEN AN AI SLIDES (Milestone 6.8).
+
+			Until now AI footballers never slid at all -- `AttemptSlideTackle` was
+			reachable only from the client remote.
+
+			GameplayFootball fires its slide inside a narrow band with a LOWER bound
+			as well as an upper one (`playercontroller.cpp:388-415`,
+			`ballDist in (0.7, 1.6)`), which is the non-obvious half: a ball at your
+			feet is not a sliding situation, it is a standing one. Beyond 90 gets
+			the same shape from its own numbers rather than a converted constant --
+			the band starts just beyond `AI.TackleDistance`, where a standing
+			challenge stops being possible, and ends inside `Slide.MaximumBallDistance`
+			with margin. So an AI slides exactly when it cannot reach with a step
+			but could reach by committing, which is both the reference's intent and
+			the football reason for the shot.
+
+			The reference also refuses to slide at all on a team containing a human
+			(`GetHumanGamerCount() != 0`). That rule cannot come across: Beyond 90's
+			whole identity is mixed human/AI sides (AGENTS.md 47), so it would
+			disable the behaviour in nearly every match. The intent -- do not let
+			bots slide recklessly around people -- is preserved through the score
+			threshold and a long cooldown instead.
+		]]
+		Slide = {
+			Enabled = true,
+			-- Just beyond a standing challenge, comfortably inside slide reach.
+			MinimumBallDistance = 6.6,
+			MaximumBallDistance = 9.2,
+			--[[
+				The duel-likeliness gate. Higher than the standing-tackle threshold
+				on purpose: a slide that does not come off leaves the defender on the
+				floor, so it has to be a better bet than a tackle to be worth taking.
+			]]
+			--[[
+				Measured at 0.58 / 7s: 8 slides across 150s of 3v3, with one AI
+				going to ground four times in that span -- too often for a last
+				resort, even allowing that a 3v3 contests the ball far more per
+				player than a full-sided match would.
+			]]
+			MinimumScore = 0.63,
+			-- Rarity. A slide is a last resort, not a challenge type.
+			DecisionCooldown = 11,
+			--[[
+				The shot block. GameplayFootball widens its band for an opponent who
+				is shooting with a touch pending, which is the one case where sliding
+				at full stretch is correct even from further out.
+			]]
+			ShotBlockMaximumBallDistance = 10.5,
+			ShotBlockMinimumScore = 0.4,
+		},
 		-- Only the designated presser challenges, so a team does not collapse
 		-- onto one carrier.
 		TackleDistance = 5.6,
-		MinimumScoreToAttempt = 0.42,
+		--[[
+			Lowered with MinimumContainSeconds above. The reference has no score
+			gate at all -- the angle is the whole decision -- but Beyond 90's
+			evaluation also judges reach and facing, which the reference handles
+			elsewhere, so a low floor is kept to stop challenges that cannot
+			physically connect.
+		]]
+		MinimumScoreToAttempt = 0.3,
 		DecisionCooldown = 1.15,
 		CommitmentSeconds = 0.45,
 		-- Bounded reaction so AI does not challenge with zero latency.
-		ReactionDelay = 0.2,
+		-- Trimmed alongside the containment gate; the reference has no reaction
+		-- delay on a challenge at all.
+		ReactionDelay = 0.12,
 		--[[
 			THE AI CONTAINS BEFORE IT COMMITS.
 
@@ -465,7 +622,42 @@ local DefendingConfig = {
 			delay on reaction: the AI still closes immediately, it simply does not
 			dive in on arrival.
 		]]
-		MinimumContainSeconds = 0.55,
+		--[[
+			THE DUEL ANGLE GATE (ported thresholds).
+
+			GameplayFootball gates its two challenge types on the same geometric
+			test at two different heights: `_InterfereCommand` refuses below 0.2,
+			`_SlidingCommand` refuses below 0.7
+			(`playercontroller.cpp`, commit 1dc1518a). Those thresholds are used
+			here unchanged -- they are ratios of a normalised dot product, so
+			unlike a distance they carry across to Beyond 90's scale directly.
+
+			0.2 is a LOW bar on purpose: it only rules out challenges that would
+			have to go through the opponent's body. 0.7 is a high one, because a
+			slide that misses leaves the defender on the floor.
+
+			See TackleEvaluator.BallDuelLikeliness.
+		]]
+		MinimumDuelLikeliness = 0.2,
+		SlideMinimumDuelLikeliness = 0.7,
+		--[[
+			ALMOST NOTHING, NOW THAT THE ANGLE DECIDES.
+
+			Measured: adding the duel test ON TOP of this gate made defending more
+			conservative, not less -- tackles fell from 3 to 1 across matched 100s
+			samples, because a challenge then had to clear the angle test AND a
+			score threshold AND half a second of containment AND a reaction delay.
+
+			GameplayFootball has none of that stack. `_InterfereCommand` refuses
+			only below 0.2 duel likeliness and otherwise challenges; there is no
+			dwell, no score gate and no reaction delay anywhere in it. Adopting the
+			reference means adopting that structure, not bolting its test onto a
+			more cautious one.
+
+			Kept at a token value rather than zero so a defender still cannot
+			challenge on the same frame it arrives.
+		]]
+		MinimumContainSeconds = 0.15,
 		--[[
 			Above this score the challenge is good enough to take regardless of
 			how long the defender has been containing. A ball left genuinely

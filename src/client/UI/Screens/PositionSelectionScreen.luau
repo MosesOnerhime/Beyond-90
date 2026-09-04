@@ -10,13 +10,13 @@
 ]]
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local UserInputService = game:GetService("UserInputService")
 
 local React = require(ReplicatedStorage.Shared.ReactPackages).React
 local Assets = require(ReplicatedStorage.Shared.Config.UIAssetConfig)
 local PositionConfig = require(ReplicatedStorage.Shared.Config.PositionConfig)
 local Theme = require(script.Parent.Parent.Theme)
 local ReactUI = require(script.Parent.Parent.Components.ReactUI)
+local MenuKit = require(script.Parent.Parent.Components.MenuKit)
 local MenuFooter = require(script.Parent.Parent.Components.MenuFooter)
 local BackButton = require(script.Parent.Parent.Components.BackButton)
 
@@ -272,7 +272,7 @@ local function PositionCard(props)
 			Font = Theme.Fonts.Navigation,
 			Text = props.DisplayName,
 			TextColor3 = Theme.Text,
-			TextSize = if props.Mobile then 10 else 13,
+			TextSize = MenuKit.Size(props.Mobile, 13),
 			TextXAlignment = Enum.TextXAlignment.Left,
 			ZIndex = 4,
 		}),
@@ -283,7 +283,7 @@ local function PositionCard(props)
 			Font = Theme.Fonts.Caption,
 			Text = props.Summary,
 			TextColor3 = Theme.MutedText,
-			TextSize = if props.Mobile then 8 else 11,
+			TextSize = MenuKit.Size(props.Mobile, 11),
 			TextXAlignment = Enum.TextXAlignment.Left,
 			TextWrapped = true,
 			ZIndex = 4,
@@ -308,14 +308,16 @@ local function PositionCard(props)
 			Font = Theme.Fonts.Caption,
 			Text = props.StatusText,
 			TextColor3 = if taken then Theme.Warning else Theme.MutedText,
-			TextSize = if props.Mobile then 8 else 10,
+			TextSize = MenuKit.Size(props.Mobile, 10),
 			ZIndex = 4,
 		}),
 	})
 end
 
 return function(props)
-	local mobile = UserInputService.TouchEnabled
+	-- Phone landscape, decided by the viewport rather than by whether the device
+	-- happens to have a touchscreen; see MenuKit.Compact.
+	local mobile = MenuKit.Compact()
 	local slots = PositionConfig.GetSelectableSlots(props.ModeId)
 	local occupancy = props.Occupancy or {}
 
@@ -414,7 +416,7 @@ return function(props)
 			Size = UDim2.fromScale(if mobile then 0.3 else 0.22, if mobile then 0.09 else 0.07),
 			BackgroundColor3 = Theme.AccentDark, BorderSizePixel = 0,
 			Font = Theme.Fonts.Navigation, Text = "CONTINUE", TextColor3 = Theme.Text,
-			TextSize = if mobile then 14 else 17, ZIndex = 2,
+			TextSize = MenuKit.Size(mobile, 17), ZIndex = 2,
 			[React.Event.Activated] = function() props.Continue(selected) end,
 		}, {
 			Corner = ReactUI.Corner(5), Stroke = ReactUI.Stroke(Theme.AccentCyan, 1.25, 0.18),

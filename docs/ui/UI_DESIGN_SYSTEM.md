@@ -383,3 +383,41 @@ They may use:
 - time-sensitive event cards.
 
 They should not inherit excessive menu decoration.
+
+
+---
+
+## Selection And Focus: Edge Markers, Not Rings
+
+**Decision (2026-09-01), replacing the previous outline-based states.**
+
+Selection and gamepad focus are shown with a solid marker on the control's
+LEADING EDGE, plus a small lift in the card's own surface. They are never shown
+with a ring, halo, or glowing border around the control.
+
+- **Selected** (the screen you are on): 4px accent-blue bar down the left edge,
+  72% of the card's height, centred vertically.
+- **Focused** (where the controller is sitting): the same bar in white — the
+  same white selected labels use.
+- **Primary buttons**, whose labels are centred and which have no leading edge to
+  spare, use a 3px white underline across the middle 55% instead.
+- **Hover**: surface lift only.
+
+### Why
+
+Rings were rejected in playtest ("I do not like the blue selector round
+boxes/buttons in the menu"), and `AGENTS.md` §40 already lists *glowing borders
+on every card* among the defaults to avoid. Three outlines were stacking at once
+on the Home cards: a cyan halo on the selected card, a brightened stroke on it,
+and a second ring on the focused one.
+
+An edge marker is what sports broadcast and EA FC's own menus use. It reads at TV
+distance, survives a bright stadium background behind a translucent panel, costs
+one thin rectangle, and leaves the card's rectangle clean — which is what makes
+the "strong rectangular navigation cards" of the approved mockup work.
+
+### Rule
+
+Every screen uses the same marker. If a control cannot take a leading-edge bar,
+use the underline variant — do not reintroduce an outline for that one case, or
+selection stops meaning the same thing from screen to screen.

@@ -468,7 +468,33 @@ local BallConfig = {
 		MaxControlCenterHeight = physicsRadius + 1.25,
 		MaxControllableBallSpeed = 54,
 		MaxRelativeSpeed = 42,
-		IntendedReceiverReachDistance = 8.25,
+		--[[
+			HOW FAR AWAY THE INTENDED RECEIVER MAY CLAIM A PASS.
+
+			This was 8.25, and it is the whole of "receiving a pass feels sloppy".
+			The runtime evidence names itself:
+
+				[Reception] player=morhanzy type=GroundPass distance=8.25 ...
+				[ReceptionHandoff] leadBefore=8.16 ... expectedLead=3.56
+
+			-- the ball was claimed eight studs away, then moved to three and a
+			half. That four-and-a-half-stud correction is a yank, and no amount of
+			animation hides it: the footballer never reaches for the ball, the
+			ball jumps to him.
+
+			The generous radius existed so a pass would never fail to arrive. That
+			is the right goal and the wrong lever. Reception is made reliable by
+			GETTING THE RECEIVER TO THE BALL -- which is what the movement assist
+			is for, and which is strengthened in the same change (see
+			PlayerConfig.Locomotion.ReceptionAssist.LiveTargetFullTrustDistance).
+			Widening the grab radius instead just moves the failure from "missed
+			it" to "teleported it".
+
+			Now just above IncomingReachDistance: an intended receiver still gets
+			more latitude than someone intercepting a stray ball, because the pass
+			was meant for him, but he has to actually be there.
+		]]
+		IntendedReceiverReachDistance = 5.4,
 		IntendedReceiverMaxBallSpeed = 145,
 		IntendedReceiverMaxCenterHeight = 4.25,
 		IntendedReceiverLateralTolerance = 4.25,
@@ -507,6 +533,52 @@ local BallConfig = {
 		IntendedReceiverScoreBonus = 0.55,
 		AngularDampingOnSettle = 0.65,
 		AngularDampingOnReceive = 0.25,
+	},
+
+	--[[
+		THE FLIGHT TRAIL (Milestone 6.9).
+
+		A struck ball leaves a thin line behind it so the player can read where it
+		came from and where it is going. On a broadcast camera the football is a
+		small object against a busy pitch, and at the speeds a shot travels it can
+		cross most of the screen between glances -- the trail is what makes that
+		flight legible.
+
+		Modelled on the EA FC Pro Clubs goalkeeper view in
+		`ref/EA FC 26 Pro Clubs goalkeeper pov.mp4`. OBSERVED FROM FOOTAGE: the
+		trail there is thin, close to white, quite transparent, follows the ball's
+		curved flight rather than a straight line, and fades out along its length
+		so the oldest part is gone. It is emphatically not a thick glowing streak.
+
+		Deliberately only for a STRUCK ball. A trail during ordinary dribbling
+		would scribble over the pitch continuously and tell the player nothing they
+		cannot already see, so it appears on a shot, pass or clearance and stops
+		once the ball is under control again.
+	]]
+	Trail = {
+		Enabled = true,
+		-- Actions that leave a trail. A dribble touch is not one of them.
+		Actions = {
+			Shoot = true,
+			GroundPass = true,
+			LobPass = true,
+			ThroughPass = true,
+			Clearance = true,
+		},
+		-- Seconds of flight the line remembers. Short: it should read as motion,
+		-- not as a drawing of the whole move.
+		Lifetime = 0.42,
+		-- Width at the ball, tapering to nothing behind it.
+		WidthStuds = 0.5,
+		Color = Color3.fromRGB(236, 244, 255),
+		-- Transparency runs head -> tail. Never fully opaque even at the head.
+		HeadTransparency = 0.45,
+		TailTransparency = 1,
+		-- The trail switches off this long after the strike even if the ball is
+		-- still loose, so a ball rolling to a stop does not keep drawing.
+		MaximumSeconds = 2.4,
+		-- Vertical separation of the two attachments the trail is drawn between.
+		WidthAnchorOffset = 0.25,
 	},
 
 	Visual = {

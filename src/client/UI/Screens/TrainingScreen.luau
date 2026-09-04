@@ -199,6 +199,9 @@ local function TrainingScreen(props)
 						end
 					end,
 				}, {
+					-- Proportional height, so no floor of its own; this is the ~48px
+					-- touch target from docs/ui/UI_AGENT_DECISION_RULES.md section 8.
+					MinimumHeight = ReactUI.MinimumSize(nil, Theme.MinimumTouchTarget),
 					Corner = ReactUI.Corner(7),
 					Stroke = ReactUI.Stroke(Theme.StrokeBright, 1.5, 0.15),
 					Gradient = ReactUI.Gradient(Theme.AccentDark, Theme.AccentViolet, 20),
@@ -252,6 +255,9 @@ local function TrainingScreen(props)
 						end
 					end,
 				}, {
+					-- Proportional height, so no floor of its own; this is the ~48px
+					-- touch target from docs/ui/UI_AGENT_DECISION_RULES.md section 8.
+					MinimumHeight = ReactUI.MinimumSize(nil, Theme.MinimumTouchTarget),
 					Corner = ReactUI.Corner(6),
 					Stroke = ReactUI.Stroke(Theme.StrokeBright, 1.3, 0.2),
 				}),

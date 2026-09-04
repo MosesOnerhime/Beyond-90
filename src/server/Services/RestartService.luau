@@ -608,6 +608,24 @@ function RestartService.Prepare(restart: string, takingTeamId: string, ballPosit
 				-- The thrower stands outside the touchline.
 				local _, lateral = PitchGeometry.ToNormalized(frame, ballPosition)
 				away = frame.Right * (if lateral > 0 then 1 else -1)
+			elseif restart == MatchRulesConfig.Restarts.Kickoff then
+				--[[
+					THE KICK-OFF TAKER STANDS IN THE OPPONENT'S HALF.
+
+					Every other restart puts the taker BEHIND the ball so they run
+					onto it going forwards. A kick-off is the one restart where
+					that is wrong: the ball is on the halfway line, the taker's
+					own team is all behind it -- the Laws require it -- and
+					standing behind the ball too puts the taker among his own
+					team-mates with nothing in front of him but opponents.
+
+					So he steps over the line. Combined with the facing rule in
+					getTakerFacingPoint, that leaves him where a kick-off is
+					actually taken from: just inside the opponent half, turned
+					back towards his own team, with every passing option in front
+					of him instead of behind his shoulder.
+				]]
+				away = frame.Forward
 			else
 				-- Behind the ball, facing the attacking goal.
 				away = -frame.Forward

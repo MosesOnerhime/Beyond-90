@@ -23,6 +23,7 @@ local GoalkeeperConfig = require(ReplicatedStorage.Shared.Config.GoalkeeperConfi
 local StaminaConfig = require(ReplicatedStorage.Shared.Config.StaminaConfig)
 local CameraConfig = require(ReplicatedStorage.Shared.Config.CameraConfig)
 local ReactUI = require(script.Parent.Parent.Components.ReactUI)
+local MenuKit = require(script.Parent.Parent.Components.MenuKit)
 local InputController = require(script.Parent.Parent.Parent.Controllers.InputController)
 
 local localPlayer = Players.LocalPlayer
@@ -32,6 +33,19 @@ local localPlayer = Players.LocalPlayer
 local sessionControlsExpanded = false
 -- Which tab the full controls reference was left on, likewise per session.
 local sessionControlsTab = nil
+
+--[[
+	An authored desktop type size, adapted for this display.
+
+	The HUD's fixed sizes ran from 9px to 14px and never changed -- measured, a
+	1920x1080 monitor and a 780x360 phone rendered the identical 9px control
+	prompts, because a raw TextSize is a device pixel count and nothing was
+	scaling it. Theme.Size grows it on large displays and floors it at the
+	readability minimum on small ones; see Theme for the derivation.
+]]
+local function hudSize(desktop: number): number
+	return Theme.Size(Theme.Compact(), desktop)
+end
 
 local function panel(props, children)
 	local merged = {
@@ -53,7 +67,18 @@ local function label(props)
 		TextColor3 = Theme.Text,
 	}
 	for key, value in props do merged[key] = value end
-	return React.createElement("TextLabel", merged)
+	--[[
+		Through MenuKit so a TextScaled label picks up the readability floor.
+
+		Most of the HUD's own text is TextScaled inside a proportional box, which
+		has no lower bound at all -- measured on a 780x360 phone the match clock
+		came out about 8px and the stamina caption about 6px. The scorebug's
+		clock and score are the first two things
+		docs/ui/UI_COMPONENTS_AND_PATTERNS.md section 7 says the scorebug MUST
+		prioritise, so they are the last text that should vanish on a small
+		screen.
+	]]
+	return MenuKit.Text(merged)
 end
 
 local function findPitchBounds(): BasePart?
@@ -76,6 +101,9 @@ local function Minimap()
 	-- Which horizontal end of the map the local team attacks: -1 left, +1 right.
 	local attackingEnd, setAttackingEnd = React.useState(0)
 	local mobile = UserInputService.TouchEnabled
+	-- Layout density is a question about the screen, not the input; see the note
+	-- on the same pair in the HUD component below.
+	local compact = Theme.Compact()
 	React.useEffect(function()
 		local trackedPlayers = Players:GetPlayers()
 		local elapsed = 0
@@ -247,8 +275,8 @@ local function Minimap()
 		-- Mobile sits closer to the bottom edge and is slightly smaller, so the
 		-- lower HUD row reads as one band without crowding the touch controls.
 		-- Desktop framing is unchanged.
-		AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromScale(0.5, if mobile then 0.995 else 0.965),
-		Size = UDim2.fromScale(if mobile then 0.142 else 0.125, if mobile then 0.205 else 0.16),
+		AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromScale(0.5, if compact then 0.995 else 0.965),
+		Size = UDim2.fromScale(if compact then 0.142 else 0.125, if compact then 0.205 else 0.16),
 		BackgroundColor3 = Color3.fromRGB(3, 10, 18),
 		BackgroundTransparency = 0.3,
 	}, {
@@ -299,7 +327,7 @@ local function ControlSectionRow(props)
 			Font = Theme.Fonts.HUDLabel,
 			Text = props.Title,
 			TextColor3 = Theme.FaintText,
-			TextSize = 9,
+			TextSize = hudSize(9),
 			TextXAlignment = Enum.TextXAlignment.Left,
 		}),
 	})
@@ -317,8 +345,8 @@ local function ControlsTab(props)
 		AutoButtonColor = false,
 		Font = Theme.Fonts.HUDLabel,
 		Text = props.Label,
-		TextColor3 = if selected then Theme.AccentCyan else Theme.MutedText,
-		TextSize = 10,
+		TextColor3 = if selected then Theme.SelectedText else Theme.MutedText,
+		TextSize = hudSize(10),
 		ZIndex = 42,
 		[React.Event.Activated] = props.Select,
 	}, {
@@ -333,6 +361,22 @@ end
 
 local function ControlRow(props)
 	local accent = props.Accent or Theme.AccentCyan
+	--[[
+		A KEY CHIP IS AS WIDE AS ITS KEY.
+
+		The chip was a fixed 22px square, which suits "V" or "E" and cannot hold
+		"SHIFT" -- measured, that needed 25px of glyphs in the 22px chip and
+		spilled over the edge. A UITextSizeConstraint sat here to catch exactly
+		this, but a constraint only takes effect when TextScaled is set, and it
+		was not, so it had never done anything.
+
+		Both halves are fixed: the chip grows for longer keys the way a real key
+		pill does, and TextScaled plus the constraint keeps the text inside it
+		without dropping below the readability floor. The action label starts
+		after whatever width the chip ends up with, so rows still line up.
+	]]
+	local keyText = tostring(props.Key or "")
+	local chipWidth = math.max(CONTROL_GLYPH_SIZE, 10 + #keyText * 7)
 	return React.createElement("Frame", {
 		LayoutOrder = props.Order,
 		Size = UDim2.new(1, 0, 0, CONTROL_ROW_HEIGHT),
@@ -344,7 +388,7 @@ local function ControlRow(props)
 			BackgroundTransparency = 1, Image = props.Glyph, ScaleType = Enum.ScaleType.Fit,
 		}) or React.createElement("Frame", {
 			AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 0, 0.5, 0),
-			Size = UDim2.fromOffset(CONTROL_GLYPH_SIZE, CONTROL_GLYPH_SIZE),
+			Size = UDim2.fromOffset(chipWidth, CONTROL_GLYPH_SIZE),
 			BackgroundColor3 = Color3.fromRGB(11, 17, 34),
 			BackgroundTransparency = 0.1, BorderSizePixel = 0,
 		}, {
@@ -352,26 +396,28 @@ local function ControlRow(props)
 			Stroke = ReactUI.Stroke(accent, 1.25, 0.32),
 			Key = React.createElement("TextLabel", {
 				Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
-				Font = Theme.Fonts.Navigation, Text = props.Key, TextColor3 = accent,
-				TextSize = 10, TextXAlignment = Enum.TextXAlignment.Center,
+				Font = Theme.Fonts.Navigation, Text = keyText, TextColor3 = accent,
+				TextXAlignment = Enum.TextXAlignment.Center,
 				TextYAlignment = Enum.TextYAlignment.Center,
+				-- TextScaled is what makes the constraint below apply at all.
+				TextScaled = true,
 			}, {
-				--[[
-					A key chip holds anything from "V" to "SHIFT". The constraint
-					shrinks the longer ones to fit rather than letting them
-					overflow the chip, which is what made the reference look
-					broken on the movement rows.
-				]]
-				Constraint = React.createElement("UITextSizeConstraint", { MaxTextSize = 10, MinTextSize = 7 }),
+				Padding = ReactUI.Padding(2, 2, 4, 4),
+				-- Was MinTextSize = 7, below the readability floor the rest of the
+				-- UI now holds; Max comes off the same scale so it stays above Min.
+				Constraint = React.createElement("UITextSizeConstraint", {
+					MaxTextSize = math.max(hudSize(10), Theme.MinimumCompactTextSize),
+					MinTextSize = Theme.MinimumCompactTextSize,
+				}),
 			}),
 		}),
 		Action = React.createElement("TextLabel", {
 			AnchorPoint = Vector2.new(0, 0.5),
-			Position = UDim2.new(0, CONTROL_GLYPH_SIZE + 8, 0.5, 0),
-			Size = UDim2.new(1, -(CONTROL_GLYPH_SIZE + 8), 0, 14),
+			Position = UDim2.new(0, chipWidth + 8, 0.5, 0),
+			Size = UDim2.new(1, -(chipWidth + 8), 0, 14),
 			BackgroundTransparency = 1,
 			Font = Theme.Fonts.HUDLabel, Text = props.Action,
-			TextColor3 = Theme.Text, TextSize = 11,
+			TextColor3 = Theme.Text, TextSize = hudSize(11),
 			TextXAlignment = Enum.TextXAlignment.Left,
 			TextYAlignment = Enum.TextYAlignment.Center,
 			TextTruncate = Enum.TextTruncate.AtEnd,
@@ -401,7 +447,9 @@ local function TouchActionButton(props)
 		BackgroundColor3 = if pressed then Color3.fromRGB(33, 99, 157) else Color3.fromRGB(6, 16, 35),
 		BackgroundTransparency = if pressed then 0.08 else 0.22, BorderSizePixel = 0,
 		AutoButtonColor = false, Font = Theme.Fonts.Navigation, Text = props.Text,
-		TextColor3 = Color3.fromRGB(235, 243, 255), TextSize = props.TextSize or 11,
+		TextColor3 = Color3.fromRGB(235, 243, 255),
+		-- Callers pass an already-scaled size; this is the scaled default.
+		TextSize = props.TextSize or hudSize(11),
 		ZIndex = 32,
 		[React.Event.InputBegan] = function(_, input)
 			if input.UserInputType == Enum.UserInputType.Touch then setHeld(true) end
@@ -731,13 +779,13 @@ local function MobileTouchControls()
 				DIVE is the big one, because it is the only input whose TIMING is
 				being tested.
 			]]
-			Through = (not isGoalkeeper) and React.createElement(TouchActionButton, { Position = UDim2.fromOffset(72, 76), Size = UDim2.fromOffset(66, 66), Text = "THROUGH", TextSize = 9, OnChanged = function(value) InputController.SetTouchFootballAction("ThroughPass", value) end }) or nil,
+			Through = (not isGoalkeeper) and React.createElement(TouchActionButton, { Position = UDim2.fromOffset(72, 76), Size = UDim2.fromOffset(66, 66), Text = "THROUGH", TextSize = hudSize(9), OnChanged = function(value) InputController.SetTouchFootballAction("ThroughPass", value) end }) or nil,
 			-- Contextual: in goal this is the DIVE; outfield it is SHOOT with the
 			-- ball and PRESS without it.
 			Shoot = React.createElement(TouchActionButton, {
 				Position = UDim2.fromOffset(174, 50), Size = UDim2.fromOffset(76, 76),
 				Text = if isGoalkeeper then "DIVE" elseif hasPossession then "SHOOT" else "PRESS",
-				TextSize = 12,
+				TextSize = hudSize(12),
 				OnChanged = function(value)
 					InputController.SetTouchFootballAction(
 						if isGoalkeeper or not hasPossession then "Tackle" else "Shoot",
@@ -752,7 +800,7 @@ local function MobileTouchControls()
 				OnChanged = function(value) InputController.SetTouchFootballAction("GroundPass", value) end,
 			}),
 			Sprint = React.createElement(TouchActionButton, { Position = UDim2.fromOffset(174, 148), Size = UDim2.fromOffset(82, 72), Text = "DASH", OnChanged = InputController.SetTouchSprint }),
-			KnockOn = (not isGoalkeeper) and React.createElement(TouchActionButton, { Position = UDim2.fromOffset(8, 126), Size = UDim2.fromOffset(58, 58), Text = "PUSH", TextSize = 9, OnChanged = function(value) InputController.SetTouchFootballAction("KnockOn", value) end }) or nil,
+			KnockOn = (not isGoalkeeper) and React.createElement(TouchActionButton, { Position = UDim2.fromOffset(8, 126), Size = UDim2.fromOffset(58, 58), Text = "PUSH", TextSize = hudSize(9), OnChanged = function(value) InputController.SetTouchFootballAction("KnockOn", value) end }) or nil,
 		}),
 	})
 end
@@ -850,6 +898,21 @@ local function GameplayHUD(props)
 		setControlsTabState(value)
 	end
 	local mobile = UserInputService.TouchEnabled
+	--[[
+		TWO DIFFERENT QUESTIONS, TWO DIFFERENT FLAGS.
+
+		`mobile` gates touch-only UI -- the sticks, the action pads, and hiding
+		the keyboard reference panels. That genuinely is a question about the
+		INPUT: a touchscreen laptop wants on-screen controls whatever size its
+		screen is, and a small desktop window does not want them at all.
+
+		`compact` drives layout density and type size. That is a question about
+		the SCREEN, and it is the one the menus already answer through
+		Theme.Compact. Using TouchEnabled for it meant the HUD laid itself out
+		identically at 1920x1080 and at 780x360 -- measured, the same 23 labels at
+		the same sizes -- so it never actually adapted to a phone at all.
+	]]
+	local compact = Theme.Compact()
 	local topLeftInset = GuiService:GetGuiInset()
 	local topInset = math.max(topLeftInset.Y, 0)
 	React.useEffect(function()
@@ -1226,8 +1289,21 @@ local function GameplayHUD(props)
 		]]
 		Scoreboard = React.createElement("Frame", {
 			AnchorPoint = Vector2.new(0.5, 0),
-			Position = UDim2.new(0.5, 0, 0, math.max(2, topInset * (if mobile then 0.35 else 0.18)) + 2),
-			Size = UDim2.fromScale(if mobile then 0.36 else 0.255, if mobile then 0.075 else 0.068),
+			Position = UDim2.new(0.5, 0, 0, math.max(2, topInset * (if compact then 0.35 else 0.18)) + 2),
+			--[[
+				TALLER ON A PHONE, NOT JUST WIDER.
+
+				docs/ui/UI_COMPONENTS_AND_PATTERNS.md section 7 puts score and
+				match time at the top of what the scorebug MUST prioritise, and at
+				7.5% of a 360px screen the whole bug was 27px -- which left the
+				clock a 9px-tall box. The text floor then held the clock at 11px
+				and it simply overflowed the box it was given.
+
+				Flooring the type without giving it somewhere to sit only moves
+				the problem, so the bug itself grows on compact. 13% of height is
+				still a sparse HUD, and it buys the clock ~17px and the score ~26.
+			]]
+			Size = UDim2.fromScale(if compact then 0.36 else 0.255, if compact then 0.13 else 0.068),
 			BackgroundTransparency = 1,
 		}, {
 			BrandClock = panel({ Size = UDim2.fromScale(0.24, 1) }, {
@@ -1246,8 +1322,8 @@ local function GameplayHUD(props)
 		}),
 		MatchBanner = bannerText and panel({
 			AnchorPoint = Vector2.new(0.5, 0),
-			Position = UDim2.new(0.5, 0, 0, math.max(2, topInset * (if mobile then 0.35 else 0.18)) + (if mobile then 44 else 56)),
-			Size = UDim2.fromScale(if mobile then 0.34 else 0.2, if mobile then 0.05 else 0.042),
+			Position = UDim2.new(0.5, 0, 0, math.max(2, topInset * (if compact then 0.35 else 0.18)) + (if compact then 44 else 56)),
+			Size = UDim2.fromScale(if compact then 0.34 else 0.2, if compact then 0.05 else 0.042),
 			BackgroundTransparency = 0.12,
 		}, {
 			Accent = React.createElement("Frame", {
@@ -1262,7 +1338,10 @@ local function GameplayHUD(props)
 		}) or nil,
 		Ping = panel({
 			AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(0.982, 0.018),
-			Size = UDim2.fromScale(0.072, 0.044),
+			-- 4.4% of a 360px screen is 15px, which leaves the readout a 9px box
+			-- and pushes 11px text out of it. Taller on compact so the number
+			-- sits inside the chip it is drawn in.
+			Size = UDim2.fromScale(if compact then 0.1 else 0.072, if compact then 0.075 else 0.044),
 		}, {
 			Icon = React.createElement("ImageLabel", { Position = UDim2.fromScale(0.1, 0.18), Size = UDim2.fromScale(0.28, 0.64), BackgroundTransparency = 1, Image = Assets.HUD.Network, ScaleType = Enum.ScaleType.Fit }),
 			Value = label({ Position = UDim2.fromScale(0.4, 0.2), Size = UDim2.fromScale(0.5, 0.6), Font = Theme.Fonts.Statistics, Text = if ping then string.format("%.0fms", ping) else "--ms", TextColor3 = if not ping or ping < 90 then Theme.Good elseif ping < 170 then Theme.Warning else Theme.Poor, TextScaled = true }),
@@ -1271,8 +1350,10 @@ local function GameplayHUD(props)
 			-- Mobile drops to the bottom band alongside the minimap; desktop keeps
 			-- its existing placement.
 			AnchorPoint = Vector2.new(0, 1),
-			Position = UDim2.fromScale(0.026, if mobile then 0.992 else 0.935),
-			Size = UDim2.fromScale(if mobile then 0.26 else 0.21, if mobile then 0.11 else 0.1),
+			Position = UDim2.fromScale(0.026, if compact then 0.992 else 0.935),
+			-- A little taller on compact so the name and bar clear the floor; the
+			-- two secondary stamina readouts drop instead of squeezing further.
+			Size = UDim2.fromScale(if compact then 0.28 else 0.21, if compact then 0.15 else 0.1),
 		}, {
 			Badge = React.createElement("ImageLabel", { Position = UDim2.fromScale(0.035, 0.12), Size = UDim2.fromScale(0.22, 0.76), BackgroundTransparency = 1, Image = Assets.HUD.PlayerBadge, ScaleType = Enum.ScaleType.Fit }),
 			Name = label({ Position = UDim2.fromScale(0.28, 0.12), Size = UDim2.fromScale(0.66, 0.3), Font = Theme.Fonts.Navigation, Text = "10  " .. string.upper(localPlayer.DisplayName), TextScaled = true, TextXAlignment = Enum.TextXAlignment.Left }),
@@ -1289,8 +1370,20 @@ local function GameplayHUD(props)
 				fresh, amber once fatigue starts biting, red near empty. The
 				thresholds are the stamina model's own, not invented here.
 			]]
-			StaminaLabel = label({ Position = UDim2.fromScale(0.28, 0.54), Size = UDim2.fromScale(0.22, 0.18), Font = Theme.Fonts.Caption, Text = "STAMINA", TextScaled = true, TextXAlignment = Enum.TextXAlignment.Left }),
-			StaminaTrack = React.createElement("Frame", { Position = UDim2.fromScale(0.51, 0.58), Size = UDim2.fromScale(0.31, 0.09), BackgroundColor3 = Color3.fromRGB(13, 17, 28), BorderSizePixel = 0 }, {
+			--[[
+				The caption and the percentage are the first things to go on a
+				phone. The BAR carries the reading -- length and colour both -- so
+				the word "STAMINA" beside it and the exact number are duplicates,
+				and docs/ui/UI_RESPONSIVE_INPUT.md section 2 drops secondary
+				content before it lets primary text shrink. Measured, the caption
+				had a 7px-tall box at 780x360, which nothing legible fits.
+			]]
+			StaminaLabel = (not compact) and label({ Position = UDim2.fromScale(0.28, 0.54), Size = UDim2.fromScale(0.22, 0.18), Font = Theme.Fonts.Caption, Text = "STAMINA", TextScaled = true, TextXAlignment = Enum.TextXAlignment.Left }) or nil,
+			StaminaTrack = React.createElement("Frame", {
+				Position = UDim2.fromScale(if compact then 0.28 else 0.51, if compact then 0.6 else 0.58),
+				Size = UDim2.fromScale(if compact then 0.66 else 0.31, if compact then 0.14 else 0.09),
+				BackgroundColor3 = Color3.fromRGB(13, 17, 28), BorderSizePixel = 0,
+			}, {
 				Fill = React.createElement("Frame", {
 					Size = UDim2.fromScale(math.clamp(stamina / StaminaConfig.Maximum, 0, 1), 1),
 					BackgroundColor3 = staminaColor,
@@ -1298,13 +1391,13 @@ local function GameplayHUD(props)
 					Visible = stamina > 0.5,
 				}),
 			}),
-			StaminaValue = label({
+			StaminaValue = (not compact) and label({
 				Position = UDim2.fromScale(0.84, 0.53), Size = UDim2.fromScale(0.12, 0.2),
 				Font = Theme.Fonts.Statistics,
 				Text = string.format("%d%%", math.floor(stamina + 0.5)),
 				TextColor3 = staminaColor,
 				TextScaled = true,
-			}),
+			}) or nil,
 		}),
 		Radar = React.createElement(Minimap),
 		--[[
@@ -1361,7 +1454,9 @@ local function GameplayHUD(props)
 					Font = Theme.Fonts.HUDLabel,
 					Text = "MAIN CONTROLS",
 					TextColor3 = Theme.MutedText,
-					TextSize = 9,
+					-- Authored at 9, which is below the readability floor on any
+					-- display where TextScale is not already lifting it.
+					TextSize = hudSize(11),
 					TextXAlignment = Enum.TextXAlignment.Left,
 					ZIndex = 42,
 				}),
@@ -1419,7 +1514,7 @@ local function GameplayHUD(props)
 				Font = Theme.Fonts.Navigation,
 				Text = "ALL CONTROLS",
 				TextColor3 = Theme.Text,
-				TextSize = 12,
+				TextSize = hudSize(12),
 				TextXAlignment = Enum.TextXAlignment.Left,
 				ZIndex = 45,
 			}),
@@ -1431,7 +1526,7 @@ local function GameplayHUD(props)
 				Font = Theme.Fonts.Navigation,
 				Text = "+",
 				TextColor3 = Theme.MutedText,
-				TextSize = 14,
+				TextSize = hudSize(14),
 				ZIndex = 45,
 			}),
 		}) or nil,
@@ -1477,7 +1572,7 @@ local function GameplayHUD(props)
 					Font = Theme.Fonts.Navigation,
 					Text = "ALL CONTROLS",
 					TextColor3 = Theme.Text,
-					TextSize = 12,
+					TextSize = hudSize(12),
 					TextXAlignment = Enum.TextXAlignment.Left,
 					ZIndex = 46,
 				}),
@@ -1489,7 +1584,7 @@ local function GameplayHUD(props)
 					Font = Theme.Fonts.Navigation,
 					Text = "\u{2212}",
 					TextColor3 = Theme.MutedText,
-					TextSize = 13,
+					TextSize = hudSize(13),
 					ZIndex = 46,
 				}),
 			}),
@@ -1544,7 +1639,7 @@ local function GameplayHUD(props)
 			AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(0.982, 0.071),
 			Size = UDim2.fromScale(0.09, 0.037), BackgroundColor3 = Color3.fromRGB(10, 17, 35),
 			BackgroundTransparency = 0.08, BorderSizePixel = 0, Font = Enum.Font.GothamMedium,
-			Text = "RETURN TO MENU", TextColor3 = Color3.fromRGB(220, 227, 242), TextSize = 11,
+			Text = "RETURN TO MENU", TextColor3 = Color3.fromRGB(220, 227, 242), TextSize = hudSize(11),
 			[React.Event.Activated] = props.ReturnToMenu,
 		}, { Corner = ReactUI.Corner(4), Stroke = ReactUI.Stroke(Color3.fromRGB(74, 88, 122), 1, 0.5) }),
 		--[[
@@ -1562,7 +1657,7 @@ local function GameplayHUD(props)
 				AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(1, 0), Size = UDim2.fromOffset(108, 32),
 				BackgroundColor3 = Color3.fromRGB(7, 17, 35), BackgroundTransparency = 0.12,
 				BorderSizePixel = 0, AutoButtonColor = false, Font = Theme.Fonts.Navigation,
-				Text = "RETURN TO MENU", TextColor3 = Color3.fromRGB(226, 235, 249), TextSize = 9,
+				Text = "RETURN TO MENU", TextColor3 = Color3.fromRGB(226, 235, 249), TextSize = hudSize(9),
 				[React.Event.Activated] = props.ReturnToMenu,
 			}, { Corner = ReactUI.Corner(5), Stroke = ReactUI.Stroke(Color3.fromRGB(83, 113, 153), 1, 0.38) }),
 		}),

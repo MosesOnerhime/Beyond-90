@@ -89,9 +89,9 @@ ControlSchemeConfig.Groups = { "Movement", "Attacking", "Defending", "Camera" }
 	-- are dropped instead of being relabelled into something invented.
 ]]
 ControlSchemeConfig.GoalkeeperOverrides = {
-	Tackle = { Label = "DIVE  (AIM WITH MOVE)", Group = "Goalkeeping" },
+	Tackle = { Label = "DIVE  (OR LEFT CLICK, THEN A / D)", Group = "Goalkeeping" },
 	Pass = { Label = "THROW / ROLL OUT", Group = "Goalkeeping" },
-	Shoot = { Label = "KICK LONG", Group = "Goalkeeping" },
+	Shoot = { Label = "DROP KICK  (WITH BALL)", Group = "Goalkeeping" },
 }
 
 -- Rows an outfielder has that a goalkeeper does not.

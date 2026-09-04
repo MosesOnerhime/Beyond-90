@@ -753,6 +753,28 @@ local function setupUserInputFallback()
 	end))
 end
 
+--[[
+	The action currently being CHARGED, and for how long.
+
+	`actionStartedAt` already tracks this so a release can report its hold
+	duration; exposing it lets presentation read the charge live, every frame,
+	rather than only learning about it once the button comes back up.
+
+	Returns nil when nothing is held. When several are somehow held at once the
+	longest-held wins, because that is the one about to be released.
+]]
+function InputController.GetChargingAction(): (string?, number)
+	local now = os.clock()
+	local bestType, bestHeld = nil, 0
+	for actionType, startedAt in actionStartedAt do
+		local held = now - startedAt
+		if held > bestHeld then
+			bestType, bestHeld = actionType, held
+		end
+	end
+	return bestType, bestHeld
+end
+
 function InputController.GetInputState()
 	local direction, magnitude = getWorldMoveDirection(inputState.MoveVector)
 	inputState.MoveDirection = direction
@@ -791,7 +813,29 @@ function InputController.SetTouchFootballAction(actionType: string, pressed: boo
 	end
 	if actionType == "GroundPass" then
 		handlePassGesture(pressed)
-	elseif actionType == "ThroughPass" or actionType == "KnockOn" or actionType == "Shoot" then
+	elseif
+		actionType == "ThroughPass"
+		or actionType == "KnockOn"
+		or actionType == "Shoot"
+		--[[
+			TACKLE WAS MISSING, AND IT IS TWO CONTROLS.
+
+			The touch HUD sends "Tackle" for the outfield PRESS button and for the
+			goalkeeper's DIVE button -- the two share a binding because winning
+			the ball back and going to get it are the same intent (see
+			GoalkeeperController's input reroute). Neither reached anything: this
+			branch listed every other action and simply dropped "Tackle" on the
+			floor, so on a phone the keeper could not dive and an outfielder could
+			not press. There was no error to notice, because a fall-through is
+			not one.
+
+			`handleBoolFootballAction` is the same dispatcher the keyboard and
+			gamepad bindings use, so touch now produces the identical
+			Pressed/Released pair with a hold duration -- which the press needs,
+			being a held input (section 2), and which the dive ignores.
+		]]
+		or actionType == "Tackle"
+	then
 		handleBoolFootballAction(actionType, pressed)
 	end
 end
@@ -806,6 +850,9 @@ function InputController.ReleaseTouchInputs()
 	actionStartedAt.ThroughPass = nil
 	actionStartedAt.KnockOn = nil
 	actionStartedAt.Shoot = nil
+	-- Cleared with the rest: a press interrupted by a menu or a respawn would
+	-- otherwise report its hold duration as the time since it was first touched.
+	actionStartedAt.Tackle = nil
 end
 
 function InputController.GetCameraLockToggleEvent(): BindableEvent

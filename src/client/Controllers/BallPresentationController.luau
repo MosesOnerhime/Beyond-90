@@ -382,7 +382,126 @@ local function updateReconciliation(ball: BasePart)
 	end
 end
 
+--[[
+	THE FLIGHT TRAIL.
+
+	See BallConfig.Trail for what it looks like and why it only appears on a
+	struck ball. This is presentation and lives entirely on the client: the
+	server already publishes what it needs -- which action was played and when --
+	as attributes on the football, so nothing has to be sent for the trail's sake.
+
+	The Trail instance is built once and then only enabled and disabled. Roblox
+	draws a Trail between two attachments, so the pair is what gives it width;
+	they sit above and below the ball's centre and the line is drawn as the ball
+	carries them through the air.
+]]
+local trailInstance: Trail? = nil
+local trailBall: BasePart? = nil
+local trailStartedAt = 0
+local lastTrailActionTime = -1
+
+local function ensureTrail(ball: BasePart): Trail?
+	local config = BallConfig.Trail
+	if not config or config.Enabled ~= true then
+		return nil
+	end
+	if trailInstance and trailInstance.Parent == ball then
+		return trailInstance
+	end
+	if trailInstance then
+		trailInstance:Destroy()
+		trailInstance = nil
+	end
+
+	local top = Instance.new("Attachment")
+	top.Name = "Beyond90TrailTop"
+	top.Position = Vector3.new(0, config.WidthAnchorOffset, 0)
+	top.Parent = ball
+
+	local bottom = Instance.new("Attachment")
+	bottom.Name = "Beyond90TrailBottom"
+	bottom.Position = Vector3.new(0, -config.WidthAnchorOffset, 0)
+	bottom.Parent = ball
+
+	local trail = Instance.new("Trail")
+	trail.Name = "Beyond90FlightTrail"
+	trail.Attachment0 = top
+	trail.Attachment1 = bottom
+	trail.Lifetime = config.Lifetime
+	trail.Color = ColorSequence.new(config.Color)
+	trail.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, config.HeadTransparency),
+		NumberSequenceKeypoint.new(1, config.TailTransparency),
+	})
+	-- Tapers to nothing behind the ball rather than ending in a blunt edge.
+	trail.WidthScale = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1),
+		NumberSequenceKeypoint.new(1, 0),
+	})
+	trail.MinLength = 0
+	trail.FaceCamera = true
+	trail.LightEmission = 0.35
+	trail.Enabled = false
+	trail.Parent = ball
+
+	trailInstance = trail
+	trailBall = ball
+	return trail
+end
+
+local function updateTrail(ball: BasePart)
+	local config = BallConfig.Trail
+	if not config or config.Enabled ~= true then
+		return
+	end
+	local trail = ensureTrail(ball)
+	if not trail then
+		return
+	end
+
+	local action = ball:GetAttribute("LastFootballAction")
+	local actionTime = ball:GetAttribute("LastFootballActionTime")
+	if typeof(actionTime) == "number" and actionTime > 0 and actionTime ~= lastTrailActionTime then
+		lastTrailActionTime = actionTime
+		--[[
+			A new strike. Only the actions listed in config start a trail, so a
+			dribble touch or a tackle deflection leaves nothing behind.
+		]]
+		if typeof(action) == "string" and config.Actions[action] == true then
+			trailStartedAt = os.clock()
+			trail.Enabled = true
+		end
+	end
+
+	if not trail.Enabled then
+		return
+	end
+
+	--[[
+		It stops when the ball stops being a ball in flight: someone brings it
+		under control, or enough time passes that whatever was struck is over.
+		Both are needed -- a pass that is never collected would otherwise draw
+		until the next touch.
+	]]
+	local controlled = ball:GetAttribute("State") == "Controlled"
+	local expired = os.clock() - trailStartedAt > config.MaximumSeconds
+	if controlled or expired then
+		trail.Enabled = false
+	end
+end
+
 local function updatePresentation(deltaTime: number)
+	--[[
+		The trail is independent of the presentation proxy. The proxy is a
+		development stand-in for the ball's appearance; the trail is a real
+		gameplay-readability feature and has to be there whether or not the proxy
+		is in use, so it runs before that early return.
+	]]
+	local trailBallPart = getFootball()
+	if trailBallPart and trailBallPart.Parent then
+		updateTrail(trailBallPart)
+	end
+
 	if not isPresentationProxyEnabled() then
 		cleanup()
 		return

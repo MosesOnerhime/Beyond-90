@@ -7,6 +7,7 @@ local DevToolsConfig = require(Shared.Config.DevToolsConfig)
 local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
 local GameConfig = require(Shared.Config.GameConfig)
+local BallControlMath = require(Shared.Football.BallControlMath)
 
 local AIService = require(script.Parent.AIService)
 local BallService = require(script.Parent.BallService)
@@ -204,6 +205,60 @@ local function onRequest(player: Player, payload)
 		BallService.Reset()
 		log(string.format("%s ResetBall", player.Name))
 		sendFeedback(player, action, true, "reset")
+		return
+	end
+
+	--[[
+		GIVE ME THE BALL (§18).
+
+		No fake possession path: the ball is placed at the requester's feet, at
+		rest, with whoever had it released. The normal acquisition rules then
+		hand it over on the next update exactly as they would for a loose ball
+		anyone had walked onto -- which is the point, because a dev tool that
+		granted possession through a private door would be testing a code path
+		no real player can reach (§48).
+
+		A keeper standing in their own area gets it IN HAND instead, because that
+		is what possession means for a keeper. R puts it back down.
+	]]
+	if action == actions.GivePossession then
+		local character = player.Character
+		local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+		if not rootPart or not rootPart:IsA("BasePart") then
+			sendFeedback(player, action, false, "no-character")
+			return
+		end
+		local ball = BallService.GetBall()
+		if not ball then
+			sendFeedback(player, action, false, "no-ball")
+			return
+		end
+
+		BallControlService.ForceRelease(ball, "dev tool gave possession")
+
+		--[[
+			Placed just in FRONT of the feet rather than on top of them: dropping
+			it inside the body leaves it fighting the character's own collision,
+			which looks like the ball jittering rather than like a footballer with
+			the ball at their feet.
+		]]
+		local facing = BallControlMath.SafeUnit(
+			BallControlMath.GetHorizontal(rootPart.CFrame.LookVector),
+			Vector3.zAxis
+		)
+		local place = rootPart.Position + facing * DevToolsConfig.GivePossessionLead
+		ball.CFrame = CFrame.new(Vector3.new(place.X, rootPart.Position.Y, place.Z))
+		ball.AssemblyLinearVelocity = Vector3.zero
+		ball.AssemblyAngularVelocity = Vector3.zero
+
+		local actor = FootballerRegistryService.GetHumanActor(player)
+		local inHand = false
+		if actor and GoalkeeperService.IsInsideOwnPenaltyArea(actor) then
+			inHand = GoalkeeperService.Hold(actor)
+		end
+
+		log(string.format("%s GivePossession -> %s", player.Name, if inHand then "in hand" else "at feet"))
+		sendFeedback(player, action, true, if inHand then "in hand" else "at feet")
 		return
 	end
 

@@ -2,6 +2,7 @@ local ContentProvider = game:GetService("ContentProvider")
 local GuiService = game:GetService("GuiService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -188,6 +189,47 @@ local function App(props)
 	setGoalState = setGoalVisible
 
 	local rootFrameRef = React.useRef(nil)
+
+	--[[
+		RE-RENDER THE MENU WHEN THE VIEWPORT CHANGES.
+
+		Text size is derived from the viewport (see MenuKit.TextScale), and a
+		derivation is only as live as the render that reads it. Without this, a
+		window resize or a device rotation left every label at the size computed
+		for the previous screen until something else happened to re-render the
+		tree -- which, on a menu the player is just looking at, might be never.
+
+		A revision counter rather than storing the size itself: nothing here needs
+		the value, only the re-render, and keeping a Vector2 in state would
+		re-render on every equal-valued reassignment as well.
+
+		One subscription for the whole menu, at the root, so no screen has to
+		remember to be responsive on its own.
+	]]
+	local _, setViewportRevision = React.useState(0)
+	React.useEffect(function()
+		local camera = Workspace.CurrentCamera
+		if not camera then
+			return
+		end
+		local function bump()
+			setViewportRevision(function(previous)
+				return previous + 1
+			end)
+		end
+		local connection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(bump)
+		-- The development layout override re-renders through the same path, so
+		-- forcing the compact branch behaves exactly like resizing the window
+		-- rather than needing the menu to be torn down and remounted.
+		-- See MenuKit.Compact.
+		local override = localPlayer
+			:GetAttributeChangedSignal("Beyond90ForceCompactLayout")
+			:Connect(bump)
+		return function()
+			connection:Disconnect()
+			override:Disconnect()
+		end
+	end, {})
 
 	React.useEffect(function()
 		localPlayer:SetAttribute("Beyond90MenuSurfaceMounted", true)

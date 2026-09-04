@@ -1,5 +1,14 @@
 local CameraConfig = {
 	DefaultMode = "Broadcast",
+	--[[
+		A goalkeeper opens in PRO CAMERA regardless of the outfield default.
+
+		Broadcast framing is built to read the whole pitch from side on, which is
+		the wrong view for the one player whose job is judging a ball coming
+		toward him. The keeper's own setting still wins if they have chosen one;
+		this only replaces the fallback.
+	]]
+	GoalkeeperDefaultMode = "ThirdPerson",
 
 	--[[
 		DEFAULT CAMERA, chosen by the player (§21, §64).
@@ -193,6 +202,84 @@ local CameraConfig = {
 		]]
 		OnBall = { Distance = 23, Height = 9.5, Pitch = 14, FOV = 70, LookAhead = 9 },
 		OffBall = { Distance = 28, Height = 13, Pitch = 19, FOV = 76, LookAhead = 13 },
+
+		--[[
+			THE GOALKEEPER'S PRO CAMERA.
+
+			A keeper stands under his own crossbar, so the ordinary Pro Camera
+			framing puts the goal frame straight through the middle of the view --
+			the post and bar obscure exactly the part of the pitch the keeper needs
+			to read.
+
+			Raised and pitched down harder so the camera looks over the frame
+			rather than through it, pulled back a little for the same reason, and
+			widened slightly because a keeper's job is reading the whole box rather
+			than one duel.
+
+			Modelled on the Pro Clubs keeper view in
+			`ref/EA FC 26 Pro Clubs goalkeeper pov.mp4`. OBSERVED FROM FOOTAGE: the
+			camera sits behind and above the keeper with the goal frame occupying
+			only the bottom of the screen and the pitch filling the rest, which is
+			what these numbers are chosen to reproduce.
+		]]
+		Goalkeeper = {
+			--[[
+				STEEPER, AND STILL THE WHOLE PITCH.
+
+				Reported twice that this view was not angled enough. The first
+				cause was that these numbers never reached the camera at all --
+				while the mouse is locked, which is the normal gameplay state,
+				`ThirdPersonCamera` drove pitch purely from accumulated mouse
+				movement seeded off the OUTFIELD preset, so a keeper got the
+				outfield 14 degrees no matter what was written here. That is
+				fixed in the camera; these are the numbers it now actually uses.
+
+				How steep is safe. The top edge of the frame sits at
+				(Pitch - FOV/2) below horizontal, and a ray at angle A from
+				height H meets the ground at H/tan(A), so the far goal stays in
+				shot while that angle is small. The pitch is ~341 studs end to
+				end (goal centres measured at z=+207 and z=-134):
+
+					OnBall   36 - 78/2 = -3 deg   -> above the horizon
+					OffBall  40 - 84/2 = -2 deg   -> above the horizon
+
+				Both edges point ABOVE the horizon, so the far goal and the
+				stands behind it are comfortably in frame with room to spare --
+				the constraint is not close to binding, which is what allows the
+				downward angle to go this far.
+			]]
+			--[[
+				CLOSER. Reported as too far away.
+
+				Measured against the reference frames: the keeper's body occupies
+				roughly a sixth of the frame height, with the goal frame filling
+				the bottom of the shot -- a camera just behind and above the man,
+				not a stand view of him. At 25 studs back with a 78 degree field
+				he was a speck.
+
+				Distance and height come down together, keeping their ratio so
+				the DOWNWARD ANGLE the last pass established is preserved, and the
+				field narrows because a nearer camera does not need the width to
+				see the same box.
+
+				The far-end check still holds. Top of frame at (Pitch - FOV/2),
+				and a ray at angle A from height H reaches H/tan(A):
+
+					OnBall   36 - 70/2 = +1 deg   14/tan(1) = 802 studs
+					OffBall  40 - 76/2 = +2 deg   17/tan(2) = 487 studs
+
+				against a 341 stud pitch, so both clear the far goal.
+
+				(An earlier revision of this note recorded the off-ball edge as
+				-1 degree, i.e. above the horizon. That was an arithmetic slip --
+				40 - 38 is +2, not -1. The VALUES were and are fine; only the
+				recorded working was wrong. Since §11 requires this check before
+				and after changing either number, a wrong check written down is
+				the trap, which is why it is corrected rather than deleted.)
+			]]
+			OnBall = { Distance = 16, Height = 14, Pitch = 36, FOV = 70, LookAhead = 8 },
+			OffBall = { Distance = 19, Height = 17, Pitch = 40, FOV = 76, LookAhead = 11 },
+		},
 		-- How fast the rig morphs between those two. Slow enough that winning and
 		-- losing the ball is not a lurch.
 		RigResponsiveness = 3.2,

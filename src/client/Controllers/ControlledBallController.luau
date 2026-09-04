@@ -983,6 +983,44 @@ local function sampleDiagnostics(ball: BasePart, rootPart: BasePart, direction: 
 	))
 end
 
+--[[
+	HOW FAR BEHIND THE FOOT THE BALL IS, 0 to 1.
+
+	Extracted so the HANDOFF servo can use it too. It could not before: the
+	rear-lag correction lived inside the ordinary carry path, and the handoff
+	branch returns long before reaching it -- so for the first
+	HandoffStabilizationDuration after gaining possession there was no rear-lag
+	authority at all.
+
+	That window is the worst possible place to have none. It is exactly when a
+	footballer collects a pass and accelerates away, and the runtime evidence is
+	a ball that simply does not come with them:
+
+		epoch=30 initialised   initialLead=+3.56   playerSpeed  4.8
+		0.77s later            realClient=-10.76   playerSpeed 16.0
+
+	-- the player covered twelve studs and the ball stayed where it was, ending
+	up ten studs behind the man supposedly dribbling it. The handoff servo's own
+	minimum-lead nudge is a single spring toward HandoffMinForwardLead, which is
+	far too gentle for an error of that size, and by the time the window expired
+	the ball was already deep enough to force a Capture recovery.
+
+	The acquisition placement was never the problem -- `rescued=true` shows the
+	ball starting in exactly the right place. It is the half-second afterwards
+	that loses it.
+]]
+local function getRearLagAlpha(leadBeforeTarget: number): number
+	local rearLag = controlConfig.RearLag
+	if not rearLag or rearLag.Enabled ~= true then
+		return 0
+	end
+	return math.clamp(
+		(rearLag.Threshold - leadBeforeTarget) / math.max(rearLag.Threshold - rearLag.FullLag, 1e-4),
+		0,
+		1
+	)
+end
+
 local function applyPossessionServo(ball: BasePart, rootPart: BasePart, locomotionState, deltaTime: number)
 	local now = os.clock()
 	local direction
@@ -1020,8 +1058,24 @@ local function applyPossessionServo(ball: BasePart, rootPart: BasePart, locomoti
 			else Vector3.zero
 		local ballHorizontalVelocity = BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity)
 		local relativeVelocity = ballHorizontalVelocity - playerDesiredVelocity
-		local correctionVelocity = targetError * controlConfig.HandoffPositionGain
-			- relativeVelocity * controlConfig.HandoffVelocityDamping
+
+		--[[
+			The same rear-lag authority the carry servo has. See getRearLagAlpha:
+			without it this window was the one place a trailing ball was left to
+			the ordinary gain, which is why possession collapsed in the half
+			second after every pass was received.
+		]]
+		local rearLag = controlConfig.RearLag
+		local handoffPositionGain = controlConfig.HandoffPositionGain
+		local handoffVelocityDamping = controlConfig.HandoffVelocityDamping
+		local lagAlpha = getRearLagAlpha(leadBeforeTarget)
+		if lagAlpha > 0 and rearLag then
+			handoffPositionGain *= 1 + (rearLag.PositionGainScale - 1) * lagAlpha
+			handoffVelocityDamping *= 1 + (rearLag.VelocityDampingScale - 1) * lagAlpha
+		end
+
+		local correctionVelocity = targetError * handoffPositionGain
+			- relativeVelocity * handoffVelocityDamping
 			+ applyBodyExclusion(ball, rootPart, direction)
 
 		if leadBeforeTarget < controlConfig.HandoffMinForwardLead then
@@ -1100,11 +1154,7 @@ local function applyPossessionServo(ball: BasePart, rootPart: BasePart, locomoti
 	]]
 	local rearLag = controlConfig.RearLag
 	if rearLag and rearLag.Enabled == true and controlMode ~= "Capture" and not controlledRestActive then
-		local lagAlpha = math.clamp(
-			(rearLag.Threshold - leadBeforeTarget) / math.max(rearLag.Threshold - rearLag.FullLag, 1e-4),
-			0,
-			1
-		)
+		local lagAlpha = getRearLagAlpha(leadBeforeTarget)
 		if lagAlpha > 0 then
 			positionGain *= 1 + (rearLag.PositionGainScale - 1) * lagAlpha
 			velocityDamping *= 1 + (rearLag.VelocityDampingScale - 1) * lagAlpha

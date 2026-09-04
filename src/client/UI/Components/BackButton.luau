@@ -39,6 +39,11 @@ function BackButton.Root(props)
 		[React.Event.MouseEnter] = function() setHovered(true) end,
 		[React.Event.MouseLeave] = function() setHovered(false) end,
 	}, {
+		-- A proportional height has no floor. At 780x360 this came out 156x27,
+		-- against the ~48px touch target docs/ui/UI_AGENT_DECISION_RULES.md
+		-- section 8 asks for; back is the control a touch player reaches for
+		-- most, so it is the last one that should be hard to hit.
+		MinimumHeight = ReactUI.MinimumSize(nil, Theme.MinimumTouchTarget),
 		Corner = ReactUI.Corner(6),
 		Stroke = ReactUI.Stroke(
 			if hovered then Theme.AccentCyan else Theme.StrokeBright,
@@ -65,7 +70,7 @@ function BackButton.Root(props)
 			Font = Theme.Fonts.Display,
 			Text = "\u{2039}",
 			TextColor3 = if hovered then Theme.AccentCyan else Theme.Text,
-			TextSize = if mobile then 18 else 20,
+			TextSize = Theme.Size(mobile, 20),
 			TextXAlignment = Enum.TextXAlignment.Center,
 			ZIndex = zIndex + 1,
 		}),
@@ -78,7 +83,7 @@ function BackButton.Root(props)
 			Font = Theme.Fonts.Navigation,
 			Text = props.Text or "BACK",
 			TextColor3 = Theme.Text,
-			TextSize = if mobile then 12 else 13,
+			TextSize = Theme.Size(mobile, 13),
 			TextXAlignment = Enum.TextXAlignment.Left,
 			ZIndex = zIndex + 1,
 		}),

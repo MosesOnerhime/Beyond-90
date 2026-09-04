@@ -26,6 +26,50 @@ local FootballActionConfig = {
 		LineColor = Color3.fromRGB(218, 222, 226),
 	},
 
+	--[[
+		THE POWER METER OVER THE PLAYER'S HEAD.
+
+		Both shooting and passing charge by holding the button, and the charge was
+		invisible -- the only way to learn how hard you were about to strike the
+		ball was to strike it. Lives here rather than in a UI config because every
+		number it needs to draw an honest bar comes from the action configs
+		below, and a meter kept in a different file from the values it reports is
+		a meter that drifts out of agreement with them.
+	]]
+	PowerIndicator = {
+		Enabled = true,
+
+		-- Studs above the head. Clear of the tallest rig without floating away
+		-- from the player at broadcast distance.
+		HeightAboveHead = 3.4,
+		Width = 120,
+		Height = 10,
+		LabelHeight = 16,
+		LabelTextSize = 13,
+		CornerRadius = 4,
+
+		--[[
+			Beyond the broadcast camera's useful range the bar would be a smear a
+			few pixels wide, so it simply stops drawing.
+		]]
+		MaximumDistance = 190,
+
+		-- Electric blue for a shot, the menu's interaction colour (§40). Passes
+		-- get a cooler, quieter tone: a pass is the safe option and should not
+		-- shout as loudly as a strike on goal.
+		ShootColor = Color3.fromRGB(64, 156, 255),
+		PassColor = Color3.fromRGB(120, 214, 190),
+		LabelColor = Color3.fromRGB(236, 242, 248),
+		TrackColor = Color3.fromRGB(12, 18, 28),
+		TrackTransparency = 0.35,
+
+		-- Appears quickly, leaves gently. The release is the moment the player is
+		-- watching the ball rather than the meter, so the bar should not vanish
+		-- under their eye.
+		FadeInRate = 22,
+		FadeOutRate = 9,
+	},
+
 	DevelopmentIntensity = {
 		Min = 0.7,
 		Max = 1.4,
@@ -292,9 +336,25 @@ local FootballActionConfig = {
 			Enabled = true,
 			MinimumHoldSeconds = 0.06,
 			MaximumHoldSeconds = 0.85,
-			-- A tap must still be a shot, not a pass at the goal (§65).
-			MinimumPower = 0.58,
+			-- A tap must still be a shot, not a pass at the goal (§65) -- but it
+			-- should not be most of a full-power one either. Widened downward so
+			-- there is a real range for holding to travel across.
+			MinimumPower = 0.4,
 			MaximumPower = 1,
+
+			--[[
+				CHARGE NOW SCALES LAUNCH SPEED.
+
+				It did not. Charge fed shot HEIGHT and CURVE only
+				(ShotPlanner.selectHeightAlpha / resolveCurve) while speed came
+				purely from distance, so holding the button changed where the shot
+				went and never how hard it was struck. A tap and a full charge left
+				the boot at the same pace.
+
+				This is the fraction of the distance-appropriate speed a minimum
+				tap produces; a full charge produces all of it.
+			]]
+			MinimumSpeedScale = 0.6,
 			-- Slightly eased so a short tap is still a usable shot and the top of
 			-- the range takes deliberate commitment.
 			CurveExponent = 1.25,
@@ -364,7 +424,10 @@ local FootballActionConfig = {
 			shot and a full charge is a genuine strike, without every tap becoming
 			a rocket.
 		]]
-		MinLaunchSpeed = 108,
+		-- Base pace reduced on playtest feedback; the top of the range is
+		-- unchanged, so a struck shot is still a struck shot but a casual one is
+		-- no longer nearly as quick. Works with Charge.MinimumSpeedScale above.
+		MinLaunchSpeed = 92,
 		MaxLaunchSpeed = 168,
 		ReferenceDistance = 120,
 		FlightTimeScale = 1.15,

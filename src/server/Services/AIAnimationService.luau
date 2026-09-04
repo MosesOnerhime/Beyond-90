@@ -39,6 +39,10 @@ function AIAnimationService.Register(actor)
 		Pass = loadTrack(animator, assets.Actions.Pass, Enum.AnimationPriority.Action, false),
 		Shoot = loadTrack(animator, assets.Actions.Shoot, Enum.AnimationPriority.Action, false),
 		Heading = loadTrack(animator, assets.Actions.HeadingBall, AnimationConfig.Heading.Priority, false),
+		-- The tackler's own clips. Empty ids load nothing and play nothing; see
+		-- AnimationConfig.Actions.
+		StandingTackle = loadTrack(animator, assets.Actions.StandingTackle, Enum.AnimationPriority.Action, false),
+		SlideTackle = loadTrack(animator, assets.Actions.SlideTackle, Enum.AnimationPriority.Action, false),
 		InjuredWalk = loadTrack(animator, assets.InjuredWalk, AnimationConfig.InjuredWalk.Priority, true),
 		-- Tackle reactions.
 		TackledNormal = loadTrack(animator, assets.Tackled.Normal, AnimationConfig.Tackled.Priority, false),

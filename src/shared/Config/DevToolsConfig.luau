@@ -5,11 +5,27 @@ local DevToolsConfig = {
 	RemoteName = "Beyond90DevToolsRequest",
 	FeedbackRemoteName = "Beyond90DevToolsFeedback",
 
+	-- How far in front of the feet GivePossession drops the ball. Roughly one
+	-- controlled-touch lead, so it lands where a footballer would be carrying it
+	-- rather than inside their own collision.
+	GivePossessionLead = 2.4,
+
 	Actions = {
 		AddAI = "AddAI",
 		RemoveAI = "RemoveAI",
 		ResetPlayer = "ResetPlayer",
 		ResetBall = "ResetBall",
+		--[[
+			GIVE ME THE BALL (§18). Puts the football at the requester's feet,
+			dead, with any existing controller released -- so the ordinary
+			acquisition path hands it straight to them.
+
+			It exists because reaching a specific on-ball situation otherwise
+			means waiting for the AI to concede possession in roughly the right
+			place, which makes testing anything that starts with "while you have
+			the ball" slow and unrepeatable.
+		]]
+		GivePossession = "GivePossession",
 		SetDribblingSkill = "SetDribblingSkill",
 		AddGoalkeeper = "AddGoalkeeper",
 		RemoveGoalkeeper = "RemoveGoalkeeper",

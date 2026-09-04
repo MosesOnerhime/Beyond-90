@@ -7,6 +7,7 @@ local AIConfig = require(Shared.Config.AIConfig)
 local BallConfig = require(Shared.Config.BallConfig)
 local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local GameConfig = require(Shared.Config.GameConfig)
+local GoalkeeperConfig = require(Shared.Config.GoalkeeperConfig)
 local BallControlMath = require(Shared.Football.BallControlMath)
 local ReceptionPlanner = require(Shared.Football.ReceptionPlanner)
 
@@ -557,6 +558,36 @@ end
 	the only way out of it is a legal release action. Before the match has been
 	started at all, no one may touch the ball either.
 ]]
+--[[
+	A BALL IN A KEEPER'S HANDS IS NOT A BALL ON THE GRASS.
+
+	Nothing in this service knew about the goalkeeper hold, so a gathered ball --
+	stationary, a couple of studs from its holder, which is exactly the shape of
+	a loose ball worth collecting -- was claimed by the ordinary dribble
+	acquisition. The runtime caught it happening to the keeper's OWN ball:
+
+		[GK] morhanzy caught the football (ballSpeed=125.1)
+		...
+		[Reception] player=morhanzy type=Shoot distance=2.10 ballSpeed=0.00
+		Ball network owner -> morhanzy
+		[ControlledBall] epoch=23 initialized phase=Carry
+		Control released: movement state invalid
+
+	Two writers then fought over one part: `GoalkeeperService.updateHeldBall`
+	pinning it to the keeper's chest on the server every frame, and the newly
+	network-owning CLIENT carrying it at foot height. The ball ends up inside the
+	keeper's own collidable torso and the solver ejects him -- the reported
+	"glitches upwards when I try to move after catching a ball".
+
+	Football says the same thing more simply: a keeper who has gathered the ball
+	has possession of it, and nobody -- including the keeper -- dribbles it.
+	Gating acquisition is therefore the rule AND the fix.
+]]
+local function isHeldByGoalkeeper(ball: BasePart): boolean
+	local holder = ball:GetAttribute(GoalkeeperConfig.HolderAttributeName)
+	return typeof(holder) == "number" and holder ~= 0
+end
+
 local function isRestartBlocked(_actor): boolean
 	if matchRulesService == nil then
 		local ok, resolved = pcall(function()
@@ -574,6 +605,9 @@ local function isRestartBlocked(_actor): boolean
 end
 
 local function chooseBestCandidate(ball: BasePart)
+	if isHeldByGoalkeeper(ball) then
+		return nil
+	end
 	local bestCandidate = nil
 	local now = os.clock()
 
@@ -1696,6 +1730,10 @@ function BallControlService.TryAcquireAI(ball: BasePart, actor, maximumDistance:
 	end
 	-- Nobody dribbles a stationary restart into play (§27).
 	if isRestartBlocked(actor) then
+		return false
+	end
+	-- Nor a ball a goalkeeper has gathered.
+	if isHeldByGoalkeeper(ball) then
 		return false
 	end
 	local controlCandidate = getAIControllerContext(actor, ball)

@@ -39,7 +39,10 @@ local function SectionButton(props)
 	local selected = props.Selected == true
 	return React.createElement("TextButton", {
 		LayoutOrder = props.Order,
-		Size = UDim2.new(1, 0, 0, if mobile then 26 else 38),
+		-- 26px was barely half the ~48px touch target on a phone; this is the
+		-- page's primary navigation. The list it sits in scrolls, so the taller
+		-- rows do not have to fit the column all at once.
+		Size = UDim2.new(1, 0, 0, if mobile then Theme.MinimumTouchTarget else 38),
 		BackgroundColor3 = if selected then Theme.PanelSelected else MenuKit.PanelColor,
 		BackgroundTransparency = if selected then 0.05 else 0.28,
 		BorderSizePixel = 0,
@@ -173,10 +176,26 @@ local function ClubsScreen(props)
 				Size = UDim2.fromScale(0.28, if mobile then 0.15 else 0.13),
 			}),
 
-			Sections = React.createElement("Frame", {
+			--[[
+				Scrolls, for the same reason the Settings category list does: six
+				sections at the ~48px touch target need more height than 52% of a
+				360px phone can give, and section 2 of the responsive guidance puts
+				target size above showing every section at once.
+
+				AutomaticCanvasSize measures the UIListLayout, so the list does not
+				need to know how many sections exist. Desktop content fits, so no
+				scrollbar appears there.
+			]]
+			Sections = React.createElement("ScrollingFrame", {
 				Position = UDim2.fromScale(if mobile then 0.03 else 0.04, if mobile then 0.3 else 0.3),
 				Size = UDim2.fromScale(if mobile then 0.19 else 0.16, if mobile then 0.52 else 0.5),
 				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				CanvasSize = UDim2.new(),
+				AutomaticCanvasSize = Enum.AutomaticSize.Y,
+				ScrollingDirection = Enum.ScrollingDirection.Y,
+				ScrollBarThickness = if mobile then 3 else 4,
+				ScrollBarImageTransparency = 0.5,
 				ZIndex = 4,
 			}, sectionChildren),
 

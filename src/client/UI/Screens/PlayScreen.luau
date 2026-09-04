@@ -73,6 +73,7 @@ local function MatchCard(props)
 			Text = props.Title,
 			TextColor3 = if available then Theme.Text else Theme.FaintText,
 			TextSize = MenuKit.Size(mobile, 21),
+			FitTo = MenuKit.Size(mobile, 21),
 			ZIndex = 5,
 		}),
 		Detail = MenuKit.Text({
@@ -116,6 +117,7 @@ local function MatchCard(props)
 				Text = props.Format,
 				TextColor3 = if available then Theme.Text else Theme.FaintText,
 				TextSize = MenuKit.Size(mobile, 15),
+				FitTo = MenuKit.Size(mobile, 15),
 				ZIndex = 6,
 			}),
 			Status = MenuKit.Text({
@@ -126,6 +128,7 @@ local function MatchCard(props)
 				Text = if available then "AVAILABLE" else "COMING LATER",
 				TextColor3 = if available then Theme.AccentCyan else Theme.FaintText,
 				TextSize = MenuKit.Size(mobile, 10),
+				FitTo = MenuKit.Size(mobile, 10),
 				TextXAlignment = Enum.TextXAlignment.Right,
 				ZIndex = 6,
 			}),
@@ -156,6 +159,7 @@ local function FeaturedTile(props)
 				Text = props.Format,
 				TextColor3 = Theme.MutedText,
 				TextSize = MenuKit.Size(mobile, 10),
+				FitTo = MenuKit.Size(mobile, 10),
 				TextXAlignment = Enum.TextXAlignment.Center,
 				ZIndex = 6,
 			}),

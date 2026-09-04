@@ -138,6 +138,9 @@ local function buildGui()
 	buttonCorner.Parent = button
 
 	local buttonStroke = Instance.new("UIStroke")
+	-- Border, not glyphs: this is parented to a TextButton, and Contextual would
+	-- outline the label's letters in blue instead of the button's edge.
+	buttonStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 	buttonStroke.Color = Color3.fromRGB(118, 191, 255)
 	buttonStroke.Thickness = 1.4
 	buttonStroke.Transparency = 0.18

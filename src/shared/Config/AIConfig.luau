@@ -55,6 +55,168 @@ local AIConfig = {
 		RootHeightAboveSurface = 5.46,
 	},
 
+	--[[
+		WHAT AN AI FOOTBALLER IS ALLOWED TO KNOW.
+
+		Adapted from GameplayFootball's MentalImage -- see
+		docs/research/gameplay-football/ai/01-perception-reachability-movement.md
+		for the source, the commit and the confirmed behaviour.
+
+		Beyond 90's AI read every opponent's exact position and velocity, every
+		tick, with no error at all. AGENTS.md §49 says plainly that it should not:
+
+			Do not automatically give the AI perfect exploitation of every known
+			value. The game engine may technically know exact states, but
+			difficulty and fairness may require bounded reaction, awareness or
+			prediction accuracy.
+
+		The reference's answer, which is the one adopted here, is a stale snapshot
+		extrapolated forward by momentum and then clamped to a maximum deviation
+		from reality. The football consequence is the point of it: an AI can be
+		beaten by a CHANGE OF DIRECTION, because its picture of you is a moment
+		old, but it is never absurdly wrong about where you are, because the clamp
+		bounds the error. Running in a straight line does not deceive anybody.
+
+		Both values are STARTING points to be tuned by playtest, not ported
+		constants. GameplayFootball uses 2.5 metres and walk velocity; a stud is
+		not a metre and Beyond 90's control distances are deliberately smaller
+		than life, so these are expressed at Beyond 90's own scale (§27).
+	]]
+	Perception = {
+		Enabled = true,
+		-- How far the AI's picture of a footballer may drift from the truth.
+		MaximumPositionDeviationStuds = 4,
+		-- ...and how wrong it may be about how fast they are moving.
+		MaximumVelocityDeviationStuds = 9,
+	},
+
+	--[[
+		OFF-BALL SUPPORT POSITIONING.
+
+		Adapted from GameplayFootball's ElizaController::GetSupportPosition_ForceField
+		and AI_GetForceFieldMovement -- see
+		docs/research/gameplay-football/ai/01-perception-reachability-movement.md
+		sections 3 and 4 for the source, the commit and the confirmed composition.
+
+		Beyond 90 positioned every off-ball footballer at ONE formation anchor and
+		nothing else. Correct shape, no football: nothing pushed two team-mates
+		apart when they converged on the same spot, nothing pulled anybody into
+		space, and nothing kept a supporting player out of the passing lane he was
+		supposed to be offering. That is the "plays like a possession loop rather
+		than like footballers" problem.
+
+		The reference's answer is a field of attractors and repellers solved into
+		one desired position. Its virtue is that the pieces COMPOSE: each is a
+		simple rule, and shape, spacing, support distance and lane discipline fall
+		out of adding them together rather than out of a state machine.
+
+		SCALE. Every distance here is converted from the reference's metres at
+		roughly 3.27 studs per metre (Beyond 90's pitch is 343 studs long against
+		a real pitch's ~105 m). They are converted as RATIOS OF THE PITCH, never
+		copied as literals (AGENTS.md 27), and every one of them is a starting
+		value for playtest rather than a tuned one.
+	]]
+	SupportField = {
+		Enabled = true,
+
+		-- How close to the desired position the pull is damped, so a footballer
+		-- settles instead of oscillating around it.
+		AttractorDampingDistance = 23,
+		-- The solved field is a direction; this is how far ahead of himself a
+		-- footballer is willing to be sent by it. Sprint speed, as in the source.
+		MaximumDisplacement = 31,
+
+		--[[
+			The formation anchor. Constant decay, and its power GROWS with
+			distance -- drift is cheap nearby and expensive far away, which is
+			what makes the team shape self-restoring instead of dissolving.
+		]]
+		AnchorPower = 0.7,
+		AnchorMinimumPowerScale = 0.3,
+		AnchorFullPowerDistance = 65,
+
+		--[[
+			Opponents. The repeller is placed BEHIND the opponent as seen from the
+			ball carrier, not on him -- so a supporting footballer is pushed
+			sideways out of the shadow the opponent casts, which is to say into
+			the passing lane. That offset is the whole trick (research 4).
+		]]
+		OpponentPower = 0.3,
+		OpponentScale = 16,
+		OpponentExponent = 0.7,
+		OpponentBehindOffset = 6.5,
+		OpponentCount = 3,
+		-- Defenders care most about not being near an opponent; forwards least.
+		OpponentRoleScale = { DEF = 2.2, MID = 1.6, FWD = 1.0, GK = 1.0 },
+
+		-- Team-mates push each other apart. Only while the side has the ball --
+		-- out of possession, players are meant to converge on the ball.
+		TeammatePower = 0.4,
+		TeammateScale = 34,
+		TeammateCount = 6,
+
+		--[[
+			Stay out of the ball's way. Four spots along the predicted path rather
+			than one at the ball, so a footballer clears the LANE and not merely
+			the current position.
+		]]
+		BallPower = 1,
+		BallScale = 6.5,
+		BallExponent = 0.5,
+		BallPredictionSeconds = { 0.2, 0.35, 0.5, 0.65 },
+
+		--[[
+			A ring around the carrier: attracted from beyond the outer scale,
+			repelled inside the inner one, so support settles at a support
+			distance. Simpler than a target distance with a deadzone, and it
+			composes with everything else in the field.
+		]]
+		CarrierPower = 0.45,
+		CarrierAttractScale = 69,
+		CarrierRepelScale = 39,
+	},
+
+	--[[
+		HOW LONG A FOOTBALLER NEEDS TO REACH A POINT.
+
+		Adapted from GameplayFootball's `AI_GetTimeNeededForDistance_ms` -- see
+		docs/research/gameplay-football/ai/01-perception-reachability-movement.md
+		section 2 for the source, the commit and the confirmed behaviour.
+
+		The estimate this replaces had momentum exactly backwards:
+
+			effectiveSpeed = math.max(JogSpeed, currentSpeed, SprintSpeed * 0.75)
+
+		`currentSpeed` is a magnitude with no direction in it, so a footballer
+		sprinting AWAY from the ball was scored as fast, and the faster he ran in
+		the wrong direction the sooner the model claimed he would arrive. That is
+		not a tuning error, it is a sign error, and it decides which footballer
+		gets sent for a loose ball.
+
+		The reference sheds existing velocity over `changeTime_ms = 700` while the
+		player accelerates toward the target. Integrated, a footballer carries his
+		current momentum for about half that window before it is spent -- so his
+		effective starting point is displaced by `velocity * decay/2`, which moves
+		TOWARD the ball when he is already running at it and AWAY when he is not.
+		Direction is finally in the answer.
+
+		Two radii, not one, are also from the reference: `usual` is getting there
+		in control at ordinary leg extension, `optimistic` is getting a toe to it
+		at full stretch. Comparing footballers on `usual` answers "who arrives in
+		control"; on `optimistic`, "who could reach it at all". Beyond 90's own
+		reception numbers supply both, so these are not converted metres.
+	]]
+	Reachability = {
+		MomentumDecaySeconds = 0.7,
+		-- The last of a sprint is very hard to actually attain, so do not promise
+		-- it. The reference de-rates by the same amount for the same reason.
+		AttainableSpeedFactor = 0.94,
+		-- In control, at ordinary leg extension.
+		ReachUsual = 1.5,
+		-- At full stretch. Beyond 90's own Reception.MaxReachDistance is 4.65.
+		ReachOptimistic = 4,
+	},
+
 	Cadence = {
 		PerceptionInterval = 0.15,
 		ReactionDelay = 0.18,
@@ -182,8 +344,12 @@ local AIConfig = {
 		-- Standoff used against a carrier who is standing still. Inside the AI
 		-- tackle range on purpose -- this IS the step-in.
 		StepInStandoff = 1.8,
-		-- How long a contained carrier may dwell before the presser goes for the
-		-- ball itself.
+		--[[
+			The presser no longer contains before committing -- it magnetises to the
+			ball the way the reference's forceMagnet does (see getPressTarget). This
+			timer previously decided when to stop containing; it is kept because the
+			dwell it measures still feeds the press-escalation logic elsewhere.
+		]]
 		CommitAfterSeconds = 1.1,
 		-- The presser must actually be engaged for dwell to accumulate; a
 		-- defender still running from thirty studs is not containing anybody.
@@ -232,9 +398,68 @@ local AIConfig = {
 		LongitudinalScale = 0.34,
 		WidthScale = 0.25,
 		BallShift = 0.28,
-		PossessionAdvance = 0.09,
-		DefensiveRetreat = 0.1,
+		-- PossessionAdvance / DefensiveRetreat used to nudge every footballer on a
+		-- discrete team-state flip. TeamShape below expresses the same thing as a
+		-- continuous bias over the whole block, so they no longer had a caller.
 		MinimumTeammateSpacing = 14,
+
+		--[[
+			TEAM SHAPE (docs/research/gameplay-football/ai/02).
+
+			The block is one box that the whole team is painted into, rather than
+			eleven footballers each deciding how far to drift from their anchor.
+			Depth and width are half-extents in the same normalised units as
+			`Roles` below, so a depth of 0.6 means the block spans 1.2 of the
+			formation's own coordinate space.
+
+			Compressing the block is a single number here, which is what makes it
+			behave like a defensive line rather than an average of independent
+			decisions. GameplayFootball reaches the same shape through
+			`adaptedDepth`/`adaptedWidth`; the values are Beyond 90's own, since
+			its pitch and formation scales are not the reference's.
+		]]
+		TeamShape = {
+			-- The block is longer and wider going forward, shorter and narrower
+			-- defending. Out of possession is the compressed one on purpose.
+			DepthInPossession = 0.68,
+			DepthOutOfPossession = 0.5,
+			WidthInPossession = 0.66,
+			WidthOutOfPossession = 0.48,
+
+			-- How much the block's centre follows the ball, per axis. Lateral is
+			-- lower: a team shuffles across less than it pushes up.
+			CentreFollowLongitudinal = 0.5,
+			CentreFollowLateral = 0.3,
+
+			-- Where the block sits relative to halfway, by possession. Positive
+			-- is toward the opponent goal.
+			CentreOffsetInPossession = 0.1,
+			CentreOffsetOutOfPossession = -0.12,
+
+			--[[
+				Possession is a continuous bias, not a state.
+
+				`Fade` is the time constant for how fast the possession reading
+				moves; a turnover slides the block instead of snapping it.
+
+				`BallWeightWhenUnclear` is the cap on how much ball position may
+				stand in for possession while possession itself is ambiguous.
+				Capped below 1 deliberately: with the ball forward and possession
+				genuinely unclear, the defenders should still keep some watch.
+			]]
+			PossessionFadeSeconds = 1.1,
+			BallWeightWhenUnclear = 0.6,
+
+			--[[
+				Stretching the midfield must not drag the defensive line with it.
+				The stretch applies in proportion to how central a position's own
+				anchor is, so the lines are left alone -- the 1.2 overstretch is
+				what keeps a defender at -0.52 almost entirely out of it.
+			]]
+			MidfieldStretchStrength = 0.32,
+			MidfieldStretchFalloff = 1.2,
+		},
+
 		Roles = {
 			Defender = { Longitudinal = -0.52, Lateral = -0.18 },
 			Support = { Longitudinal = -0.02, Lateral = 0.28 },
@@ -423,6 +648,38 @@ local AIConfig = {
 		GoalkeeperReceiverPenalty = 0.7,
 		-- Below this a lofted ball is pointless; play it along the ground. GF 10 m.
 		LoftedMinimumDistance = 31,
+
+		--[[
+			HOW FAR AN AI FOOTBALLER IS WILLING TO PASS.
+
+			There was no distance term in the pass scoring at all: a team-mate
+			140 studs away scored exactly like one 15 studs away if the tactical
+			ratings matched. So the AI kept hitting the full length of the pitch,
+			and because the shared pass planner then has to actually get it there,
+			it did so at the speed cap:
+
+				[AIPass] receiver=HOME_AI_91 distance=140.9 launchSpeed=120.0
+				[AIPass] receiver=AWAY_AI_2  distance=152.2 launchSpeed=93.3
+
+			-- a goalkeeper picked out from the other penalty area, at 120
+			studs/second. Nothing about that reads as football.
+
+			This is bounded at the DECISION, not at the ball. AI expresses intent
+			through the same passing mechanic a human uses (AGENTS.md §48), so
+			capping the launch speed for bots specifically would be exactly the
+			bot-only shortcut that section forbids -- and it would leave the AI
+			still CHOOSING a 150-stud pass, merely under-hitting it. Stop it
+			wanting the pass and the speed follows on its own.
+
+			Preferred is a comfortable short-to-medium ball. Beyond it the score
+			decays per stud, so a long ball has to be clearly better than the
+			short option to win rather than merely available -- which is the
+			football relationship: long balls are a deliberate choice, not a
+			default. Past Maximum the team-mate is not a passing option at all.
+		]]
+		PreferredPassDistance = 46,
+		LongPassPenaltyPerStud = 0.011,
+		MaximumPassDistance = 105,
 		--[[
 			Pass odds below which a pressured carrier deep in its own half gives
 			up on football and clears instead (GF `_AddPanicPass`). Deliberately

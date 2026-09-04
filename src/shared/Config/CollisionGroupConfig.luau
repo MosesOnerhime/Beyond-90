@@ -36,6 +36,25 @@ CollisionGroupConfig.Ball = "Beyond90Ball"
 CollisionGroupConfig.NonCollidingPairs = {
 	{ CollisionGroupConfig.Official, CollisionGroupConfig.Footballer },
 	{ CollisionGroupConfig.Official, CollisionGroupConfig.Ball },
+
+	--[[
+		FOOTBALLERS DO STILL COLLIDE WITH FOOTBALLERS.
+
+		This pair was briefly removed to stop players climbing over each other,
+		and that cure was worse than the disease: footballers passed straight
+		THROUGH one another, which is not football at any price. Reverted.
+
+		Climbing is now addressed where it actually comes from -- bodies reaching
+		contact at all. FootballerSeparation steers them apart before they touch,
+		and it is tuned to hold roughly a body's width of daylight, so the
+		collision is still there for the cases steering cannot prevent (two
+		players committed to the same ball) without being the routine state.
+
+		If climbing survives that, the next step is a single smooth collision
+		capsule per footballer rather than the separate torso parts -- a Humanoid
+		climbs LEDGES, and separate parts are what make ledges. Do not reach for
+		removing the pair again.
+	]]
 }
 
 return CollisionGroupConfig

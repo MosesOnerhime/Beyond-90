@@ -92,6 +92,10 @@ local function Toggle(props)
 		ZIndex = 6,
 		[React.Event.Activated] = props.Activate,
 	}, {
+		-- The ON/OFF control is the whole point of the row it sits in, and a
+		-- proportional height left it 18px tall on a phone. This is the ~48px
+		-- touch target from docs/ui/UI_AGENT_DECISION_RULES.md section 8.
+		MinimumSize = ReactUI.MinimumSize(Theme.MinimumTouchTarget, Theme.MinimumTouchTarget),
 		Corner = ReactUI.Corner(5),
 		Stroke = ReactUI.Stroke(if on then Theme.StrokeBright else MenuKit.PanelStroke, 1.2, 0.3),
 	})
@@ -102,7 +106,10 @@ local function CategoryButton(props)
 	local selected = props.Selected == true
 	return React.createElement("TextButton", {
 		LayoutOrder = props.Order,
-		Size = UDim2.new(1, 0, 0, if mobile then 26 else 40),
+		-- 26px was under half the ~48px touch target on a phone. These are the
+		-- page's primary navigation, so they take the floor; the list they sit in
+		-- scrolls, which is what makes the taller rows affordable.
+		Size = UDim2.new(1, 0, 0, if mobile then Theme.MinimumTouchTarget else 40),
 		BackgroundColor3 = if selected then Theme.PanelSelected else MenuKit.PanelColor,
 		BackgroundTransparency = if selected then 0.05 else 0.28,
 		BorderSizePixel = 0,
@@ -194,7 +201,7 @@ return function(props)
 			AutoButtonColor = true,
 			Font = Theme.Fonts.Navigation,
 			Text = entry.Label,
-			TextColor3 = if selected then Theme.AccentCyan else Theme.Text,
+			TextColor3 = if selected then Theme.SelectedText else Theme.Text,
 			TextSize = MenuKit.Size(mobile, 12),
 			ZIndex = 6,
 			[React.Event.Activated] = function()
@@ -203,6 +210,9 @@ return function(props)
 				end
 			end,
 		}, {
+			-- Proportional height, so no floor of its own; this is the ~48px
+			-- touch target from docs/ui/UI_AGENT_DECISION_RULES.md section 8.
+			MinimumHeight = ReactUI.MinimumSize(nil, Theme.MinimumTouchTarget),
 			Corner = ReactUI.Corner(6),
 			Stroke = ReactUI.Stroke(
 				if selected then Theme.StrokeBright else MenuKit.PanelStroke,
@@ -248,7 +258,7 @@ return function(props)
 			AutoButtonColor = true,
 			Font = Theme.Fonts.Navigation,
 			Text = entry.Label,
-			TextColor3 = if selected then Theme.AccentCyan else Theme.Text,
+			TextColor3 = if selected then Theme.SelectedText else Theme.Text,
 			TextSize = MenuKit.Size(mobile, 12),
 			ZIndex = 6,
 			[React.Event.Activated] = function()
@@ -257,6 +267,9 @@ return function(props)
 				end
 			end,
 		}, {
+			-- Proportional height, so no floor of its own; this is the ~48px
+			-- touch target from docs/ui/UI_AGENT_DECISION_RULES.md section 8.
+			MinimumHeight = ReactUI.MinimumSize(nil, Theme.MinimumTouchTarget),
 			Corner = ReactUI.Corner(6),
 			Stroke = ReactUI.Stroke(
 				if selected then Theme.StrokeBright else MenuKit.PanelStroke,
@@ -304,14 +317,16 @@ return function(props)
 		local selected = props.SelectedTrack == index
 		trackRows["Track" .. index] = React.createElement("TextButton", {
 			LayoutOrder = index,
-			Size = UDim2.new(1, 0, 0, if mobile then 20 else 27),
+			-- 20px was well under half the ~48px touch target. The list these sit
+			-- in already scrolls, so taller rows cost only scroll distance.
+			Size = UDim2.new(1, 0, 0, if mobile then Theme.MinimumTouchTarget else 27),
 			BackgroundColor3 = if selected then Theme.PanelSelected else MenuKit.PanelColor,
 			BackgroundTransparency = if selected then 0.05 else 0.3,
 			BorderSizePixel = 0,
 			AutoButtonColor = true,
 			Font = Theme.Fonts.Navigation,
 			Text = track.Name,
-			TextColor3 = if selected then Theme.AccentCyan else Theme.Text,
+			TextColor3 = if selected then Theme.SelectedText else Theme.Text,
 			TextSize = MenuKit.Size(mobile, 12),
 			ZIndex = 5,
 			[React.Event.Activated] = function()
@@ -352,10 +367,31 @@ return function(props)
 
 			-- Aligned with the content region so the list and the panel share a
 			-- top edge instead of floating at different heights.
-			Categories = React.createElement("Frame", {
+			--[[
+				SCROLLS, BECAUSE THE ROWS NOW HAVE TO BE TAPPABLE.
+
+				Five categories at the ~48px touch target need 256px with padding,
+				and this column is 52% of a 360px phone -- 187px. Something has to
+				give, and it is not the target size: docs/ui/UI_RESPONSIVE_INPUT.md
+				section 2 puts interactive target size above showing everything at
+				once, and section 3 allows a list to become scrollable rather than
+				shrinking its rows.
+
+				AutomaticCanvasSize measures the UIListLayout, so nothing here has
+				to know how many categories there are. On desktop the rows fit the
+				column exactly, the canvas equals the window and no bar appears --
+				so this is a phone behaviour that costs the desktop nothing.
+			]]
+			Categories = React.createElement("ScrollingFrame", {
 				Position = UDim2.fromScale(if mobile then 0.03 else 0.04, if mobile then 0.3 else 0.3),
 				Size = UDim2.fromScale(if mobile then 0.19 else 0.16, if mobile then 0.52 else 0.5),
 				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				CanvasSize = UDim2.new(),
+				AutomaticCanvasSize = Enum.AutomaticSize.Y,
+				ScrollingDirection = Enum.ScrollingDirection.Y,
+				ScrollBarThickness = if mobile then 3 else 4,
+				ScrollBarImageTransparency = 0.5,
 				ZIndex = 4,
 			}, categoryChildren),
 
@@ -493,10 +529,20 @@ return function(props)
 					TextSize = MenuKit.Size(mobile, 10),
 					ZIndex = 5,
 				}),
-				Tracks = React.createElement("Frame", {
+				-- Scrolls on a phone for the same reason as the category list: the
+				-- rows are now tappable, and three of them at the touch target
+				-- need more than 29% of a 360px screen. Desktop content fits, so
+				-- no scrollbar appears there.
+				Tracks = React.createElement("ScrollingFrame", {
 					Position = UDim2.fromScale(0.05, 0.675),
 					Size = UDim2.fromScale(0.9, 0.29),
 					BackgroundTransparency = 1,
+					BorderSizePixel = 0,
+					CanvasSize = UDim2.new(),
+					AutomaticCanvasSize = Enum.AutomaticSize.Y,
+					ScrollingDirection = Enum.ScrollingDirection.Y,
+					ScrollBarThickness = if mobile then 3 else 4,
+					ScrollBarImageTransparency = 0.5,
 					ZIndex = 5,
 				}, trackRows),
 			}),

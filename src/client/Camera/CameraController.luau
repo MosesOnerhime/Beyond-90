@@ -6,6 +6,12 @@ local Workspace = game:GetService("Workspace")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local BallConfig = require(Shared.Config.BallConfig)
 local CameraConfig = require(Shared.Config.CameraConfig)
+local GoalkeeperConfig = require(Shared.Config.GoalkeeperConfig)
+
+-- Held so the keeper-role watch can be replaced rather than stacked when
+-- gameplay is entered more than once in a session.
+local keeperRoleConnection: RBXScriptConnection? = nil
+local keeperCharacterConnection: RBXScriptConnection? = nil
 local GameConfig = require(Shared.Config.GameConfig)
 local MatchRulesConfig = require(Shared.Config.MatchRulesConfig)
 local BroadcastCamera = require(script.Parent.BroadcastCamera)
@@ -385,12 +391,88 @@ function CameraController.Initialize()
 		end
 	end
 
-	if valid then
-		setMode(chosen)
-	elseif CameraConfig.DefaultMode == "Broadcast" then
-		setMode("Broadcast1")
-	else
-		restoreDefaultCamera()
+	--[[
+		A KEEPER OPENS IN PRO CAMERA.
+
+		Broadcast framing reads the pitch from side on, which is the wrong view
+		for the one player judging a ball travelling toward him. An explicit
+		choice in Settings still wins -- this only replaces the fallback, so a
+		keeper who has picked Broadcast keeps it.
+
+		THE ROLE ARRIVES LATE. The first version of this read the role attribute
+		once, here, and the keeper camera never applied: the attribute is written
+		by the server when GoalkeeperService registers the keeper, and it has not
+		necessarily replicated by the time the camera opens. So the choice is made
+		now AND re-made if the role turns up afterwards.
+	]]
+	local function resolveOpeningMode()
+		local character = localPlayer.Character
+		local isKeeper = character ~= nil
+			and character:GetAttribute(GoalkeeperConfig.RoleAttributeName) == GoalkeeperConfig.Role
+
+		--[[
+			THE ROLE WINS, NOT THE STORED DEFAULT.
+
+			This used to let a saved Settings choice beat the keeper rule, on the
+			grounds that an explicit choice should stand. In practice the saved
+			choice is Broadcast for anyone who has ever picked it once, so
+			choosing GK opened in Broadcast every time and the keeper camera was
+			reported missing again -- the log is `Mode -> Broadcast1` on every
+			keeper spawn.
+
+			Overruled deliberately: playing in goal is a different job from
+			playing out, and the camera that job needs is not a preference the
+			outfield choice should be answering for. The player can still switch
+			once they are in.
+		]]
+		if isKeeper and CameraConfig.GoalkeeperDefaultMode then
+			setMode(CameraConfig.GoalkeeperDefaultMode)
+			return
+		end
+		if valid then
+			setMode(chosen)
+			return
+		end
+		if CameraConfig.DefaultMode == "Broadcast" then
+			setMode("Broadcast1")
+		else
+			restoreDefaultCamera()
+		end
+	end
+
+	resolveOpeningMode()
+
+	--[[
+		Watch for the role landing, on this character and on the next one.
+
+		No longer gated on the player having made no camera choice. The role
+		almost always arrives AFTER the camera opens -- that is the entire reason
+		this watcher exists -- so gating it on `not valid` meant a player with any
+		stored choice could never receive the keeper camera at all, by either
+		path. Since the role now outranks the stored choice above, it has to
+		outrank it here too or the two disagree.
+	]]
+	do
+		if keeperRoleConnection then
+			keeperRoleConnection:Disconnect()
+			keeperRoleConnection = nil
+		end
+		local function watch(character: Model)
+			if keeperRoleConnection then
+				keeperRoleConnection:Disconnect()
+			end
+			keeperRoleConnection = character
+				:GetAttributeChangedSignal(GoalkeeperConfig.RoleAttributeName)
+				:Connect(resolveOpeningMode)
+			resolveOpeningMode()
+		end
+		if localPlayer.Character then
+			watch(localPlayer.Character)
+		end
+		if keeperCharacterConnection then
+			keeperCharacterConnection:Disconnect()
+		end
+		keeperCharacterConnection = localPlayer.CharacterAdded:Connect(watch)
 	end
 end
 

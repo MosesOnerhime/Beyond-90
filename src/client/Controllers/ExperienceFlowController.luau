@@ -10,6 +10,7 @@ local GameConfig = require(Shared.Config.GameConfig)
 
 local Controllers = script.Parent
 local AnimationController = require(Controllers.AnimationController)
+local PowerIndicatorController = require(Controllers.PowerIndicatorController)
 local AudioController = require(Controllers.AudioController)
 local PositionController = require(script.Parent.PositionController)
 local BallPresentationController = require(Controllers.BallPresentationController)
@@ -20,6 +21,7 @@ local DevelopmentHUDController = require(Controllers.DevelopmentHUDController)
 local FootballActionController = require(Controllers.FootballActionController)
 local GameModeController = require(Controllers.GameModeController)
 local GoalkeeperController = require(Controllers.GoalkeeperController)
+local GoalkeeperIndicatorController = require(Controllers.GoalkeeperIndicatorController)
 local InputController = require(Controllers.InputController)
 local MatchPresentationController = require(Controllers.MatchPresentationController)
 local RefereeDecisionController = require(Controllers.RefereeDecisionController)
@@ -49,6 +51,12 @@ local gameplayControllers = {
 	-- After DefendingController, because it reroutes the same tackle input when
 	-- the local footballer is actually a goalkeeper.
 	GoalkeeperController,
+	-- Draws the keeper's stance ring and positioning guide; presentation only,
+	-- so it sits after the controller that owns the keeper's inputs.
+	GoalkeeperIndicatorController,
+	-- Draws the shot/pass charge over the local player's head. Presentation
+	-- only, and it reads the same charge curves the planners use.
+	PowerIndicatorController,
 	ShotTrajectoryController,
 	PlayerIndicatorController,
 	BallPresentationController,

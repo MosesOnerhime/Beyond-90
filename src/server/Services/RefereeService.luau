@@ -208,11 +208,40 @@ local function buildOfficialBody(name: string, displayName: string, kitColor: Co
 	return model, modelHumanoid, modelRoot :: BasePart, source
 end
 
+--[[
+	BUILDING AN OFFICIAL YIELDS, SO CREATION MUST BE RE-ENTRANCY SAFE.
+
+	`buildOfficialBody` parents the official into the container before it
+	returns, and it now yields part-way through -- the shared frame
+	standardisation in CharacterAppearanceService waits a Heartbeat for
+	ApplyDescription to settle. A second caller arriving during that yield used
+	to sail straight through and build a second set, which is how one match ended
+	up with two Referees and four assistants, one of them floating in mid-air:
+
+		[Referee] 3 assistant referees ready
+		[Referee] 4 assistant referees ready
+
+	`createCharacter` had no guard at all, and `createAssistants` guarded on
+	`#assistants > 0` -- the FINISHED state, which is still empty while the first
+	call is yielding. A guard on the finished state cannot protect a function
+	that yields before reaching it, so both now latch on entry.
+]]
+local creatingCharacter = false
+local creatingAssistants = false
+
 local function createCharacter(): boolean
+	if character then
+		return true
+	end
+	if creatingCharacter then
+		return false
+	end
+	creatingCharacter = true
 	local kit = RefereeConfig.Character
 	local model, modelHumanoid, modelRoot, source =
 		buildOfficialBody(RefereeConfig.Name, kit.DisplayName, kit.KitColor, kit.KitBlend)
 	if not model or not modelHumanoid or not modelRoot then
+		creatingCharacter = false
 		return false
 	end
 
@@ -229,6 +258,7 @@ local function createCharacter(): boolean
 	rootPart = modelRoot
 	whistle = sound
 	currentSpeed = 0
+	creatingCharacter = false
 	log(string.format("Referee ready (body source=%s)", source))
 	return true
 end
@@ -255,8 +285,12 @@ local function loadOfficialTracks(officialHumanoid: Humanoid)
 		animator.Parent = officialHumanoid
 	end
 
-	local function load(assetId: string, priority: Enum.AnimationPriority)
+	local function load(name: string, assetId: string, priority: Enum.AnimationPriority)
 		local animation = Instance.new("Animation")
+		-- Named so a playing track is identifiable at runtime. Unnamed, every
+		-- official track reports as "Animation" and no diagnostic can tell which
+		-- clip is actually on the body.
+		animation.Name = name
 		animation.AnimationId = assetId
 		local ok, track = pcall(function()
 			return animator:LoadAnimation(animation)
@@ -270,13 +304,64 @@ local function loadOfficialTracks(officialHumanoid: Humanoid)
 		return track
 	end
 
+	--[[
+		THE WHOLE DIRECTIONAL SET, NOT JUST FORWARD.
+
+		Officials do not run where they are looking. They face the BALL -- see the
+		AutoRotate note further down, which is correct and is what a real official
+		does -- while their feet take them up the touchline, across the pitch, or
+		backwards as play comes at them. Loading only the forward clip meant every
+		one of those was animated as a forward run, so an assistant tracking the
+		offside line side-glided along it and the referee back-pedalled while his
+		legs ran forwards. That is the "unnatural" movement.
+
+		Same eight clips the footballers already use, chosen the same way, so this
+		costs no new assets -- only the direction the existing ones are picked by.
+	]]
 	local offBall = AnimationConfig.Assets.Locomotion.OffBall
+	local jog = offBall.Jog
 	return {
-		Idle = load(offBall.Idle, Enum.AnimationPriority.Idle),
-		Jog = load(offBall.Jog.Forward, Enum.AnimationPriority.Movement),
-		Sprint = load(offBall.Sprint.Forward, Enum.AnimationPriority.Movement),
+		Idle = load("Idle", offBall.Idle, Enum.AnimationPriority.Idle),
+		JogForward = load("JogForward", jog.Forward, Enum.AnimationPriority.Movement),
+		JogForwardLeft = load("JogForwardLeft", jog.ForwardLeft, Enum.AnimationPriority.Movement),
+		JogForwardRight = load("JogForwardRight", jog.ForwardRight, Enum.AnimationPriority.Movement),
+		JogLeft = load("JogLeft", jog.Left, Enum.AnimationPriority.Movement),
+		JogRight = load("JogRight", jog.Right, Enum.AnimationPriority.Movement),
+		JogBackward = load("JogBackward", jog.Backward, Enum.AnimationPriority.Movement),
+		JogBackLeft = load("JogBackLeft", jog.BackLeft, Enum.AnimationPriority.Movement),
+		JogBackRight = load("JogBackRight", jog.BackRight, Enum.AnimationPriority.Movement),
+		Sprint = load("Sprint", offBall.Sprint.Forward, Enum.AnimationPriority.Movement),
 		Current = "",
 	}
+end
+
+--[[
+	Which clip matches travelling `velocity` while facing `look`?
+
+	The same eight-way mapping the footballer locomotion uses: the signed angle
+	between where the body points and where it is actually going, bucketed to the
+	nearest 45 degrees.
+]]
+local OFFICIAL_JOG_BY_OCTANT = {
+	"JogForward", "JogForwardRight", "JogRight", "JogBackRight",
+	"JogBackward", "JogBackLeft", "JogLeft", "JogForwardLeft",
+}
+
+local function getOfficialJogClip(look: Vector3, velocity: Vector3): string
+	local flatLook = BallControlMath.GetHorizontal(look)
+	local flatVelocity = BallControlMath.GetHorizontal(velocity)
+	if flatLook.Magnitude <= 1e-3 or flatVelocity.Magnitude <= 1e-3 then
+		return "JogForward"
+	end
+	local forward = flatLook.Unit
+	local travel = flatVelocity.Unit
+	-- Roblox handedness: RightVector is LookVector x up, not up x LookVector.
+	-- The other way round mirrors the whole set, so an official running up the
+	-- touchline plays the clip for the opposite shoulder.
+	local right = forward:Cross(Vector3.yAxis)
+	local angle = math.deg(math.atan2(travel:Dot(right), travel:Dot(forward)))
+	local octant = (math.floor((angle % 360) / 45 + 0.5) % 8) + 1
+	return OFFICIAL_JOG_BY_OCTANT[octant]
 end
 
 local function updateOfficialAnimation(tracks, officialRoot: BasePart)
@@ -289,10 +374,28 @@ local function updateOfficialAnimation(tracks, officialRoot: BasePart)
 	local name, reference
 	if speed < config.IdleSpeedThreshold then
 		name, reference = "Idle", 1
-	elseif speed >= config.SprintSpeedThreshold then
-		name, reference = "Sprint", config.SprintReferenceSpeed
 	else
-		name, reference = "Jog", config.JogReferenceSpeed
+		local clip = getOfficialJogClip(officialRoot.CFrame.LookVector, officialRoot.AssemblyLinearVelocity)
+		--[[
+			SPRINT IS FORWARD-ONLY, SO IT IS ONLY USED WHEN TRAVEL IS FORWARD.
+
+			There is one sprint clip and it runs straight ahead. Selecting it on
+			speed alone put officials at 26 studs/s into a forward sprint while
+			actually travelling backwards -- measured, before this guard:
+
+				clip=Sprint  travelVsFacing=135-180 deg
+
+			which is a referee moonwalking at full pace. Above the threshold but
+			off-axis, the directional jog set is used instead and simply played
+			faster; the playback clamp already covers the range. Sprinting is
+			reserved for the case it was authored for -- an official chasing play,
+			which is the one time they do run where they are looking.
+		]]
+		if speed >= config.SprintSpeedThreshold and clip == "JogForward" then
+			name, reference = "Sprint", config.SprintReferenceSpeed
+		else
+			name, reference = clip, config.JogReferenceSpeed
+		end
 	end
 
 	local playback = if name == "Idle"
@@ -307,9 +410,8 @@ local function updateOfficialAnimation(tracks, officialRoot: BasePart)
 		return
 	end
 
-	for _, other in { "Idle", "Jog", "Sprint" } do
-		local track = tracks[other]
-		if track and track.IsPlaying then
+	for other, track in tracks do
+		if other ~= name and other ~= "Current" and typeof(track) == "Instance" and track.IsPlaying then
 			track:Stop(config.MoveFadeSeconds)
 		end
 	end
@@ -321,6 +423,7 @@ local function updateOfficialAnimation(tracks, officialRoot: BasePart)
 end
 
 local function destroyCharacter()
+	creatingCharacter = false
 	clearInertnessWatches()
 	if character then
 		character:Destroy()
@@ -354,6 +457,10 @@ local function createAssistants(): boolean
 	if #assistants > 0 then
 		return true
 	end
+	if creatingAssistants then
+		return false
+	end
+	creatingAssistants = true
 	local config = RefereeConfig.Assistants
 
 	for index = 1, config.Count do
@@ -364,6 +471,7 @@ local function createAssistants(): boolean
 			config.KitBlend
 		)
 		if not model or not assistantHumanoid or not assistantRoot then
+			creatingAssistants = false
 			return false
 		end
 		table.insert(assistants, {
@@ -380,11 +488,13 @@ local function createAssistants(): boolean
 			Tracks = nil,
 		})
 	end
+	creatingAssistants = false
 	log(string.format("%d assistant referees ready", #assistants))
 	return true
 end
 
 local function destroyAssistants()
+	creatingAssistants = false
 	for _, assistant in assistants do
 		if assistant.Character then
 			assistant.Character:Destroy()

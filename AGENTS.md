@@ -134,6 +134,45 @@ The distinction is:
                 ≠
     CHOOSE THE PLAYER'S FOOTBALL DECISION
 
+## A Held Input Is Itself A Decision
+
+The list above bans the GAME from choosing. It does not ban the player from
+choosing once and having that choice carried out over time.
+
+A sustained input is a football decision the player has already made. When a
+player holds a press input, they are not asking to stand near the carrier; they
+are asking to win the ball back, and they keep asking for as long as they hold
+it. Executing that request when the opportunity arrives is assistance, not
+substitution.
+
+So the following are explicitly ALLOWED:
+
+- A held press that closes the carrier down and challenges when a legal
+  challenge becomes available.
+- A held charge that releases at a threshold the player set by holding.
+- Any sustained input where releasing it stops the behaviour immediately.
+
+The conditions are:
+
+1. The behaviour only runs while the input is held.
+2. Releasing the input ends it at once.
+3. A discrete tap remains available for players who want to choose the exact
+   moment themselves.
+4. The assisted action is refused when it would be illegal or impossible, so
+   the assistance cannot manufacture an outcome the player could not have
+   produced.
+5. The server still validates the result. Predicting the moment is allowed;
+   awarding the outcome is not.
+
+The test is whether the player can stop it. If letting go ends the behaviour,
+the player is deciding continuously and the game is executing. If it continues
+regardless, the game has taken the decision and that is forbidden.
+
+Where a held input triggers an automatic action, prefer gating it on football
+geometry rather than on a timer. A challenge that would have to travel through
+an opponent's body should be refused whatever the input says, because that is
+the difference between pressing and lunging.
+
 For AI-controlled footballers, tactical decision-making is intentionally part
 of the AI system, but the final physical execution should still respect Beyond
 90's football mechanics, networking rules and competitive constraints.
@@ -437,6 +476,698 @@ A winger needs to understand space down the flank.
 A goalkeeper needs a much wider understanding of the pitch.
 
 Do not design camera systems exclusively around the striker's perspective.
+
+## The Goalkeeper Opens In Pro Camera
+
+The goalkeeper is the one outfield-facing role whose job is judging a ball
+travelling toward them rather than reading the pitch from side on. A keeper
+therefore DEFAULTS to the Pro Camera rather than to the Broadcast Camera.
+
+This is a default, not a lock. A keeper who chooses a camera in Settings keeps
+their choice; only the fallback differs by role.
+
+The keeper's Pro Camera also uses its own framing, sitting higher and pitched
+down harder than the outfield one. A keeper stands under their own crossbar, so
+the ordinary framing puts the goal frame through the middle of the view and
+hides the part of the pitch the keeper most needs to see. Any future change to
+Pro Camera framing must keep the keeper variant clearing the goal frame.
+
+How steep the keeper's view may go has an arithmetic answer, so use it rather
+than guessing. The top edge of the frame sits at (Pitch - FOV/2) below
+horizontal, and a ray at angle A from height H meets the ground at H/tan(A). The
+pitch is about 341 studs between goal centres, so the far goal stays in shot for
+as long as that reach exceeds it -- and if (Pitch - FOV/2) is negative the edge
+is above the horizon and the whole pitch is in frame with room to spare. Check
+this before and after changing either number; "steeper" and "still sees the
+whole pitch" are not in tension until the edge crosses the horizon.
+
+Do not "restore" the Broadcast default for goalkeepers on the grounds that the
+Broadcast Camera is Beyond 90's core camera. It remains the core camera for
+outfield play; this is a role-specific exception with a stated reason.
+
+## A Ball In A Keeper's Hands Is Not A Loose Ball
+
+Possession tests that ask "who is dribbling the ball" report nobody while a
+goalkeeper is holding it. Treating that as a loose ball sends every footballer
+on both sides to chase, and they converge on the keeper -- which is neither
+football (nobody may challenge a keeper who has gathered it) nor playable.
+
+A held ball is possession for the keeper's side: their team-mates shape up to
+receive the distribution, the opposition drops into its defensive shape, and
+neither side nominates anyone to go and get it.
+
+## A Held Input Asks Once, Then Waits
+
+An input held down should not re-send its request every frame. The auto-challenge
+on a held press did, firing ~60 requests a second that the server refused as
+`already-committed` or `recovering`, so the press looked broken while saturating
+the remote.
+
+A sustained input drives sustained BEHAVIOUR (closing the carrier down); the
+discrete REQUEST it produces is rate-limited and gated on the state the server
+already published. This does not weaken section 2's rule that a held input is a
+decision -- the decision still stands for as long as it is held. It only stops
+the same decision being transmitted sixty times.
+
+## A Goalkeeper Is Only A Goalkeeper Inside Their Own Area
+
+The keeper role is bounded by the penalty area, and the same boundary governs
+three separate things, which must not be allowed to disagree:
+
+- Handling is legal inside it. `GoalkeeperService.Hold` refuses a keeper who
+  reaches for the ball outside it, and `updateHeldBall` penalises a keeper who
+  gathered it legally and then carried it out. Both are handling offences.
+- Keeper CONTROLS apply inside it. Outside, the player gets their ordinary
+  outfield bindings back, because outside the box a keeper has no special
+  actions available to them anyway.
+- Keeper ANIMATION is chosen by DIRECTION OF TRAVEL, not by area and not by
+  speed. Moving across the line plays the keeper's sidestep, sped up with pace;
+  moving toward or away from the play plays ordinary jog and sprint, because a
+  keeper closing a striker down is running. Gating this on speed alone made any
+  quick movement play the outfield sprint; gating it on the penalty area made
+  the sidestep the only clip that ever played.
+- Keeper handling owns the attacking inputs only while the ball is actually IN
+  HAND. With the ball on the grass -- a goal kick, a loose ball at their feet --
+  a keeper passes and shoots exactly like any other footballer. Refusing those
+  inputs for anyone wearing the gloves left the nominated taker unable to take
+  their own goal kick.
+- The keeper's turn is bounded to a half-circle centred on facing out of their
+  own goal, so they can square up to an attacker at either post but never
+  rotate to face their own net.
+
+All three read the same test (`IsInsideOwnPenaltyArea`) against the same
+published pitch frame. If a future change needs a different boundary for one of
+them, state why the three should diverge rather than adding a second test.
+
+## Read The Reference Before Reproducing It
+
+`ref/` holds the footage a feature is meant to look like. Extract frames and
+LOOK at them before building the thing, and cite what the frames show.
+
+The goalkeeper ground indicators were built from a written description of the
+reference rather than from the reference. The result had a 16-spoke ring, a
+chevron and a second ring at the keeper's target position. The footage has one
+thin continuous ring and a pair of coloured dive arcs that appear only during a
+save — no spokes, no chevron, no second ring. The extra ring was what the player
+saw as a "double circle" underneath the keeper.
+
+Frames extract locally with ffmpeg and stay local. They are development
+reference only: never import them into Roblox (section 57).
+
+## Measure Against The Man, Not The Marker
+
+Distances that stand for a football relationship must be measured to the thing
+the relationship is about.
+
+Press containment was gated on the distance to the press TARGET — a point
+goal-side of the carrier — rather than to the carrier. A defender well away from
+his opponent could be close to that point, get treated as jockeying, and be
+capped below sprint for an entire chase. Jockeying range is a distance to the
+MAN; interception range is a distance to the BALL; offside is a distance to the
+LINE. Check that the quantity being compared is the one the rule is about.
+
+## Never Trust A Height You Did Not Measure
+
+The pitch publishes `PitchGroundY` on its bounds. It is **not** the height of the
+grass a player stands on. On the development stadium the attribute reads 0.20
+while a ray against the rendered pitch returns 1.70 -- a 1.5 stud difference,
+which is enough to bury anything drawn on the ground completely.
+
+The goalkeeper ground indicators were placed with a guessed constant, then with
+that attribute, and were invisible both times for the same reason.
+
+Anything that must sit ON the pitch surface -- ground markers, decals, restart
+spots, placed props -- raycasts down for the surface and uses what it hits.
+`PlayerService` already does this for foot placement. The bounds attribute
+describes the pitch's reference frame and is fine for region maths, which is
+what `PitchGeometry` uses it for; it is not a rendering height.
+
+## A Humanoid Cannot Be Bypassed, Only Driven
+
+A Roblox `Humanoid` keeps applying its last `Move` command every physics step.
+Skipping its update does not neutralise it -- it freezes it on whatever it was
+last told, and `Move(Vector3.zero)` with `WalkSpeed = 0` is an active brake.
+
+Any server-decided movement of a player-controlled footballer -- a dive, a
+launched slide, a knock-back -- must therefore be expressed THROUGH the humanoid
+(set `WalkSpeed` and `Move` toward the intended direction) rather than as a raw
+velocity write that the character controller will cancel on the next step.
+
+The goalkeeper dive failed three times before this was understood: written on
+the server (wrong owner), applied on the client then skipped (humanoid still
+braking), and only worked once it drove the humanoid.
+
+## Server-Approved, Client-Applied Motion
+
+A player's own character is network-owned by THEIR CLIENT. A server-side write
+to `AssemblyLinearVelocity` on a client-owned assembly is discarded on the next
+replication tick, silently -- the state change, the attribute and the log line
+all succeed while the body never moves.
+
+The goalkeeper dive was built this way and did not move for human keepers for
+exactly this reason, while working correctly for AI keepers, whose bodies the
+server owns.
+
+The pattern for any server-decided impulse on a player-owned body is therefore:
+
+    SERVER decides whether it happens, and publishes the launch
+            |
+    OWNING CLIENT applies it
+
+This is section 32's split, not an exception to it: the client simulates the
+motion, the server decides what the motion means. Validation, cooldowns,
+direction and duration stay on the server. Before adding any new launched
+movement for a human-controlled footballer, check which side owns the body.
+
+## Measure The Clip Before Writing Code That Duplicates It
+
+The keeper's dive rolled the ROOT 78 degrees in code, and unwound it again on
+recovery. Both were wrong, because the authored clips already carry the fall.
+Measured with `KeyframeSequenceProvider:GetKeyframeSequenceAsync`:
+
+    DiveLeft    maxTorsoRot=107.9 deg   rootTranslations=0
+    DiveRight   maxTorsoRot= 97.6 deg   rootTranslations=0
+    GetUpLeft   maxTorsoRot=103.2 deg   rootTranslations=0
+    GetUpRight  maxTorsoRot= 87.8 deg   rootTranslations=0
+
+and across DiveLeft's own timeline the torso goes 17.7 -> 108 degrees:
+
+    t=0.00  17.7    t=0.80   54.3    t=1.60  102.5
+    t=0.27  23.4    t=1.07   86.7    t=1.87  107.9
+
+So one dive tipped the keeper about 178 degrees: roughly 100 from the clip and
+78 from the code. Applied twice, taken away twice. That is what the player saw
+as "rolls around", and every previous pass treated it as a bug in HOW the roll
+was applied rather than asking whether it should be applied at all.
+
+The animator's note that "the animations have no x or y movements" was accurate
+and was misread. It is a statement about TRANSLATION -- `rootTranslations` is 0
+for all four clips -- not about rotation.
+
+    THE CLIP OWNS THE BODY'S ATTITUDE.
+    THE CODE OWNS ITS TRANSLATION AND ITS YAW.
+
+Before writing code that poses a character, LOAD THE CLIP AND MEASURE IT. It is
+a few lines and it is checkable; assuming is how the same 78 degrees survived
+four separate fixes. The same applies to LENGTH: `Dive.Duration` was 0.78s
+against a fall that takes 1.3s, so the keeper was cut off mid-fall and the get-up
+started from a lying pose he had not reached. Scale the playback so the clip
+completes inside the window the gameplay owns, rather than moving the window.
+
+## Rotation The Code Applies, The Code Must Take Away
+
+`Humanoid.AutoRotate` governs YAW ONLY. Nothing in a Humanoid returns a ROLLED
+root part to upright -- so any code that tips a character over owns standing it
+back up, and stopping writing the CFrame is not the same as undoing it.
+
+The goalkeeper dive tipped the body 78 degrees and then simply released it. The
+keeper stayed lying on the pitch for the rest of the match, and a tipped Humanoid
+reports `FallingDown`, which the airborne test treats as airborne -- so the
+animation flip-flopped between the keeper set and the airborne fallback
+indefinitely, with the body sliding because a keeper on its side has no footing.
+
+Any driven rotation needs a full arc: apply it, and unwind it on a stated
+recovery. If the Humanoid may have entered `FallingDown` while tipped, put it
+back with `ChangeState(GettingUp)` -- it does not leave that state on its own.
+
+SUPERSEDED IN PART -- see "Measure The Clip Before Writing Code That Duplicates
+It" above. The rule holds wherever code genuinely does rotate a body. It was
+learned here on a 78 degree roll that should never have existed, because the
+dive clip already lays the keeper down; the roll is now gone rather than
+balanced. Correct rule, wrong place to have learned it.
+
+## A Snapshot Cannot Hold State
+
+`FootballerRegistryService.GetHumanActor` builds a NEW TABLE on every call. That
+is fine for answering a question and fatal for anything that WRITES to the actor,
+because the write lands on a throwaway that is discarded the moment the caller
+returns.
+
+Every goalkeeper dive guard stores its state on the actor -- committed-until,
+recovery window, input cooldown. The keeper remote resolved its actor with
+`GetHumanActor`, so for a HUMAN keeper all three were written and instantly lost:
+`IsDiving` was permanently false and every request launched a brand-new dive on
+top of the one already running, republishing the launch direction and resetting
+the dive's start stamp so the body roll restarted from zero. The keeper thrashed
+on the spot instead of travelling.
+
+    19:59:11.696  runo dives LowDive toward (25.8, 4.5, 180.2)
+    19:59:11.853  runo dives LowDive toward (27.7, 4.5, 178.4)   <- 157ms later
+                  KeeperDiveRight -> KeeperDiveLeft
+
+`Register` already keeps one long-lived table per keeper; the fix was to use it.
+
+The general rule: before writing a field onto an actor, know whether that actor
+is the REGISTERED one or a snapshot. If a function can hand back a different
+table for the same footballer on two consecutive calls, it is a read-only view,
+and per-footballer state does not belong on it.
+
+Also note how this looked from outside: an animation flipping between two clips.
+Two earlier passes tried to fix that flip inside the animation and the movement
+roll -- both were downstream of a server that was genuinely restarting the dive.
+When presentation flip-flops, check whether the STATE it is reading is
+flip-flopping before rewriting how it is read.
+
+## A Threshold In The Wrong Units Cannot Express The Rule
+
+The keeper's side step was gated on `SideStepMinimumSpeed`, a threshold in
+STUDS PER SECOND. But "sideways" is an ANGLE, and no speed can express it: the
+faster the keeper travels, the smaller the deviation needed to clear a fixed
+lateral speed.
+
+    speed  6 -> side-steps from 15.5 deg off straight
+    speed 16 -> side-steps from  5.7 deg off straight
+    speed 24 -> side-steps from  3.8 deg off straight
+
+At their 16 stud/s line pace a 5.7 degree wobble was "sideways". The diagnostic
+showed every one of these playing the side step:
+
+    travelAngle=  14.3  lat= 3.95   <- straight ahead
+    travelAngle= 154.2  lat=10.38   <- BACKWARDS
+    travelAngle=-159.0  lat=-6.21   <- BACKWARDS
+
+One wrong unit, three reported symptoms: the strafe never read as a strafe
+because it was always on, jog-backwards could never play because backwards
+travel carries lateral too and the lateral test claimed it first, and the clip
+thrashed against the outfield jog whenever the wobble crossed the line. Three
+separate fix attempts moved the NUMBER; none questioned the UNIT.
+
+Before tuning a threshold, ask what quantity the rule is actually about. Sectors
+in degrees, with hysteresis, express "forward / sideways / backward" exactly.
+
+## Measure Against Something That Does Not Move
+
+The keeper's dive picked its side from the sign of the dive direction against
+the BODY's right vector. A keeper may turn up to `MaximumFacingArcDegrees` off
+the pitch, so that reference swings through 180 degrees -- and at the edge of the
+arc a ball in front of goal is BEHIND the keeper:
+
+    launchWorld= 90.0  frame= -1.3  ->  +91.3  lateral, fine
+    launchWorld=-90.9  frame= 90.6  -> +178.5  BEHIND the keeper
+    launchWorld= 89.4  frame=-75.2  -> +164.6  BEHIND the keeper
+
+Two consequences, and only the second was visible. The clip side became a
+coin-flip on where the body happened to point. And the body was driven along
+that world direction, so it genuinely travelled BACKWARDS at 17-19 studs/s --
+the reported "keeper dives backwards instead of sideways". No clip choice fixes
+that; the motion really was backwards.
+
+`Pitchward` -- out of the keeper's own goal, the published centre of their turn
+arc -- does not move. Both the clip side and the dive's body orientation now
+read it, so a shot-stopping dive is lateral by construction and the two agree.
+
+A sign taken against a rotating reference is not a decision, it is a sample of
+where something was pointing. Pick a reference the rule is actually about.
+
+The same fault ran one layer up, in the keeper's LOCOMOTION sectors. Measured
+against the body, the travel angle swung 17 degrees inside 41 milliseconds on a
+steady input -- a 244 degree body-yaw span across one session -- and the
+side-step/jog flip-flop followed it exactly. Sectors are now measured against
+`Pitchward` too: 0 is off the line, +/-90 is across the goal (a side step),
++/-180 is back into the net (jog backwards). Those are the football meanings,
+and they do not move.
+
+That fix needs its partner: `MaximumFacingArcDegrees` went 90 -> 45. At 90 a
+keeper may face fully ALONG their own goal line, where "across the goal" and
+"straight ahead" are the same direction for the body -- so no clip choice can be
+right, because a lateral shuffle and a forward jog describe the same motion.
+Selecting in a stable frame while PLAYING in a rotating one only works if the
+two agree; bounding the arc is what makes them agree.
+
+## Moving Somewhere Is Not Looking Somewhere
+
+Keeper facing was steered by the MOVEMENT stick, unclamped. The body therefore
+pointed along its own velocity, and on every side-step sample measured in one
+session the two were aligned:
+
+    goalAngle= 67.9  body fwd=+10.14 right=-0.11  -> bodyAngle= -0.6
+    goalAngle=-94.6  body fwd=+16.00 right=-0.13  -> bodyAngle= -0.5
+
+Two reported faults, one cause. A shuffle across the line rendered as a
+footballer jogging forwards, because the body had turned to face its travel. And
+jog-backwards was unreachable BY CONSTRUCTION: if the body always points at the
+travel, no travel is ever backwards. The yaw also reached 94 degrees against a
+45 degree arc, because the steer branch returned before the clamp.
+
+Moving sideways and looking sideways are different things in football, and for a
+keeper they are almost never the same thing. Facing is ball-tracking clamped to
+the arc; movement does not touch it.
+
+Note what this replaced: an earlier pass had handed facing to the stick BECAUSE
+a keeper pinned to the arc edge could not look elsewhere. That was a real
+complaint with a real cause, and the fix addressed it in the wrong place. When a
+constraint is too tight, widen the constraint -- do not hand the value to
+whatever else happens to be to hand.
+
+## Committed Movement Must Be Stopped, Not Just Ended
+
+Clearing the flag that says a launched movement is over does not stop the body.
+The keeper's dive drove the humanoid at `LowDiveSpeed`, and when the dive ended
+nothing took the momentum away:
+
+    KeeperGetUpLeft  speed=48.7   [Coast] slid 31.4 studs
+    KeeperGetUpLeft  speed=48.2   [Coast] slid 32.4 studs
+
+-- a keeper sliding thirty studs across his own box while the get-up clip plays
+over the top. Reported as "glitches backwards after diving", and it is exactly
+that: the body is still travelling in the dive's direction while the animation
+says the dive is finished.
+
+Any launched movement owns its own deceleration. Zero the HORIZONTAL component
+only, so a body still in the air finishes falling rather than freezing mid-drop.
+The owning client writes its own assembly -- section 32 forbids the SERVER
+writing to a client-owned body, not the owner writing its own, which is how the
+launch was applied in the first place.
+
+Pairs with "Rotation The Code Applies, The Code Must Take Away": the same is
+true of velocity.
+
+## A Keeper's Dive Goes Across The Goal
+
+Aiming a dive at the ball is not the same as diving. The human dive aimed along
+the direction to the ball, so a ball up the pitch produced a dive up the pitch.
+Three of eight dives in one session launched FORWARD off the line and one
+launched BACKWARD into the net.
+
+Squaring the keeper's body to the goal fixed the left/right CLIP, and that was
+worth doing, but a clip cannot make a forward dive lateral -- the body genuinely
+travelled that way. The dive is now projected onto the goal's width axis.
+
+The player's input still chooses the side; the projection's sign comes straight
+from their aim, so left stays left. What is removed is only the component that
+was never a save. An aim with no meaningful side to it (the ball coming straight
+at the keeper) is refused, and the save is taken standing -- which is the correct
+football action, not a fallback.
+
+This is §2's line exactly: assist the execution of the decision the player made,
+do not make the decision, and do not carry out a request the geometry says is not
+the action being asked for.
+
+Related: `up:Cross(look)` is MIRRORED relative to `CFrame.RightVector`; the
+correct order is `look:Cross(up)`. Verified in all four cardinal orientations
+after getting it wrong once in this very fix.
+
+## A Threshold Must Be Checked Against The Speeds It Will See
+
+The keeper's side step was chosen by ANGLE (sideways relative to the body). That
+was right. It was replaced with a pure SPEED cap after the log showed the shuffle
+clip playing at 45 studs/s -- but the real cause of those readings was the body
+still carrying dive velocity after `Diving` had gone false, not a genuine run.
+
+The replacement cap was set to 9 studs/s. A keeper's own line pace is
+`Positioning.MoveSpeed = 15` and their rush is 26, so the cap sat BELOW walking
+pace: every piece of ordinary line work exceeded it and handed over to the
+outfield jog, and the side step only played when the keeper was barely moving --
+the exact opposite of the intent. Raising the cap then broke the other side,
+because a keeper running out at 26 studs/s was neither lateral enough to side
+step nor fast enough to clear the cap, and fell through to IDLE.
+
+Two lessons, and the second is the general one:
+
+- Before setting a threshold, look up the speeds, distances or angles the system
+  actually produces and check the value against them. `MoveSpeed` and `RushSpeed`
+  were both one grep away.
+- When a symptom appears in one state, fix THAT state rather than replacing the
+  rule that governs all of them. The 45 studs/s readings were a missing dive
+  recovery state; the answer was to give the recovery its own state (the get-up
+  clip), not to rewrite how every keeper movement is classified.
+
+## A Clip Is A Better Authority Than A Timer
+
+Code that unwinds a pose over a fixed duration is an animation written in the
+wrong language. It cannot know when the body is actually ready, so it is always
+approximately wrong, and the error shows as the character drifting out of the
+movement.
+
+The keeper's dive recovery was a 0.34s constant unwinding a 78-degree roll. With
+a real get-up clip the CLIP became the authority: it publishes when it will
+finish (`Beyond90KeeperGetUpUntil`), the roll unwinds across exactly that window,
+and input returns on the same frame the keeper is animated as standing.
+
+Where two systems must agree on a duration, ONE of them owns it and publishes it;
+the other reads. Two constants for one event is how they drift apart. Keep the
+constant as a fallback for the missing-asset case, so a clip that fails to load
+degrades to the old behaviour rather than stranding the character.
+
+## Two Assists Must Not Fight Each Other
+
+Assistance systems are written one at a time against the case they are for, and
+each is reasonable alone. Check every new one against the assists that already
+exist, because the failure is silent: both run, neither logs anything wrong, and
+the player simply cannot do the thing.
+
+Body-overlap separation steers a footballer AWAY from anyone close. Pressing
+steers a footballer TOWARD the man they are closing down. Added independently,
+separation cancelled the last few studs of every press -- and the only visible
+trace was the tackle being refused on distance:
+
+    [Defending] [Tackle] runo -> AWAY_AI_2 rejected=ball-out-of-reach
+
+The rule that resolves it: a deliberate player decision outranks an automatic
+correction. The press is held down by the player, so the man being pressed is
+exempt from separation while it lasts. When two assists disagree, the one
+carrying an explicit input wins.
+
+## Removing A Collision Is Not A Fix For A Collision Bug
+
+Footballers were climbing over each other, so the footballer-versus-footballer
+collision pair was removed. They then walked THROUGH each other, which is worse:
+climbing is ugly, but passing through a defender is not football at all.
+
+Collision is load-bearing for how a sport reads even when nothing competitive is
+computed from it. Fix contact bugs by changing what is being contacted -- the
+geometry, or how often bodies reach each other -- and treat deleting the contact
+as the last resort it is. A Humanoid climbs LEDGES, and separate torso parts are
+what make ledges; a single smooth collision capsule is the real answer if
+steering is not enough.
+
+## Where Two Driven Motions Meet, Match The RATE, Not Just The VALUE
+
+The keeper's dive fell on a squared curve to the last frame of the dive, and the
+get-up then raised him starting from rest. The two agreed on the VALUE at the
+handover -- both said "2 studs down" -- and disagreed completely on the RATE: the
+fall was descending fastest at the instant it stopped. That step change is felt
+as an impact jolt, and no amount of adjusting the endpoint heights removes it.
+
+Easing the fall so it meets the ground at zero rate, and holding the keeper flat
+for the last stretch of the dive, makes the whole arc continuous from launch to
+standing:
+
+    p=0.830 rate=-1.18   p=0.845 rate=-0.30   p=0.850 rate=-0.02   p=1.000 +0.00
+
+Whenever one driven motion hands over to another -- dive to get-up, run to stop,
+carry to release -- check the derivative at the seam, not only the position.
+
+## Gate EVERY Half Of A Commitment On The Same Edge
+
+A committed action usually drives more than one thing. The keeper's dive drives
+both a LAUNCH (velocity) and an ORIENTATION (squaring the body to `Pitchward`).
+Gating only the launch on the animation's start left the orientation firing on
+the server's `Diving` edge -- up to 45 degrees of yaw snap, ~39ms before the clip
+was drawn, and because a per-frame CFrame write is integrated as motion, the snap
+carried a translation with it.
+
+The symptom ("moves slightly before the animation plays") was reported twice and
+fixed once, because the first fix addressed the half that was easy to see. When
+gating an action on a start signal, enumerate everything that action writes and
+gate all of it.
+
+## A Baseline Read From What You Are Writing To Is Not A Baseline
+
+Code that offsets a property needs a rest value to offset FROM. Capturing that
+lazily -- on the first frame that needs it -- means any path reaching the capture
+while an offset is already applied records the OFFSET as the new rest value, and
+every later offset stacks on top of it.
+
+The keeper's dive drove `Humanoid.HipHeight` this way. Measured against a
+calibrated 2.950:
+
+    [Grounding] state=jog hipHeight=9.602 ... contactMax=18.129
+
+with the keeper mid-get-up -- reported as "shoots up just after getting to the
+floor". Each dive was adding roughly its own apex to the character's resting
+height, and no single path was wrong; the loop was.
+
+Bind the rest value ONCE, where the thing it describes is created (here, when the
+character's humanoid is bound), before anything can have moved it. Releasing an
+offset restores the value but must NOT clear the binding -- clearing it is what
+lets a later capture read an offset value. Pairs with "A Value With Two Owners
+Has One Real Owner": this is the same fault with the two owners being the same
+line of code at two different times.
+
+## A Rate That Sizes A Window Must Also Drive The Clip
+
+`GetUpPlaybackRate` was used to compute how long the get-up window should last,
+and never applied to the get-up track. The clip fell through to the generic
+speed-scaled rate, which at a standstill clamps to `MinimumPlaybackRate` -- so a
+keeper pushing up off the grass, who is by definition not moving, always got the
+slowest clip in the set:
+
+    State -> KeeperGetUpRight ... playback=0.80   (window sized as though 1.00)
+
+The window and the clip then disagreed by exactly that ratio, and the body was
+handed back before the animation finished standing up. One rate, used for both,
+in the branch that owns the clip. Check any config value whose name says "rate"
+is actually reaching the track, not only the arithmetic around it.
+
+## A Require Cache Is Not A Sync Failure
+
+`require()` caches a module's returned table per DataModel. Rojo replaces a
+ModuleScript's `Source`, but an Edit session that already required that module
+keeps handing out the ORIGINAL table forever. So a probe that requires a config
+and reads a field reports the value from whenever the module was first required,
+which may be hours and many saves ago.
+
+This was misdiagnosed three rounds running as "AnimationConfig has not synced to
+Studio", and nearly ended with the user being told to reconnect Rojo. Rojo was
+fine. Reading the same instance's `Source` showed every edit present:
+
+    require(...).DivePlaybackRate   -> 1     (cached at first require)
+    Source match "DivePlaybackRate" -> 1.7   (what Rojo actually delivered)
+
+A Play session builds a fresh DataModel, so playtests were running the NEW
+values the whole time. The bug was in the measuring instrument.
+
+When verifying that an edit reached Studio, read `Source`. Use `require` only to
+check that a module still LOADS, or inside a Play session that started after the
+edit. If a probe reports a stale value, confirm against `Source` before
+concluding anything about the sync.
+
+## A Value With Two Owners Has One Real Owner
+
+When a value can be set from configuration AND accumulated at runtime, tuning
+the configuration does nothing for as long as the accumulator is the one being
+read. The tuning looks applied -- the file changed, the build succeeded -- and
+the game ignores it.
+
+The Pro Camera's pitch worked this way. With the mouse locked, which is the
+normal gameplay state, pitch was `mousePitch` alone, seeded once from the
+OUTFIELD preset and moved only by mouse delta thereafter. The goalkeeper preset
+supplied height, distance and FOV, which visibly took effect, and an angle that
+never did. Two passes of tuning the keeper's `Pitch` changed nothing on PC, and
+the report each time was that the camera was still not angled correctly.
+
+So before tuning any value, find every writer of it. If one of them is a
+runtime accumulator, decide explicitly when the accumulator is re-seeded --
+otherwise the configuration is documentation rather than behaviour.
+
+## A Fall-Through Is Not An Error
+
+`InputController.SetTouchFootballAction` dispatched on a list of action names --
+`GroundPass`, `ThroughPass`, `KnockOn`, `Shoot` -- and `Tackle` was simply not on
+it. The touch HUD sent it anyway, for two buttons: the outfield PRESS and the
+goalkeeper's DIVE. Both did nothing on every touch device, silently, because a
+name that matches no branch produces no error and no log line.
+
+Section 22 already requires touch to be tested alongside keyboard. The narrower
+rule this teaches: when one input path dispatches on a SET of names and another
+path produces them, the two lists must be checked against each other. Prefer a
+shared table of action names over two hand-written lists that can drift.
+
+The same fix exposed a second layer. The keyboard `Tackle` binding sent a bare
+`send("Dive")` with no aim -- acceptable while it was a secondary binding beside
+the mouse click, and broken as soon as it became the ONLY way a phone player
+dives, because a dive with no side is refused as `no-lateral-component`. A
+control that is secondary on one device may be primary on another; check what
+each entry point actually supplies before sharing it.
+
+## Two Writers, One Part
+
+`BallControlService` had no knowledge of the goalkeeper hold, so a gathered ball
+-- stationary, two studs from its holder, the exact shape of a loose ball worth
+collecting -- was claimed by the ordinary dribble acquisition, for the keeper
+HOLDING IT:
+
+    [GK] morhanzy caught the football (ballSpeed=125.1)
+    [Reception] player=morhanzy type=Shoot distance=2.10 ballSpeed=0.00
+    Ball network owner -> morhanzy
+    [ControlledBall] epoch=23 initialized phase=Carry
+    Control released: movement state invalid
+
+`updateHeldBall` then pinned the ball to the keeper's chest on the SERVER every
+frame while the newly network-owning CLIENT carried it at foot height. The part
+ends up inside the keeper's own collidable torso and the solver ejects him --
+reported as "glitches upwards when I try to move after catching a ball".
+
+Whenever a part is positioned every frame by one system, every OTHER system that
+can take ownership of that part needs a reason not to. The football rule and the
+fix are the same sentence here: a keeper who has gathered the ball has
+possession, and nobody -- the keeper included -- dribbles it.
+
+Pairs with [[Do Not Let A Keeper Catch Their Own Distribution]]: same part, same
+service boundary, different direction across it.
+
+## A Timer That Releases The Ball Is A Decision The Player Did Not Make
+
+`HoldSeconds` and `MaximumHoldSeconds` made a keeper throw the ball away 1.5s
+after catching it, and force-distributed at 5s. For an AI keeper that IS the
+decision and it must stay -- section 2 puts tactical choice on the AI side, and a
+keeper who never distributes stalls the match. For a HUMAN keeper it is exactly
+what section 2 forbids: the ball left their hands without them choosing to
+release it.
+
+The general shape: before adding a timer that performs a football action, ask
+whose decision that action is. If a human controls the footballer, the timer may
+prompt, warn, or penalise -- it may not act.
+
+## Do Not Let A Keeper Catch Their Own Distribution
+
+A goalkeeper's throw or kick releases the ball AT THE KEEPER'S HANDS, so for one
+frame it is a free ball a fraction of a stud away -- which is precisely what the
+assisted save and the assisted claim exist to pounce on. Both the AI keeper and
+the human one were re-securing every ball they distributed, within milliseconds,
+which read to the player as the control doing nothing at all.
+
+Football already states the rule: having released the ball, a keeper may not
+handle it again until another player has touched it. Implement it as a per-actor
+block that lifts on anyone else's touch, with a timeout so a clearance reaching
+nobody cannot strand the keeper.
+
+The general form: any system that both RELEASES a ball and AUTOMATICALLY CLAIMS
+one needs to know it was the releaser. Check the receiving/interception paths
+whenever a new release is added.
+
+## Bodies Do Not Climb Bodies
+
+A Roblox `Humanoid` steps up onto anything within its step height, and another
+footballer's torso is inside it -- so two footballers meeting shoulder to
+shoulder ride up over one another, leaving one airborne and the other pinned.
+
+No amount of steering fixes this alone: while the geometry is climbable, a hard
+enough collision climbs it. Remove the thing being climbed (footballer against
+footballer is a non-colliding pair) and replace it with steering separation,
+which holds bodies apart before they meet. Section 33 already permits
+body-overlap avoidance as assistance, so the steering is allowed for a
+human-controlled footballer as well as an AI one.
+
+If physical shielding is built later it wants its own deliberate contact model,
+not Roblox's default one -- the default is what was climbing.
+
+## A UIStroke Outlines Text Unless Told Otherwise
+
+`UIStroke.ApplyStrokeMode` defaults to `Contextual`, and Contextual on a
+`TextLabel` or `TextButton` strokes the GLYPHS, not the frame. Every text
+control that gets a stroke therefore gets outlined letters, which fattens and
+blurs them until they read as a different, wider typeface -- and any accent
+colour becomes a halo around the text.
+
+Beyond 90's shared stroke helpers now pin `ApplyStrokeMode = Border`. `Border`
+is identical to `Contextual` on a Frame, so pinning it costs nothing and fixes
+every text control at once. Any new stroke created directly rather than through
+those helpers must set it too.
+
+## A Human Actor Answers The Same Questions As An AI One
+
+Human and AI footballers are described by actor tables that must support the
+same queries, because shared systems query them identically. Where an AI actor
+carries a field and a human actor does not, every test on that field silently
+answers "no" for humans -- which is not an error anywhere, just a wrong answer
+everywhere.
+
+`actor.Position` was AI-only, so `actor.Position == "Goalkeeper"` was false for
+a human goalkeeper. Match assembly counts keepers with exactly that test and
+reported a complete side as a keeper short. When adding a field to one actor
+kind, add it to both, or read it from the character attribute both kinds set.
 
 ---
 
@@ -4567,6 +5298,48 @@ and broader match/team integration is planned for:
 
 If future playtesting changes milestone dependencies, update this document
 explicitly rather than silently drifting from the roadmap.
+
+## The Above Is Historical. Current State Follows.
+
+The 5.0A / 5.0B text above describes where the project stood when the roadmap
+was written and is kept for context. It is **not** the current position.
+
+### Working milestone numbers are not roadmap numbers
+
+Day-to-day work is tracked by milestone briefs under:
+
+    docs/milestones/
+
+Those briefs use their own numbering, assigned as work is commissioned, and it
+does **not** correspond to the roadmap in section 54. "Milestone 6.8" in
+`docs/milestones/` is pressing, tackling and slide tackling; section 54's 6.8 is
+Clubs. Do not assume a brief and a roadmap entry with the same number are the
+same body of work.
+
+Section 54 remains authoritative for **dependency order** — what must be stable
+before what. The briefs are authoritative for **what is actually being built
+now**.
+
+### Roughly where things stand
+
+Substantially implemented and playtested: core locomotion, controlled ball,
+passing, receiving, shooting and goals, defending and interceptions, human and
+AI goalkeepers, AI footballers with team shape and formation positioning, match
+flow, restarts and offside, menus and match HUD, player identity and the
+footballer/avatar choice.
+
+Known incomplete, and the most useful things to know before planning:
+
+- **Animation is the largest gap.** There is no clip for a player performing a
+  tackle or a slide, none for a goalkeeper dive, and no on-ball locomotion set
+  at all — a footballer dribbling is animated as one running with no ball.
+- Only 3v3 assembles AI. `Tournament5v5` and `Clubs11v11` are `Enabled = false`,
+  and the `Development` mode fields no AI outfielders, so AI work is invisible
+  in it. Use `Quick3v3` to observe AI behaviour.
+- Match-format scaling, clubs, ranked and progression are not started.
+
+Update this subsection when that stops being true, rather than leaving a future
+reader to infer the state from the code.
 
 ---
 

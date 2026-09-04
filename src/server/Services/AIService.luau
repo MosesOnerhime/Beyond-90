@@ -19,6 +19,8 @@ local SetPieceFormation = require(Shared.Football.SetPieceFormation)
 local MatchConfig = require(Shared.Config.MatchConfig)
 local PlayerConfig = require(Shared.Config.PlayerConfig)
 local BallControlMath = require(Shared.Football.BallControlMath)
+local FootballerSeparation = require(Shared.Football.FootballerSeparation)
+local TackleEvaluator = require(Shared.Football.TackleEvaluator)
 local AITacticalEvaluator = require(Shared.Football.AITacticalEvaluator)
 local TrajectoryPredictor = require(Shared.Football.TrajectoryPredictor)
 
@@ -194,6 +196,87 @@ local function clampTargetForOffside(actor, teamModel, target: Vector3): Vector3
 	return PitchGeometry.FromNormalized(frame, limit, targetLateral, target.Y - frame.GroundY)
 end
 
+--[[
+	THE TEAM'S SHAPE, SOLVED ONCE FOR THE WHOLE SIDE.
+
+	See docs/research/gameplay-football/ai/02-team-shape-and-positioning.md.
+
+	Every footballer used to work out its own drift: its anchor, shifted by the
+	ball, scaled by its own HoldShape. Eleven independent decisions do not add up
+	to a shape -- positions with a low HoldShape drift while high ones hold, so
+	gaps open that nobody chose to open, and the block never compresses as a unit.
+
+	This computes ONE box per team per tactical tick. Formation anchors are then
+	painted into that box, so relative shape is preserved by construction and
+	compressing the block is a single number rather than an emergent average.
+
+	POSSESSION IS A BIAS, NOT A STATE. The discrete InPossession/OutOfPossession
+	branch snapped the whole side on a turnover. Here a faded possession reading
+	blends with ball position, and -- the part worth having from the reference --
+	ball position counts for MORE when possession itself is unclear, because that
+	is exactly when the possession reading is worth least. It is capped below 1 so
+	a contested ball upfield does not pull the defenders all the way out.
+
+	Runs at team cadence in updateTeams, not per footballer and not per frame,
+	per AGENTS.md 53.
+]]
+local function computeTeamShape(teamModel, controller, now: number)
+	local config = AIConfig.Formation.TeamShape
+	local attackDirection, lateralAxis = getAxes(teamModel.TeamId)
+	local ballOffset = BallControlMath.GetHorizontal(teamModel.PerceivedBallPosition - pitchState.Center)
+	local ballLongitudinal = math.clamp(
+		ballOffset:Dot(attackDirection) / math.max(pitchState.Length * 0.5, 1), -1, 1)
+	local ballLateral = math.clamp(
+		ballOffset:Dot(lateralAxis) / math.max(pitchState.Width * 0.5, 1), -1, 1)
+
+	-- Instantaneous reading: 1 we have it, 0 they have it, 0.5 nobody does.
+	local instant = 0.5
+	if controller then
+		instant = if getTeamId(controller) == teamModel.TeamId then 1 else 0
+	end
+
+	local previous = teamModel.PossessionAmount or 0.5
+	local elapsed = math.clamp(now - (teamModel.ShapeUpdatedAt or now), 0, 1)
+	local fade = 1 - math.exp(-elapsed / math.max(config.PossessionFadeSeconds, 0.01))
+	local amount = previous + (instant - previous) * fade
+	teamModel.PossessionAmount = amount
+	teamModel.ShapeUpdatedAt = now
+
+	-- Ball position as a second opinion, weighted by how little the first is
+	-- worth: at amount 0.5 the reading says nothing, so the ball says more.
+	local ballOpinion = math.clamp(ballLongitudinal * 0.5 + 0.5, 0, 1)
+	local unclear = 1 - math.abs(amount * 2 - 1)
+	local ballWeight = unclear * config.BallWeightWhenUnclear
+	local bias = math.clamp(amount * (1 - ballWeight) + ballOpinion * ballWeight, 0, 1)
+
+	local depth = config.DepthOutOfPossession
+		+ (config.DepthInPossession - config.DepthOutOfPossession) * bias
+	local width = config.WidthOutOfPossession
+		+ (config.WidthInPossession - config.WidthOutOfPossession) * bias
+	local offset = config.CentreOffsetOutOfPossession
+		+ (config.CentreOffsetInPossession - config.CentreOffsetOutOfPossession) * bias
+
+	--[[
+		The centre follows the ball, then is pulled back toward halfway in
+		proportion to how much room the block itself needs. Without that second
+		step a deep block with the ball on the touchline ends up half outside the
+		pitch and every clamp fires at once.
+	]]
+	local centreLongitudinal = ballLongitudinal * config.CentreFollowLongitudinal + offset
+	local centreLateral = ballLateral * config.CentreFollowLateral
+	centreLongitudinal *= math.clamp(1 - depth, 0, 1) * 0.95 + 0.05
+	centreLateral *= math.clamp(1 - width, 0, 1) * 0.9 + 0.1
+
+	teamModel.Shape = {
+		PossessionBias = bias,
+		CentreLongitudinal = centreLongitudinal,
+		CentreLateral = centreLateral,
+		Depth = depth,
+		Width = width,
+	}
+	return teamModel.Shape
+end
+
 local function getFormationTarget(actor, teamModel): Vector3
 	local position = getPositionProfile(actor)
 	local role = if position
@@ -218,29 +301,79 @@ local function getFormationTarget(actor, teamModel): Vector3
 		HoldShape 1 means the anchor is absolute, 0 means follow the ball freely.
 	]]
 	local hold = if profile then math.clamp(profile.HoldShape, 0, 1) else 0.5
-	local ballShift = AIConfig.Formation.BallShift * (1 - hold * 0.7)
-	local longitudinal = role.Longitudinal + ballLongitudinal * ballShift
 
-	if teamModel.State == "InPossession" then
-		-- Only positions willing to break forward actually do.
-		local runWillingness = if profile then math.clamp(profile.RunWillingness, 0, 1) else 0.5
-		longitudinal += AIConfig.Formation.PossessionAdvance * (0.4 + runWillingness)
-	elseif teamModel.State == "OutOfPossession" then
-		longitudinal -= AIConfig.Formation.DefensiveRetreat
+	local shape = teamModel.Shape
+	local longitudinal, lateral
+	-- `actor.Position` is the field that carries the keeper role (see the check
+	-- in rebuildTeams); actors have no IsGoalkeeper flag.
+	local isKeeper = actor.Position == GoalkeeperConfig.Role
+	if shape and not isKeeper then
+		--[[
+			Painted into the team's box rather than drifting independently.
+
+			The anchor is a normalised coordinate; the box says where that
+			coordinate currently lives. So the block slides and compresses as one
+			piece and the relative shape survives, which is the whole point of
+			solving it per team (see computeTeamShape).
+
+			HoldShape keeps its meaning as resistance to the box: a defender at
+			high hold stays nearer its nominal line while the block moves around
+			it. It no longer authorises unbounded independent drift.
+		]]
+		local painted = shape.CentreLongitudinal + role.Longitudinal * shape.Depth
+		longitudinal = role.Longitudinal + (painted - role.Longitudinal) * (1 - hold * 0.55)
+
+		--[[
+			Stretch the midfield without dragging the lines with it. The stretch
+			applies in proportion to how central the anchor is, so a defender at
+			-0.52 keeps almost all of its line and a midfielder near 0 takes the
+			full effect.
+		]]
+		local config = AIConfig.Formation.TeamShape
+		local centrality = math.clamp(
+			1 - math.abs(role.Longitudinal * config.MidfieldStretchFalloff), 0, 1)
+		local stretch = centrality * config.MidfieldStretchStrength
+		longitudinal += (shape.PossessionBias * 2 - 1) * stretch
+
+		local paintedLateral = shape.CentreLateral + role.Lateral * shape.Width
+		lateral = role.Lateral + (paintedLateral - role.Lateral) * (1 - hold * 0.4)
+	else
+		-- Goalkeepers are not part of the outfield block, and a team without a
+		-- solved shape yet falls back to the anchor plus a plain ball shift.
+		local ballShift = AIConfig.Formation.BallShift * (1 - hold * 0.7)
+		longitudinal = role.Longitudinal + ballLongitudinal * ballShift
+		lateral = role.Lateral + ballLateral * 0.12
 	end
 
 	-- A position may never abandon its band entirely.
 	if profile then
 		longitudinal = math.clamp(longitudinal, profile.MaximumRetreat, profile.MaximumAdvance)
 	end
-
-	local lateral = role.Lateral + ballLateral * 0.12
 	local target = pitchState.Center
 		+ attackDirection * (longitudinal * pitchState.Length * AIConfig.Formation.LongitudinalScale)
 		+ lateralAxis * (lateral * pitchState.Width * AIConfig.Formation.WidthScale)
 
-	-- Only a footballer actually breaking forward can be caught offside.
-	if teamModel.State == "InPossession" and profile and profile.RunWillingness > 0.5 then
+	--[[
+		EVERY ATTACKER IS CHECKED, NOT ONLY THE ONES BREAKING FORWARD.
+
+		The gate here was `RunWillingness > 0.5`, on the reasoning that only a
+		footballer making a run can be caught offside. That is not the rule: any
+		attacker beyond the second-last defender when the ball is played is
+		offside, whatever its position's appetite for running. The gate mattered
+		less when each footballer drifted a little from its own anchor; now the
+		team box pushes the whole front line upfield when the bias is high, so a
+		low-run-willingness position can sit beyond the line for free.
+
+		The clamp is a no-op for anyone already onside, so applying it to every
+		outfielder costs nothing and removes the exemption. The possession test
+		is the continuous bias rather than the discrete state, so it does not
+		flicker on a contested ball -- and it is deliberately below 0.5, because
+		a side can be caught offside while possession is still being decided.
+	]]
+	local attacking = if teamModel.Shape
+		then teamModel.Shape.PossessionBias > 0.4
+		else teamModel.State == "InPossession"
+	if attacking and not isKeeper then
 		target = clampTargetForOffside(actor, teamModel, target)
 	end
 
@@ -257,26 +390,57 @@ local function predictBallPosition(timeSeconds: number): Vector3
 	return clampToPitch(TrajectoryPredictor.SamplePosition(ball.Position, ball.AssemblyLinearVelocity, timeSeconds))
 end
 
-local function estimateTimeToPoint(actor, point: Vector3): number
-	local distance = BallControlMath.GetHorizontal(point - actor.RootPart.Position).Magnitude
-	local currentSpeed = BallControlMath.GetHorizontal(actor.RootPart.AssemblyLinearVelocity).Magnitude
-	local effectiveSpeed = math.max(AIConfig.Locomotion.JogSpeed, currentSpeed, AIConfig.Locomotion.SprintSpeed * 0.75)
-	return AIConfig.Cadence.ReactionDelay + distance / effectiveSpeed
+--[[
+	How long this footballer needs to reach `point`, in control and at a stretch.
+
+	Adapted from GameplayFootball (Apache-2.0), commit
+	1dc1518abd0ffaa349c7e1a53ded6ba19213c73f, `AI_GetTimeNeededForDistance_ms` in
+	src/onthepitch/AIsupport/AIfunctions.cpp. An ADAPTATION, not a copy: the
+	momentum relationship and the two-radius split are preserved, the 10ms stepped
+	simulation is solved in closed form instead, and the distances are Beyond 90's
+	own. See AIConfig.Reachability for why the previous estimate was wrong.
+
+	Returns (usual, optimistic).
+]]
+local function estimateTimeToPoint(actor, point: Vector3): (number, number)
+	local config = AIConfig.Reachability
+	local velocity = BallControlMath.GetHorizontal(actor.RootPart.AssemblyLinearVelocity)
+	--[[
+		Momentum is carried before it can be shed, so it displaces where the
+		footballer effectively starts from -- toward the ball if he is already
+		running at it, away if he is not. This is the whole correction.
+	]]
+	local carriedStart = actor.RootPart.Position + velocity * (config.MomentumDecaySeconds * 0.5)
+	local distance = BallControlMath.GetHorizontal(point - carriedStart).Magnitude
+	local speed = math.max(
+		AIConfig.Locomotion.SprintSpeed * config.AttainableSpeedFactor,
+		AIConfig.Locomotion.JogSpeed
+	)
+	local delay = AIConfig.Cadence.ReactionDelay
+	local usual = delay + math.max(0, distance - config.ReachUsual) / speed
+	local optimistic = delay + math.max(0, distance - config.ReachOptimistic) / speed
+	return usual, optimistic
 end
 
-local function estimateTimeToBall(actor): (number, Vector3)
+local function estimateTimeToBall(actor): (number, Vector3, number)
 	local bestTime = math.huge
+	local bestOptimistic = math.huge
 	local bestPoint = ball and ball.Position or pitchState.Center
 	for _, predictionTime in AIConfig.LooseBall.PredictionTimes do
 		local point = predictBallPosition(predictionTime)
-		local reachTime = estimateTimeToPoint(actor, point)
+		local reachTime, optimisticTime = estimateTimeToPoint(actor, point)
+		--[[
+			A footballer cannot arrive before the ball does, so the score is the
+			later of the two. Kept from the existing model; it is correct.
+		]]
 		local scoreTime = math.max(reachTime, predictionTime)
 		if scoreTime < bestTime then
 			bestTime = scoreTime
+			bestOptimistic = math.max(optimisticTime, predictionTime)
 			bestPoint = point
 		end
 	end
-	return bestTime, bestPoint
+	return bestTime, bestPoint, bestOptimistic
 end
 
 local function getControllerActor()
@@ -397,14 +561,27 @@ local function getPressTarget(actor, targetActor, dwellSeconds: number?): Vector
 		+ (defending.PressStandoff - defending.StepInStandoff) * containAlpha
 
 	--[[
-		DWELL: the carrier has been contained long enough. Go and get the ball.
+		THE NOMINATED PRESSER GOES AT THE BALL. UNCONDITIONALLY.
 
-		Aiming at the football rather than at a point relative to the carrier is
-		what actually puts the defender inside tackle range; the challenge itself
-		is still decided by the ordinary evaluation, so this creates the
-		OPPORTUNITY to tackle rather than a tackle.
+		This is `forceMagnet` (GameplayFootball `playercontroller.cpp`
+		_MovementCommand): for the player the team has nominated to press, haste is
+		set to 1, movement is driven by AI_GetToBallMovement, and autoBias becomes
+		1.0 -- a total override toward the ball. There is no angle test, no dwell
+		and no standoff anywhere in that path.
+
+		Beyond 90 previously aimed the presser at a containment point 3.2 studs
+		goal-side of the CARRIER and only went for the ball after a timer. Measured
+		over 100s that left the nearest defender averaging 9.4 studs from a ball a
+		tackle can reach at 5.6 -- on average, permanently out of range of the
+		challenge it was supposed to be making. That is what made pressing passive.
+
+		The duel angle still matters, but it gates the CHALLENGE, not the approach
+		(DefendingConfig.AI.MinimumDuelLikeliness). Containing is the SUPPORT
+		defender's job -- getSupportPressTarget, documented there as not
+		challenging -- and the behind-recovery branch above still stops a defender
+		chasing into the back of a carrier it can never legally tackle.
 	]]
-	if ball and dwellSeconds and dwellSeconds >= defending.CommitAfterSeconds then
+	if ball then
 		return Vector3.new(ball.Position.X, carrierPosition.Y, ball.Position.Z)
 	end
 
@@ -537,18 +714,31 @@ local function chooseDesignatedPlayer(teamModel, targetActor)
 
 	for _, actor in teamModel.Actors do
 		if refreshActor(actor) then
-			local time, point
+			local time, point, optimistic
 			if targetActor then
 				point = getPressTarget(actor, targetActor, dwellSeconds)
-				time = estimateTimeToPoint(actor, point)
+				time, optimistic = estimateTimeToPoint(actor, point)
 			else
-				time, point = estimateTimeToBall(actor)
+				time, point, optimistic = estimateTimeToBall(actor)
 				local intendedId = ball and ball:GetAttribute("LastFootballActionIntendedReceiverUserId")
 				if intendedId == actor.Id then
 					time -= AIConfig.LooseBall.IntendedReceiverBonusSeconds
+					optimistic -= AIConfig.LooseBall.IntendedReceiverBonusSeconds
 				end
 			end
 			actor.TimeToBall = time
+			--[[
+				The full-stretch answer, kept alongside the in-control one.
+
+				Nothing decides on it yet, and deliberately so (AGENTS.md 26): the
+				reference uses it to ask "who COULD reach this" separately from
+				"who reaches it in control", and Beyond 90 has no decision that
+				needs the distinction until more than one footballer is allowed to
+				contest a ball. It is recorded and published so the difference can
+				be watched while that decision is designed, rather than invented
+				ahead of a use for it.
+			]]
+			actor.OptimisticTimeToBall = optimistic
 			actor.ReceptionTarget = point
 			local isHumanActivelyClosing = not actor.IsAI
 				and BallControlMath.GetHorizontal(actor.RootPart.AssemblyLinearVelocity).Magnitude >= 4
@@ -634,10 +824,78 @@ local function chooseDesignatedPlayer(teamModel, targetActor)
 	end
 end
 
+--[[
+	THE SNAPSHOT THE AI IS ALLOWED TO SEE.
+
+	id -> { Position, Velocity, At }. Refreshed on the perception tick, which is
+	deliberately slower than the decision tick, so what the AI reasons about is
+	always a little behind the world. See AIConfig.Perception.
+]]
+local perceivedActors: { [number]: { Position: Vector3, Velocity: Vector3, At: number } } = {}
+
+local function takePerceptionSnapshot()
+	local now = os.clock()
+	for _, teamModel in teams do
+		for _, actor in teamModel.Actors do
+			if refreshActor(actor) then
+				perceivedActors[actor.Id] = {
+					Position = actor.RootPart.Position,
+					Velocity = actor.RootPart.AssemblyLinearVelocity,
+					At = now,
+				}
+			end
+		end
+	end
+end
+
+--[[
+	Where the AI believes `actor` is, and how fast it believes they are moving.
+
+	The three-part rule from the reference, in order: take the stale sample,
+	extrapolate it forward by its own momentum, then clamp both results to a
+	maximum deviation from the truth. The extrapolation is what keeps a
+	constant-velocity runner correctly tracked; the clamp is what stops a stale
+	sample becoming nonsense when someone turns.
+
+	Falls back to the truth when there is no sample yet -- a footballer who has
+	just spawned should not be invisible.
+]]
+local function getPerceivedState(actor): (Vector3, Vector3)
+	local truePosition = actor.RootPart.Position
+	local trueVelocity = actor.RootPart.AssemblyLinearVelocity
+	local perception = AIConfig.Perception
+	if not perception or perception.Enabled ~= true then
+		return truePosition, trueVelocity
+	end
+	local sample = perceivedActors[actor.Id]
+	if not sample then
+		return truePosition, trueVelocity
+	end
+
+	local age = math.max(os.clock() - sample.At, 0) + AIConfig.Cadence.ReactionDelay
+	local extrapolated = sample.Position + sample.Velocity * age
+
+	local positionError = extrapolated - truePosition
+	local positionLimit = perception.MaximumPositionDeviationStuds
+	if positionError.Magnitude > positionLimit then
+		extrapolated = truePosition + positionError.Unit * positionLimit
+	end
+
+	local believedVelocity = sample.Velocity
+	local velocityError = believedVelocity - trueVelocity
+	local velocityLimit = perception.MaximumVelocityDeviationStuds
+	if velocityError.Magnitude > velocityLimit then
+		believedVelocity = trueVelocity + velocityError.Unit * velocityLimit
+	end
+
+	return extrapolated, believedVelocity
+end
+
 local function updatePerception()
 	if not ball then
 		return
 	end
+	takePerceptionSnapshot()
 	local controller = getControllerActor()
 	local controllerId = controller and controller.Id or 0
 	if controllerId ~= lastControllerId then
@@ -651,13 +909,263 @@ local function updatePerception()
 	end
 end
 
+--[[
+	Everything the decision needs to know about the opposition, once.
+
+	Built per decision rather than per candidate: the free-space and interception
+	models each walk the whole opposition, and a 3v3 carrier rating itself plus
+	two team-mates would otherwise rebuild this five times a tick (§102).
+]]
+local function collectOpponents(teamId: string): { any }
+	local opponentTeam = teams[if teamId == "Home" then "Away" else "Home"]
+	local list = {}
+	for _, opponent in opponentTeam and opponentTeam.Actors or {} do
+		if refreshActor(opponent) then
+			--[[
+				An opponent is seen through the perception snapshot, not read
+				exactly. This is the one place opponent world state enters AI
+				decision-making -- passing odds, situation rating, pressing -- so
+				bounding it here bounds it everywhere, without every caller having
+				to remember to.
+			]]
+			local perceivedPosition, perceivedVelocity = getPerceivedState(opponent)
+			table.insert(list, {
+				Position = perceivedPosition,
+				Velocity = perceivedVelocity,
+				IsGoalkeeper = opponent.Position == GoalkeeperConfig.Role,
+			})
+		end
+	end
+	return list
+end
+
+--[[
+	OFF-BALL SUPPORT POSITIONING, AS A FIELD OF ATTRACTORS AND REPELLERS.
+
+	Adapted from GameplayFootball (Apache-2.0), commit
+	1dc1518abd0ffaa349c7e1a53ded6ba19213c73f, from `AI_GetForceFieldMovement` in
+	src/onthepitch/AIsupport/AIfunctions.cpp and
+	`ElizaController::GetSupportPosition_ForceField` in
+	src/onthepitch/player/controller/elizacontroller.cpp. This is an ADAPTATION,
+	not a copy: the composition and the mathematical relationships are preserved,
+	while the engine types, the role enumeration and every distance are Beyond
+	90's own. See
+	docs/research/gameplay-football/ai/01-perception-reachability-movement.md.
+
+	The solver is a WEIGHTED AVERAGE, not a sum. Dividing by the cumulative force
+	is what makes adding another spot change the DIRECTION a footballer moves
+	without changing how urgently he moves; summing instead would make crowded
+	areas produce faster movement, which is backwards.
+]]
+local function solveForceField(spots: { any }, currentPosition: Vector3): Vector3
+	local field = AIConfig.SupportField
+	local cumulativeVector = Vector3.zero
+	local cumulativeForce = 0
+
+	for _, spot in spots do
+		local offset = BallControlMath.GetHorizontal(spot.Origin - currentPosition)
+		local distance = offset.Magnitude
+		local intensity
+		if spot.Scale then
+			intensity = math.clamp(1 - distance / math.max(spot.Scale, 1e-3), 0, 1)
+			if spot.Exponent and spot.Exponent ~= 1 then
+				intensity = intensity ^ spot.Exponent
+			end
+		else
+			-- Constant decay: reaches across the whole pitch at full strength.
+			intensity = 1
+		end
+		if intensity > 0 and distance > 1e-3 then
+			local direction = offset.Unit
+			if spot.Repel then
+				direction = -direction
+			elseif distance < field.AttractorDampingDistance then
+				--[[
+					Attractors are damped as they are reached, or a footballer
+					oscillates around the spot he has already arrived at.
+					Repellers are deliberately undamped: you always want to be
+					pushed out of a crowd at full strength.
+				]]
+				direction *= distance / field.AttractorDampingDistance
+			end
+			local force = spot.Power * intensity
+			cumulativeVector += direction * force
+			cumulativeForce += force
+		end
+	end
+
+	if cumulativeForce <= 0 then
+		return Vector3.zero
+	end
+	return (cumulativeVector / cumulativeForce) * field.MaximumDisplacement
+end
+
+--[[
+	Build this footballer's field and solve it into a desired support position.
+
+	The formation anchor becomes one attractor among several rather than the whole
+	answer, which is the entire difference between a team that holds its shape and
+	a team that plays: shape, spacing, support distance and lane discipline all
+	fall out of adding simple rules together.
+]]
+local function refineOffBallTarget(actor, teamModel, anchor: Vector3, opponents: { any }): Vector3
+	local field = AIConfig.SupportField
+	if not field or field.Enabled ~= true then
+		return anchor
+	end
+	local carrier = teamModel.Controller
+	if carrier and carrier.Id == actor.Id then
+		-- The footballer on the ball is positioned by the ball, not by support.
+		return anchor
+	end
+
+	local currentPosition = actor.RootPart.Position
+	local spots = {}
+
+	--[[
+		1. THE FORMATION ANCHOR, whose pull GROWS with distance. Drift is cheap
+		near it and expensive far from it, so the team shape restores itself
+		instead of dissolving.
+	]]
+	local anchorDistance = BallControlMath.GetHorizontal(anchor - currentPosition).Magnitude
+	local anchorReach = math.clamp(anchorDistance / math.max(field.AnchorFullPowerDistance, 1e-3), 0, 1)
+	table.insert(spots, {
+		Origin = anchor,
+		Power = field.AnchorPower
+			* (field.AnchorMinimumPowerScale + (1 - field.AnchorMinimumPowerScale) * anchorReach),
+	})
+
+	local carrierPosition = if carrier and carrier.RootPart then carrier.RootPart.Position else nil
+
+	--[[
+		2. OPPONENTS, repelled from a point BEHIND them as seen from the carrier.
+		Repelling from the opponent himself pushes a supporting footballer
+		anywhere at all; repelling from behind him pushes him out of the shadow
+		the opponent casts, which is to say into the passing lane.
+	]]
+	local roleScale = field.OpponentRoleScale[actor.PositionSlotId] or 1
+	local nearest = {}
+	for _, opponent in opponents do
+		table.insert(nearest, {
+			Position = opponent.Position,
+			Distance = BallControlMath.GetHorizontal(opponent.Position - currentPosition).Magnitude,
+		})
+	end
+	table.sort(nearest, function(a, b)
+		return a.Distance < b.Distance
+	end)
+	for index = 1, math.min(field.OpponentCount, #nearest) do
+		local opponentPosition = nearest[index].Position
+		local origin = opponentPosition
+		if carrierPosition then
+			local awayFromCarrier = BallControlMath.GetHorizontal(opponentPosition - carrierPosition)
+			if awayFromCarrier.Magnitude > 1e-3 then
+				origin += awayFromCarrier.Unit * field.OpponentBehindOffset
+			end
+		end
+		table.insert(spots, {
+			Origin = origin,
+			Repel = true,
+			Power = field.OpponentPower * roleScale,
+			Scale = field.OpponentScale,
+			Exponent = field.OpponentExponent,
+		})
+	end
+
+	--[[
+		3. TEAM-MATES PUSH EACH OTHER APART, but only while the side has the ball.
+		Out of possession, converging on the ball is the correct thing to do.
+	]]
+	if teamModel.State == "InPossession" then
+		local mates = {}
+		for _, mate in teamModel.Actors do
+			if mate.Id ~= actor.Id and refreshActor(mate) then
+				table.insert(mates, {
+					Position = mate.RootPart.Position,
+					Distance = BallControlMath.GetHorizontal(
+						mate.RootPart.Position - currentPosition
+					).Magnitude,
+				})
+			end
+		end
+		table.sort(mates, function(a, b)
+			return a.Distance < b.Distance
+		end)
+		for index = 1, math.min(field.TeammateCount, #mates) do
+			table.insert(spots, {
+				Origin = mates[index].Position,
+				Repel = true,
+				Power = field.TeammatePower,
+				Scale = field.TeammateScale,
+			})
+		end
+	end
+
+	if carrierPosition then
+		--[[
+			4. STAY OUT OF THE BALL'S WAY. Four spots along the predicted path
+			rather than one at the ball, so a footballer clears the LANE and not
+			merely the spot the ball currently occupies.
+		]]
+		for _, seconds in field.BallPredictionSeconds do
+			table.insert(spots, {
+				Origin = predictBallPosition(seconds),
+				Repel = true,
+				Power = field.BallPower,
+				Scale = field.BallScale,
+				Exponent = field.BallExponent,
+			})
+		end
+
+		--[[
+			5. A RING AROUND THE CARRIER: attracted from beyond the outer scale,
+			repelled inside the inner one, so support settles at a support
+			distance. Simpler than a target distance with a deadzone, and it
+			composes with everything else in the field.
+		]]
+		table.insert(spots, {
+			Origin = carrierPosition,
+			Power = field.CarrierPower,
+			Scale = field.CarrierAttractScale,
+		})
+		table.insert(spots, {
+			Origin = carrierPosition,
+			Repel = true,
+			Power = field.CarrierPower,
+			Scale = field.CarrierRepelScale,
+		})
+	end
+
+	return clampToPitch(currentPosition + solveForceField(spots, currentPosition))
+end
+
 local function updateTeams()
 	local now = os.clock()
 	local controller = getControllerActor()
 	for _, teamModel in teams do
 		local requestedState
 		local owningTeam = false
-		if controller then
+
+		--[[
+			A BALL IN A KEEPER'S HANDS IS NOT A LOOSE BALL.
+
+			`getControllerActor` only reports a footballer DRIBBLING the ball, so
+			a keeper holding it read as nobody in control -- which fell through to
+			LooseBall and sent every footballer on both sides sprinting at the
+			keeper. Reported as players surrounding the keeper instead of taking
+			up position, and it is also simply not football: nobody may challenge
+			a keeper who has gathered it.
+
+			So a held ball is possession for the keeper's side. Their team-mates
+			shape up to receive the distribution and the opposition drops into its
+			defensive shape, which is exactly what both sides do while a keeper has
+			the ball in his hands.
+		]]
+		local holder = GoalkeeperService.GetHolder()
+		if holder then
+			owningTeam = getTeamId(holder) == teamModel.TeamId
+			requestedState = if owningTeam then "InPossession" else "OutOfPossession"
+		elseif controller then
 			owningTeam = getTeamId(controller) == teamModel.TeamId
 			requestedState = if owningTeam then "InPossession" else "OutOfPossession"
 		else
@@ -673,7 +1181,11 @@ local function updateTeams()
 		end
 		local immediate = owningTeam and AIConfig.Cadence.PossessionCommitImmediate == true
 		setTeamState(teamModel, requestedState, now, immediate)
-		if requestedState == "LooseBall" then
+		if holder then
+			-- Nobody may challenge for a ball a keeper is holding, so no
+			-- footballer is sent at it. Everyone takes up position instead.
+			teamModel.DesignatedActor = nil
+		elseif requestedState == "LooseBall" then
 			chooseDesignatedPlayer(teamModel, nil)
 		elseif requestedState == "OutOfPossession" or requestedState == "Transition" then
 			-- Press the opposing carrier only. Sending the designated player at a
@@ -683,9 +1195,19 @@ local function updateTeams()
 		else
 			teamModel.DesignatedActor = nil
 		end
+		--[[
+			Opponents are collected ONCE for the whole team rather than once per
+			footballer. The support field reads them for every actor, and
+			rebuilding the list six times a tick is exactly the repeated world
+			read AGENTS.md 53 warns about.
+		]]
+		local fieldOpponents = collectOpponents(teamModel.TeamId)
+		-- One box for the whole side, before any footballer reads it.
+		computeTeamShape(teamModel, controller, now)
 		for _, actor in teamModel.Actors do
 			if refreshActor(actor) then
-				actor.FormationTarget = getFormationTarget(actor, teamModel)
+				local anchor = getFormationTarget(actor, teamModel)
+				actor.FormationTarget = refineOffBallTarget(actor, teamModel, anchor, fieldOpponents)
 			end
 		end
 	end
@@ -702,27 +1224,6 @@ local function getNearestOpponentDistance(actor, point: Vector3): number
 	return nearest
 end
 
---[[
-	Everything the decision needs to know about the opposition, once.
-
-	Built per decision rather than per candidate: the free-space and interception
-	models each walk the whole opposition, and a 3v3 carrier rating itself plus
-	two team-mates would otherwise rebuild this five times a tick (§102).
-]]
-local function collectOpponents(teamId: string): { any }
-	local opponentTeam = teams[if teamId == "Home" then "Away" else "Home"]
-	local list = {}
-	for _, opponent in opponentTeam and opponentTeam.Actors or {} do
-		if refreshActor(opponent) then
-			table.insert(list, {
-				Position = opponent.RootPart.Position,
-				Velocity = opponent.RootPart.AssemblyLinearVelocity,
-				IsGoalkeeper = opponent.Position == GoalkeeperConfig.Role,
-			})
-		end
-	end
-	return list
-end
 
 local function rateSituation(actor, opponents: { any })
 	local decision = AIConfig.Decision
@@ -839,7 +1340,18 @@ local function choosePass(actor, teamModel, opponents: { any }, selfRating, long
 					+ odds * decision.PassWeight
 				) / math.max(decision.TacticalDiffWeight + decision.PassWeight, 1e-4)
 
-				if total > bestTotal and total > passThreshold and odds > passMinimum then
+				--[[
+					DISTANCE COSTS SOMETHING. See AIConfig.Decision for why.
+
+					Applied after the tactical/odds blend rather than inside it,
+					so it changes which team-mate is chosen without distorting
+					what the odds model is saying about the pass itself.
+				]]
+				local overreach = math.max(distance - decision.PreferredPassDistance, 0)
+				total -= overreach * decision.LongPassPenaltyPerStud
+
+				local withinRange = distance <= decision.MaximumPassDistance
+				if withinRange and total > bestTotal and total > passThreshold and odds > passMinimum then
 					bestTotal = total
 					bestReceiver = receiver
 					bestActionType = actionType
@@ -1091,6 +1603,74 @@ local function decidePossession(actor, teamModel)
 	-- Nothing on: carry it. MovementTarget is already the dribble target.
 end
 
+--[[
+	THE AI SLIDE (Milestone 6.8).
+
+	Deliberately rare. Every gate here exists to keep it that way, because a bot
+	that slides whenever it might work is worse than a bot that never slides: it
+	spends most matches on the floor and gives away fouls.
+
+	The order is: is the ball inside the band, is the challenge good enough to be
+	worth the commitment, and has enough time passed since the last one. A shot in
+	flight relaxes the band and the score, which is the single case where going to
+	ground from further out is the right football.
+]]
+function trySlideTackle(actor, now: number, distanceToBall: number)
+	local config = DefendingConfig.AI.Slide
+	if not config or config.Enabled ~= true then
+		return
+	end
+	if actor.LastSlideDecisionAt and now - actor.LastSlideDecisionAt < config.DecisionCooldown then
+		return
+	end
+	if ball:GetAttribute("State") ~= "Controlled" or ball:GetAttribute("GoalkeeperHeld") == true then
+		return
+	end
+
+	--[[
+		A shot already struck widens the band: blocking it is worth the body even
+		from beyond the range a normal challenge would justify.
+	]]
+	local lastAction = ball:GetAttribute("LastFootballAction")
+	local blocking = (lastAction == "Shoot" or lastAction == "Clearance")
+		and (now - (ball:GetAttribute("LastFootballActionTime") or 0)) < 0.6
+	local maximum = if blocking then config.ShotBlockMaximumBallDistance else config.MaximumBallDistance
+	local minimumScore = if blocking then config.ShotBlockMinimumScore else config.MinimumScore
+	if distanceToBall < config.MinimumBallDistance or distanceToBall > maximum then
+		return
+	end
+
+	local preview = DefendingService.PreviewSlideTackle(actor)
+	if not preview or not preview.Valid or (preview.Score or 0) < minimumScore then
+		return
+	end
+
+	--[[
+		The reference refuses a slide below 0.7 on the same angle test it gates a
+		standing challenge on at 0.2 (`_SlidingCommand`). A slide that has to go
+		through the man is the canonical red card, so this bar is deliberately
+		near the top of the range.
+	]]
+	local carrier = getControllerActor()
+	if carrier and carrier.RootPart then
+		local likeliness = TackleEvaluator.BallDuelLikeliness(
+			actor.RootPart.Position,
+			BallControlMath.GetHorizontal(actor.RootPart.AssemblyLinearVelocity),
+			carrier.RootPart.Position,
+			BallControlMath.GetHorizontal(carrier.RootPart.AssemblyLinearVelocity),
+			ball.Position,
+			BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity)
+		)
+		if likeliness < DefendingConfig.AI.SlideMinimumDuelLikeliness then
+			return
+		end
+	end
+
+	actor.LastSlideDecisionAt = now
+	actor.TackleCommittedUntil = now + DefendingConfig.Slide.SlideSeconds
+	DefendingService.AttemptSlideTackle(actor)
+end
+
 -- Bounded AI tackle decision. Reaction delay, cooldown and commitment prevent
 -- an AI defender from spamming challenges the instant it is in range.
 function tryAITackle(actor, teamModel)
@@ -1116,6 +1696,18 @@ function tryAITackle(actor, teamModel)
 	if distanceToBall > DefendingConfig.AI.TackleDistance then
 		actor.TackleIntentAt = nil
 		actor.ContainingSince = nil
+		--[[
+			OUT OF RANGE TO STEP -- BUT MAYBE IN RANGE TO COMMIT.
+
+			This is the one place a slide belongs: the ball is past what a standing
+			challenge can reach, which is exactly the situation the extra stretch
+			exists for. Below the band the AI should be stepping in instead; above
+			it, nothing is available and the defender keeps containing.
+
+			See DefendingConfig.AI.Slide for why the band's lower bound matters as
+			much as its upper one.
+		]]
+		trySlideTackle(actor, now, distanceToBall)
 		return
 	end
 
@@ -1161,6 +1753,36 @@ function tryAITackle(actor, teamModel)
 		return
 	end
 
+	--[[
+		IS THE CHALLENGE EVEN AVAILABLE?
+
+		The angle test the reference gates `_InterfereCommand` on, at its own
+		threshold. This rules out exactly the challenges that would have to travel
+		through the carrier's body -- the ones that produce fouls rather than
+		tackles -- and it does so on geometry rather than on how long the defender
+		has been standing there.
+	]]
+	local carrier = getControllerActor()
+	if carrier and carrier.RootPart then
+		local likeliness = TackleEvaluator.BallDuelLikeliness(
+			actor.RootPart.Position,
+			BallControlMath.GetHorizontal(actor.RootPart.AssemblyLinearVelocity),
+			carrier.RootPart.Position,
+			BallControlMath.GetHorizontal(carrier.RootPart.AssemblyLinearVelocity),
+			ball.Position,
+			BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity)
+		)
+		if likeliness < DefendingConfig.AI.MinimumDuelLikeliness then
+			return
+		end
+	end
+
+	--[[
+		The containment dwell is now a SECOND opinion rather than the gate. With
+		the angle test above doing the real work, holding a defender back for a
+		further half second only reintroduces the passivity that test removed --
+		so an exposed ball still skips it, and everything else waits only briefly.
+	]]
 	local contained = now - (actor.ContainingSince or now)
 	local exposed = preview.Score >= DefendingConfig.AI.OpportunistScore
 	if contained < DefendingConfig.AI.MinimumContainSeconds and not exposed then
@@ -1310,12 +1932,62 @@ local function resolveMovementSpeed(actor, distance: number): (number, boolean)
 		else locomotion.JogSpeed), false
 end
 
+--[[
+	Every footballer on the pitch, as {Id, Position}, rebuilt once per movement
+	tick and shared by all of them.
+
+	Reused rather than rebuilt per actor: with eleven a side this is the
+	difference between one pass over the registry each frame and 22, and
+	AGENTS.md section 53 is explicit that every AI independently rebuilding the
+	same shared state is the thing to avoid.
+]]
+local separationNeighbours: { { Id: number, Position: Vector3 } } = {}
+
+local function refreshSeparationNeighbours()
+	table.clear(separationNeighbours)
+	if PlayerConfig.Separation.Enabled ~= true then
+		return
+	end
+	for _, other in FootballerRegistryService.GetAll() do
+		if other.RootPart and other.RootPart.Parent then
+			table.insert(separationNeighbours, { Id = other.Id, Position = other.RootPart.Position })
+		end
+	end
+end
+
 local function updateMovement(deltaTime: number)
 	if not ball then
 		return
 	end
+	refreshSeparationNeighbours()
 	for _, actor in aiActors do
 		if not refreshActor(actor) then
+			continue
+		end
+		--[[
+			A COMMITTED SLIDE IS NOT STEERABLE.
+
+			The slide launches the body along a line and the server owns that
+			commitment (DefendingService.AttemptSlideTackle). Without this the AI
+			would keep driving toward its movement target through the whole slide,
+			which cancels the launch, removes the risk the challenge is supposed to
+			carry, and looks like a footballer skating along the floor.
+
+			Humans already get this: the client suppresses input off the same
+			attribute. This is the AI half of the same rule.
+		]]
+		local slidingUntil = actor.Character and actor.Character:GetAttribute(DefendingConfig.Slide.SlidingAttribute)
+		if typeof(slidingUntil) == "number" and slidingUntil > os.clock() then
+			continue
+		end
+		--[[
+			A DIVING KEEPER IS NOT STEERED EITHER.
+
+			GoalkeeperService launches the dive with a velocity and owns it until
+			GoalkeeperDiveUntil. Driving toward a movement target through that
+			cancels the launch, exactly as it did for the slide above.
+		]]
+		if actor.GoalkeeperDiveUntil and os.clock() < actor.GoalkeeperDiveUntil then
 			continue
 		end
 		local target = actor.MovementTarget or actor.FormationTarget or actor.RootPart.Position
@@ -1393,7 +2065,15 @@ local function updateMovement(deltaTime: number)
 		)
 		actor.Humanoid.WalkSpeed = actor.CurrentSpeed
 		actor.Humanoid:SetAttribute("SprintRequested", actor.CurrentSpeed >= 19)
-		actor.Humanoid:Move(direction, false)
+		--[[
+			Steered around anyone standing in the way. Applied last, to the
+			direction every decision above has already settled on, so it bends
+			the path without touching the choice -- see FootballerSeparation.
+		]]
+		actor.Humanoid:Move(
+			FootballerSeparation.Steer(direction, actor.RootPart.Position, separationNeighbours, actor.Id),
+			false
+		)
 
 		--[[
 			A pressing defender watches the ball, not where its feet are going.

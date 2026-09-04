@@ -17,7 +17,10 @@ local PlayerConfig = {
 			faster or slower than the humans they play against.
 		]]
 		BaseSpeed = 16,
-		SprintSpeed = 31,
+		-- Pulled back from 31 on playtest feedback that sprinting ran too fast for
+		-- the pitch to read. AIConfig derives its own sprint from this value, so
+		-- footballers on both sides move together and nothing gains an advantage.
+		SprintSpeed = 27,
 		JumpEnabled = true,
 		JumpPower = 19,
 		JumpHeight = 0,
@@ -121,7 +124,30 @@ local PlayerConfig = {
 			ManualOverrideMagnitude = 0.9,
 			ExpiryGraceTime = 2.2,
 			DiagnosticInterval = 0.75,
+			--[[
+				HOW MUCH THE ASSIST TRUSTS THE BALL OVER THE PLAN.
+
+				The assist steers toward the pass's PLANNED target, nudged toward
+				where the ball is actually going by LiveTargetWeight. A fixed 0.55
+				was wrong at both ends of the flight.
+
+				Early, the plan is the better guide: it is where the pass was
+				aimed, and the ball has not curved or bounced yet. Late, the plan
+				is a fiction and the ball is the truth -- measured, a pass
+				predicted to arrive in 1.16s actually took 1.95s:
+
+					[PassArrival] predictedETA=1.16 measuredETA=1.95
+
+				With a fixed weight the receiver settled next to a point the ball
+				never reached and stood there while it rolled past. That is the
+				other half of "sloppy".
+
+				So trust ramps with proximity: the plan while the ball is far, the
+				ball itself once it is inside FullTrustDistance. The receiver ends
+				up where the ball is rather than where it was supposed to be.
+			]]
 			LiveTargetWeight = 0.55,
+			LiveTargetFullTrustDistance = 18,
 			MaxLiveTargetCorrection = 24,
 			FacingResponsiveness = 12,
 			FacingMinimumBallSpeed = 4,
@@ -175,7 +201,42 @@ local PlayerConfig = {
 		StandardizeEnabled = true,
 		RequiredRigType = "R15",
 		ApplyDescriptionStandardization = false,
-		ScaleToCanonicalHeight = false,
+
+		--[[
+			EVERY FOOTBALLER IS THE SAME HEIGHT. MEASURED, NOT ASSUMED.
+
+			This was false, on the reasoning that height is the platform's to
+			decide and a script measuring the result overrides the Avatar Settings.
+			That reasoning held while every footballer came from the same
+			StarterCharacter. It stopped holding the moment players started
+			wearing their own avatars, because a human is now built by
+			ApplyDescription rebuilding the rig while an NPC is a clone of a model
+			someone authored -- two different sources that were never going to
+			agree. Measured, same match:
+
+				human     height 7.46  hipHeight 4.064
+				AI / ref  height 8.27  hipHeight 3.780
+
+			Three quarters of a stud, and the AI's hips two thirds of a stud
+			lower. Control distance, tackle reach, shot contact radius,
+			interception reach and body exclusion are all measured in studs from
+			the root, so those two bodies were playing under measurably different
+			rules -- a competitive-integrity problem, not a cosmetic one
+			(AGENTS.md §41, §49).
+
+			Standardising the FRAME (scales pinned to 1, body package cleared) is
+			done first and gets the proportions honest, but it cannot fix this on
+			its own: the StarterCharacter rig's part sizes are baked into the
+			model and survive ApplyDescription. So the last step is explicit --
+			measure the body and scale it to one number.
+
+			The number is the measured height of the standard frame a human
+			already builds to, so a human scales by 1.00 and nothing about the
+			existing grounding, shot or camera calibration moves. It is the AI and
+			the officials that come down to meet them.
+		]]
+		ScaleToCanonicalHeight = true,
+		TargetHeightStuds = 7.46,
 		HeightScale = 1,
 		WidthScale = 1,
 		DepthScale = 1,
@@ -242,6 +303,23 @@ local PlayerConfig = {
 		Identity = {
 			Enabled = true,
 			Sources = { RobloxAvatar = "RobloxAvatar", Beyond90Avatar = "Beyond90Avatar" },
+			--[[
+				YOU PLAY AS YOURSELF BY DEFAULT.
+
+				`Beyond90Avatar` is the StarterCharacter -- the kit, and what every
+				AI footballer and official wears. `RobloxAvatar` is the player's
+				own avatar, their own clothes included.
+
+				This was briefly defaulted to the kit, on the reasoning that a
+				stadium full of unrelated avatars reads as a lobby rather than a
+				team. That is a real concern and it is not this setting's to
+				solve: a player's footballer is THEM, in the menu and on the
+				pitch, and a team identity should come from kits worn over an
+				avatar rather than from replacing the player with a mannequin.
+
+				The kit remains one setting away, in Settings -> Footballer, and
+				remains what every non-player footballer wears.
+			]]
 			Default = "RobloxAvatar",
 			-- Stored on the player so any system can read the choice; session
 			-- scoped, because persistence is a later milestone.
@@ -254,9 +332,41 @@ local PlayerConfig = {
 		Grounding = {
 			TargetFootClearanceStuds = 0.13,
 			VisualSoleOffsetStuds = 0.035,
-			MinimumHipHeightStuds = 3.78,
-			AllowDownwardHipHeightCorrection = false,
-			GeometryHipHeightCorrectionEnabled = false,
+			--[[
+				THE RIG DECIDES ITS OWN HIP HEIGHT. A CONSTANT CANNOT.
+
+				This was a fixed 4.31, measured against the Beyond 90 kit back when
+				every footballer on the pitch WAS the kit. That stopped being true
+				the moment players started spawning as their own avatars: a Roblox
+				avatar has its own leg length, and forcing its hip to the kit's
+				number hangs it in the air. Measured, a player wearing their own
+				avatar:
+
+					phase=calibrated       rootY=4.684  footBottom=0.535  err=-0.095
+					phase=late-calibrated  rootY=4.684  hipAdjustment=1.275
+					phase=final-validation rootY=5.959  footBottom=1.892  err=+1.099
+
+				-- feet correctly on the grass, then lifted 1.275 studs off it.
+				That number is not a coincidence: it is exactly
+				4.31 minus the avatar rig's own hip height, applied by
+
+					nextHipHeight = math.max(minimumHipHeight, hipHeight + adjustment)
+
+				with the geometry correction switched off, so the minimum was the
+				only thing acting.
+
+				The correction that belongs here already existed and was disabled:
+				measure where the feet actually are, and move the hip by the
+				difference. That is rig-agnostic by construction -- it works for
+				the kit, for a tall avatar and for a short one, without anybody
+				re-deriving a constant every time a body changes.
+
+				The minimum stays as a SAFETY FLOOR only, far below any real rig,
+				to catch a degenerate HipHeight rather than to set a good one.
+			]]
+			GeometryHipHeightCorrectionEnabled = true,
+			AllowDownwardHipHeightCorrection = true,
+			MinimumHipHeightStuds = 2,
 			FootGroundToleranceStuds = 0.03,
 			FloorProbeDistanceStuds = 20,
 			MaxHipHeightCorrectionStuds = 0.55,
@@ -321,6 +431,49 @@ local PlayerConfig = {
 		CanonicalBodyRadius = 1.04,
 		CanonicalFootContactHeight = 0.25,
 		CanonicalFootForwardOffset = 1.25,
+	},
+
+	--[[
+		KEEPING BODIES OUT OF EACH OTHER.
+
+		See `FootballerSeparation`. Footballers no longer collide with one
+		another -- that collision was what they were climbing -- so this is what
+		stops them merging instead.
+	]]
+	Separation = {
+		Enabled = true,
+
+		--[[
+			Where avoidance starts, in studs between root parts.
+
+			A footballer is about 2.1 studs across the shoulders
+			(CanonicalBodyRadius 1.04). Three studs therefore leaves most of a
+			body's width of daylight at the point the push begins and reaches
+			full strength only when they are genuinely touching -- close enough
+			to still look like a contested ball, far enough not to be walked
+			through.
+		]]
+		--[[
+			Raised from 3. Footballers collide again (see CollisionGroupConfig),
+			so separation is now the thing that has to stop them REACHING the
+			collision rather than a substitute for it -- it has to start pushing
+			before shoulders meet, not as they touch.
+		]]
+		Radius = 4.2,
+		-- Ceiling on the combined push, so being surrounded does not eject you.
+		MaximumPush = 1,
+		--[[
+			How much of the push is mixed into the movement direction.
+
+			Well under 1: separation must bend a run, never redirect it. At 0.6 a
+			footballer running straight at an opponent leaves at roughly 30
+			degrees off their line -- a sidestep, not a swerve -- and anyone not
+			being crowded is unaffected entirely.
+
+			Raised with the radius, for the same reason: it now has to turn a
+			body away from a collision rather than tidy up a near miss.
+		]]
+		SteeringWeight = 0.6,
 	},
 }
 

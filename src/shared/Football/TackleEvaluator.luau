@@ -147,4 +147,67 @@ function TackleEvaluator.Evaluate(
 	}
 end
 
+--[[
+	CAN I WIN THIS BALL WITHOUT GOING THROUGH THE MAN?
+
+	A close translation of GameplayFootball's `OppBetweenBallAndMeDot` and
+	`CouldWinABallDuelLikeliness`
+	(`src/onthepitch/player/controller/playercontroller.cpp`, commit
+	1dc1518abd0ffaa349c7e1a53ded6ba19213c73f, Apache-2.0, written by bastiaan
+	konings schuiling 2008-2015). Translated deliberately and closely rather than
+	reinvented, per AGENTS.md 27 "What May Be Ported Closely".
+
+	The original is three lines and asks one geometric question:
+
+		MeToOpp    = (oppPos   + oppVel * 0.1) - (myPos + myVel * 0.1)
+		OppToBall  = ballAt(100ms) - (oppPos + oppVel * 0.1)
+		dot        = normalise(MeToOpp) . normalise(OppToBall)
+		likeliness = 1 - (dot * 0.5 + 0.5)
+
+	If the way to the opponent and the way from the opponent to the ball point
+	the SAME direction, the opponent is between me and the ball: dot -> 1,
+	likeliness -> 0, and any challenge has to go through him. If the ball is on
+	my side of him, dot -> -1 and likeliness -> 1.
+
+	Worth knowing: the original tried folding relative ball distance into this and
+	abandoned it, leaving the attempt commented out with "doesn't really seem to
+	work all too well". The angle alone is the whole test. Beyond 90's own
+	TackleEvaluator above scores closeness, facing, skill and exposure -- this
+	does not replace that judgement of whether a challenge SUCCEEDS. It answers
+	the earlier and cruder question of whether the challenge is available at all,
+	which is what the reference uses to decide between containing and committing.
+
+	Both positions are led by a tenth of a second of their own movement, and the
+	ball by a tenth of a second of flight, so the answer describes the duel as it
+	is about to be rather than as it was.
+]]
+local DUEL_MOVEMENT_LEAD_SECONDS = 0.1
+local DUEL_BALL_LEAD_SECONDS = 0.1
+
+function TackleEvaluator.BallDuelLikeliness(
+	challengerPosition: Vector3,
+	challengerVelocity: Vector3,
+	opponentPosition: Vector3,
+	opponentVelocity: Vector3,
+	ballPosition: Vector3,
+	ballVelocity: Vector3
+): number
+	local me = BallControlMath.GetHorizontal(
+		challengerPosition + challengerVelocity * DUEL_MOVEMENT_LEAD_SECONDS)
+	local opponent = BallControlMath.GetHorizontal(
+		opponentPosition + opponentVelocity * DUEL_MOVEMENT_LEAD_SECONDS)
+	local ball = BallControlMath.GetHorizontal(
+		ballPosition + ballVelocity * DUEL_BALL_LEAD_SECONDS)
+
+	local meToOpponent = opponent - me
+	local opponentToBall = ball - opponent
+	if meToOpponent.Magnitude <= 1e-4 or opponentToBall.Magnitude <= 1e-4 then
+		-- Degenerate geometry: nobody is between anybody. Treat as available.
+		return 1
+	end
+
+	local dot = meToOpponent.Unit:Dot(opponentToBall.Unit)
+	return math.clamp(1 - (dot * 0.5 + 0.5), 0, 1)
+end
+
 return TackleEvaluator

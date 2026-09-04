@@ -12,6 +12,7 @@ local AIService = require(script.Parent.AIService)
 local MatchAssemblyService = require(script.Parent.MatchAssemblyService)
 local MatchService = require(script.Parent.MatchService)
 local GoalService = require(script.Parent.GoalService)
+local PlayerService = require(script.Parent.PlayerService)
 
 local GameModeService = {}
 
@@ -122,7 +123,10 @@ function GameModeService.Initialize()
 			existingCharacter = nil
 		end
 		if not existingCharacter then
-			player:LoadCharacter()
+			-- Spawns them in the body they chose; see
+			-- PlayerService.SpawnFootballer for why the kit cannot come from a
+			-- HumanoidDescription.
+			PlayerService.SpawnFootballer(player)
 		end
 		task.spawn(function()
 			local character = player.Character or player.CharacterAdded:Wait()

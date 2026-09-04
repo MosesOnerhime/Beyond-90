@@ -7,6 +7,7 @@ local AIConfig = require(Shared.Config.AIConfig)
 local BallControlMath = require(Shared.Football.BallControlMath)
 local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
 local GameConfig = require(Shared.Config.GameConfig)
+local GoalkeeperConfig = require(Shared.Config.GoalkeeperConfig)
 local PositionConfig = require(Shared.Config.PositionConfig)
 
 local FootballerRegistryService = {}
@@ -68,6 +69,24 @@ function FootballerRegistryService.GetHumanActor(player: Player)
 		Player = player,
 		IsAI = false,
 		Role = player:GetAttribute(AIConfig.Attributes.Role),
+		--[[
+			WHAT POSITION THIS FOOTBALLER PLAYS.
+
+			An AI actor has carried this field since AI keepers existed; a human
+			actor did not, so every `actor.Position == GoalkeeperConfig.Role`
+			test in the codebase silently answered "no" for a human goalkeeper.
+
+			The visible symptom was assembly: `MatchAssemblyService` counts
+			keepers with exactly that test, so a human in goal was tallied as an
+			outfielder and the roster came up a keeper short --
+
+				[Assembly] FAILED: roster incomplete -- outfield 6/6, goalkeepers 1/2
+
+			-- for a side that was in fact complete. Reading the same character
+			attribute the rest of the game reads makes a human actor and an AI
+			actor answer the question identically.
+		]]
+		Position = character:GetAttribute(GoalkeeperConfig.RoleAttributeName),
 		-- The position slot the server reserved for this player, so rules and
 		-- set-piece placement can treat humans and AI identically.
 		PositionSlotId = player:GetAttribute(PositionConfig.SlotAttributeName),

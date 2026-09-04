@@ -56,6 +56,8 @@ local Workspace = game:GetService("Workspace")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local BallConfig = require(Shared.Config.BallConfig)
 local CameraConfig = require(Shared.Config.CameraConfig)
+local MatchConfig = require(Shared.Config.MatchConfig)
+local GoalkeeperConfig = require(Shared.Config.GoalkeeperConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local BallControlMath = require(Shared.Football.BallControlMath)
 local CameraShake = require(script.Parent.CameraShake)
@@ -77,6 +79,7 @@ local previousMouseBehavior: Enum.MouseBehavior? = nil
 	rather than being restored to a default the player never chose.
 ]]
 local uiSuspendedLock = false
+local matchStateConnection: RBXScriptConnection? = nil
 local menuOpenConnection: RBXScriptConnection? = nil
 
 -- Smoothed camera state. Nil until the first frame, so the camera starts where
@@ -95,6 +98,9 @@ local currentRig = {
 }
 local mouseYaw = 0
 local mousePitch = config.OnBall.Pitch
+-- Which preset table is driving the rig: the outfield one, or the keeper's.
+-- Watched so a change can re-seed the pitch the mouse accumulates from.
+local activeFrames: any = nil
 -- Framing: where the controlled footballer currently sits in the frame, and how
 -- far the ball has pulled that away from the configured composition.
 local framingShiftX = 0
@@ -243,7 +249,49 @@ local function updateCamera(deltaTime: number)
 		The rig morphs between the on-ball and off-ball presets rather than
 		switching, so winning or losing the ball is a settle rather than a lurch.
 	]]
-	local targetRig = if onBall then config.OnBall else config.OffBall
+	--[[
+		A KEEPER GETS ITS OWN FRAMING.
+
+		Standing under the crossbar puts the goal frame through the middle of the
+		ordinary Pro Camera view. The keeper rig is higher and pitched down
+		harder so the camera looks over the frame rather than through it; see
+		CameraConfig.ThirdPerson.Goalkeeper.
+	]]
+	local frames = config
+	local character = localPlayer and localPlayer.Character
+	if config.Goalkeeper
+		and character
+		and character:GetAttribute(GoalkeeperConfig.RoleAttributeName) == GoalkeeperConfig.Role
+	then
+		frames = config.Goalkeeper
+	end
+	local targetRig = if onBall then frames.OnBall else frames.OffBall
+
+	--[[
+		A NEW FRAME SET RE-SEEDS THE PITCH.
+
+		Pitch has two owners. With the mouse free it eases toward the rig's
+		`Pitch` every frame; with the mouse LOCKED -- the normal gameplay state --
+		it is `mousePitch` alone, which only ever moves by mouse delta from
+		whatever it was last seeded to. That seed was `config.OnBall.Pitch`, the
+		OUTFIELD value, set once at reset.
+
+		So a goalkeeper's own framing never took effect on PC. Height, distance
+		and FOV switched to the keeper rig on spawn while the ANGLE stayed at the
+		outfielder's, which is why this view kept coming back as not angled
+		enough however the keeper preset was tuned.
+
+		Switching frame sets happens on spawn and when a player changes position
+		-- not during play -- so snapping here is a settle, not a lurch, and the
+		mouse keeps full control of the angle afterwards.
+	]]
+	if activeFrames ~= frames then
+		activeFrames = frames
+		local seeded = math.clamp(targetRig.Pitch, config.MinimumPitchDegrees, config.MaximumPitchDegrees)
+		currentPitch = seeded
+		mousePitch = seeded
+		currentRig.Pitch = targetRig.Pitch
+	end
 	local small = isSmallViewport(camera)
 	local mobile = config.Mobile
 	local rigAlpha = expAlpha(config.RigResponsiveness, deltaTime)
@@ -436,6 +484,9 @@ local function resetSmoothing()
 	currentRig.Height = config.OnBall.Height
 	currentRig.Pitch = config.OnBall.Pitch
 	currentRig.LookAhead = config.OnBall.LookAhead
+	-- Forget which preset was live, so the first frame after a reset re-seeds
+	-- the pitch from whichever rig the footballer now belongs to.
+	activeFrames = nil
 	framingShiftX = 0
 	framingShiftY = 0
 	widenAlpha = 0
@@ -490,11 +541,36 @@ end
 	stand down on, so all three agree by construction about when the player is in
 	a menu rather than in a match.
 ]]
+--[[
+	IS THE PLAYER BEING ASKED TO CLICK SOMETHING?
+
+	Between arriving on the pitch and kick-off there is a prompt to start the
+	match, and a locked mouse cannot press it -- the player had to unlock by
+	hand, press it, and lock again. That is a cursor-driven moment exactly like a
+	menu, so it goes through the same suspend/restore path rather than getting
+	its own: the lock comes back on its own when the match starts.
+
+	Anything that is not actually being played counts, so half-time and full-time
+	prompts get the cursor back too.
+]]
+local function isAwaitingKickOff(): boolean
+	local folder = ReplicatedStorage:FindFirstChild(MatchConfig.ReplicatedFolderName or "Beyond90Match")
+	if not folder then
+		return false
+	end
+	local state = folder:GetAttribute(MatchConfig.StateAttributeName)
+	if typeof(state) ~= "string" then
+		return false
+	end
+	return state ~= MatchConfig.States.Playing
+end
+
 local function onMenuOpenChanged()
 	if not active or config.MouseLockEnabled ~= true then
 		return
 	end
 	local menuOpen = localPlayer:GetAttribute("Beyond90MenuOpen") == true
+		or isAwaitingKickOff()
 	if menuOpen then
 		if mouseLocked then
 			uiSuspendedLock = true
@@ -536,6 +612,14 @@ function ThirdPersonCamera.Enable()
 	end)
 	uiSuspendedLock = false
 	menuOpenConnection = localPlayer:GetAttributeChangedSignal("Beyond90MenuOpen"):Connect(onMenuOpenChanged)
+	-- The same handler also has to run when the match state moves, so the lock
+	-- returns by itself the moment play begins.
+	local matchFolder = ReplicatedStorage:FindFirstChild(MatchConfig.ReplicatedFolderName or "Beyond90Match")
+	if matchFolder then
+		matchStateConnection = matchFolder
+			:GetAttributeChangedSignal(MatchConfig.StateAttributeName)
+			:Connect(onMenuOpenChanged)
+	end
 	-- Apply the current state immediately: the camera may be enabled while a
 	-- menu is already up, and starting locked behind a menu is the same bug.
 	onMenuOpenChanged()
@@ -558,6 +642,10 @@ function ThirdPersonCamera.Disable()
 		UserInputService.MouseIconEnabled = true
 	end
 	mouseLocked = false
+	if matchStateConnection then
+		matchStateConnection:Disconnect()
+		matchStateConnection = nil
+	end
 	uiSuspendedLock = false
 	if menuOpenConnection then
 		menuOpenConnection:Disconnect()

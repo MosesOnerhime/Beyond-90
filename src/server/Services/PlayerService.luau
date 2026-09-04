@@ -145,9 +145,10 @@ end
 --[[
 	Put every part of a footballer into the Footballer group.
 
-	This changes nothing about how footballers collide -- Footballer still
-	collides with the world, the ball and other footballers. It exists so the
-	referee has something to be excluded from.
+	Footballer still collides with the world and with the ball. It does NOT
+	collide with another Footballer, nor with the referee -- see
+	CollisionGroupConfig for both, and FootballerSeparation for what holds two
+	footballers apart now that geometry no longer does.
 ]]
 local function applyCollisionGroup(character: Model, groupName: string)
 	ensureCollisionGroups()
@@ -603,7 +604,37 @@ end
 	normalization and grounding are immediately below. Returns the clone and the
 	name of the source it came from, for diagnostics.
 ]]
+--[[
+	THE BEYOND 90 KIT LIVES IN ReplicatedStorage, NOT IN StarterCharacter.
+
+	It used to be StarterPlayer.StarterCharacter, and that is a stronger
+	statement than it looks: Roblox spawns EVERY player as StarterCharacter and
+	ignores their avatar, so a player wearing their own avatar got it applied
+	over the kit afterwards. ApplyDescription only replaces part of a rig, so the
+	result was a hybrid -- measured, the player's torso and clothes on the kit's
+	arms, legs and head.
+
+	That cannot be patched from script. An R15 rig hangs its joints off
+	Attachments that ship inside each body part; copying meshes across with
+	ApplyMesh leaves those attachments behind and mangles the body -- measured,
+	30 attachment mismatches, the head 1.86 studs off centre and the RIGHT arm
+	rendered on the LEFT of the torso.
+
+	So the kit stopped being StarterCharacter. With no StarterCharacter in the
+	place, Roblox spawns a player as their own avatar the way it does by default
+	-- no patching, nothing to go wrong -- and the AI and officials clone the kit
+	from here instead. StarterCharacter is still accepted as a fallback so a place
+	that still has one keeps working.
+]]
 function PlayerService.CloneFootballerTemplate(): (Model?, string)
+	local kit = ReplicatedStorage:FindFirstChild("Beyond90Kit")
+	if kit and kit:IsA("Model")
+		and kit:FindFirstChildOfClass("Humanoid")
+		and kit:FindFirstChild("HumanoidRootPart")
+	then
+		return kit:Clone(), "Beyond90Kit"
+	end
+
 	local starterCharacter = StarterPlayer:FindFirstChild("StarterCharacter")
 	if starterCharacter and starterCharacter:IsA("Model")
 		and starterCharacter:FindFirstChildOfClass("Humanoid")
@@ -625,6 +656,62 @@ function PlayerService.CloneFootballerTemplate(): (Model?, string)
 		return generated, "GeneratedR15"
 	end
 	return nil, "none"
+end
+
+--[[
+	Spawn this player's footballer, in whichever body they chose.
+
+	WHY THIS EXISTS RATHER THAN A PLAIN LoadCharacter.
+
+	The kit cannot be described. A HumanoidDescription round trip through the
+	Beyond 90 kit returns a DIFFERENT body -- measured, all fifteen parts differ,
+	and what comes back is the default avatar rather than the kit -- so
+	LoadCharacterWithHumanoidDescription cannot reproduce it and neither can
+	applying a description to a spawned rig. The kit is a model, and the only
+	faithful way to wear it is to spawn that model. That is exactly how the AI
+	footballers and the officials get it.
+
+	So: a player wearing their own avatar takes Roblox's own path, which builds
+	the avatar correctly and is the default. A player who has chosen the kit gets
+	a clone of it, positioned where LoadCharacter would have put them.
+
+	Everything downstream is unaffected either way. Assigning `player.Character`
+	fires CharacterAdded exactly as LoadCharacter does, so the appearance
+	standardisation, the collider policy, the grounding calibration and the
+	animation controller all run on the result without knowing which path built
+	it.
+]]
+function PlayerService.SpawnFootballer(player: Player)
+	local identity = PlayerConfig.Appearance.Identity
+	local wantsKit = identity ~= nil
+		and identity.Enabled == true
+		and player:GetAttribute(identity.AttributeName) == identity.Sources.Beyond90Avatar
+
+	local kit = if wantsKit then ReplicatedStorage:FindFirstChild("Beyond90Kit") else nil
+	if not (kit and kit:IsA("Model")
+		and kit:FindFirstChildOfClass("Humanoid")
+		and kit:FindFirstChild("HumanoidRootPart"))
+	then
+		-- Their own avatar, or no kit available to wear.
+		player:LoadCharacter()
+		return
+	end
+
+	local model = kit:Clone()
+	model.Name = player.Name
+	for _, descendant in model:GetDescendants() do
+		if descendant:IsA("BaseScript") then
+			descendant:Destroy()
+		end
+	end
+
+	local spawnLocation = player.RespawnLocation
+	if spawnLocation then
+		model:PivotTo(spawnLocation.CFrame + Vector3.new(0, developmentSpawnCharacterYOffset, 0))
+	end
+
+	model.Parent = Workspace
+	player.Character = model
 end
 
 function PlayerService.NormalizeFootballerPhysics(character: Model)

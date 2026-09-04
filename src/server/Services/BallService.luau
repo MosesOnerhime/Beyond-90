@@ -804,4 +804,9 @@ function BallService.GetBallSampledEvent(): BindableEvent
 	return ballSampledEvent
 end
 
+-- The live football, for services that come along after Initialize returned it.
+function BallService.GetBall(): Part?
+	return activeBall
+end
+
 return BallService

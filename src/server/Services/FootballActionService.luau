@@ -9,6 +9,7 @@ local BallControlMath = require(Shared.Football.BallControlMath)
 local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
 local GameConfig = require(Shared.Config.GameConfig)
+local GoalkeeperConfig = require(Shared.Config.GoalkeeperConfig)
 local PositionConfig = require(Shared.Config.PositionConfig)
 local PlayerConfig = require(Shared.Config.PlayerConfig)
 local MatchRulesConfig = require(Shared.Config.MatchRulesConfig)
@@ -734,6 +735,52 @@ local function handleRestartShot(player: Player, payload, restartActor, restartK
 	local teamId = FootballTeamConfig.Normalize(player:GetAttribute(FootballTeamConfig.AttributeName))
 	local mapping = FootballTeamConfig.GetGoalMapping(teamId)
 	local goal = mapping and goals[mapping.AttackingGoalId]
+
+	--[[
+		A GOAL KICK IS NOT A SHOT.
+
+		Every other restart this key reaches -- corner, free kick, penalty -- is
+		aimed at the goal, so planning a shot is right for them. A goal kick is
+		aimed at the OTHER END OF THE PITCH: the attacking goal is some 340 studs
+		away, which is not a shot the planner can or should produce.
+
+		So the same key does the thing a keeper actually does with it, and the
+		thing the HUD has always advertised: hits it long and high up the pitch
+		along the aim direction. The numbers are the goalkeeper's own drop-kick
+		numbers rather than new ones, so "kick it long" carries the same weight
+		whether the ball is in the keeper's hands or on the six-yard line.
+	]]
+	if restartKind == "GoalKick" then
+		local aim = BallControlMath.GetHorizontal(getAimDirection(player, payload))
+		if aim.Magnitude < 0.05 then
+			aim = BallControlMath.GetHorizontal(rootPart.CFrame.LookVector)
+		end
+		local distribution = GoalkeeperConfig.Distribution
+		local launch = BallControlMath.SafeUnit(aim, rootPart.CFrame.LookVector) * distribution.GoalKickSpeed
+			+ Vector3.yAxis * distribution.GoalKickLift
+
+		local released = BallControlService.ReleaseForRestart(ball, restartActor, "GoalKick", launch, {
+			IntendedReceiverUserId = 0,
+			TargetKind = "Clearance",
+		})
+		if not released then
+			sendFeedback(player, false, "shot-release-rejected", nil, "Shoot")
+			return
+		end
+		-- `isCooldownReady` above already stamped the cooldown.
+		MatchRulesService.NotifyRestartAction(restartActor, "Shoot")
+		log(string.format(
+			"[GoalKick] taken long by %s speed=%.1f lift=%.1f carry=%.0f",
+			player.Name,
+			distribution.GoalKickSpeed,
+			distribution.GoalKickLift,
+			-- Projectile range, so the log says how far it should actually go.
+			distribution.GoalKickSpeed * 2 * distribution.GoalKickLift / workspace.Gravity
+		))
+		sendFeedback(player, true, "", nil, "Shoot", "Released")
+		return
+	end
+
 	if not goal then
 		sendFeedback(player, false, "goal-unavailable", nil, "Shoot")
 		return

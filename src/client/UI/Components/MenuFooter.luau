@@ -63,7 +63,7 @@ function MenuFooter.Prompt(props)
 			Font = Theme.Fonts.Statistics,
 			Text = props.Fallback or "",
 			TextColor3 = Theme.Text,
-			TextSize = if mobile then 9 else 10,
+			TextSize = Theme.Size(mobile, 10),
 			ZIndex = props.ZIndex or 4,
 		}, {
 			Corner = ReactUI.Corner(4),

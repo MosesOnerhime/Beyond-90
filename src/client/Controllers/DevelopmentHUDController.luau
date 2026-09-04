@@ -495,9 +495,18 @@ local function createGui()
 
 	-- BALL ------------------------------------------------------------------
 	createSectionHeader(panel, "BALL", UDim2.fromOffset(16, 216))
+	--[[
+		Split into two half-width buttons on the same row rather than pushing
+		everything below it down: the panel is laid out in absolute offsets, so
+		inserting a full-width row would mean re-numbering every control under it.
+	]]
 	local resetBallButton = createButton(panel, "ResetBallButton", UDim2.fromOffset(16, 236))
 	resetBallButton.Text = "RESET BALL"
-	resetBallButton.Size = UDim2.fromOffset(290, 32)
+	resetBallButton.Size = UDim2.fromOffset(142, 32)
+
+	local givePossessionButton = createButton(panel, "GivePossessionButton", UDim2.fromOffset(164, 236))
+	givePossessionButton.Text = "GIVE ME BALL"
+	givePossessionButton.Size = UDim2.fromOffset(142, 32)
 	dribblingSkillLabel = createStepperRow(panel, "DribblingSkillRow", "DRIBBLING  --", UDim2.fromOffset(16, 272), function(delta)
 		local config = DevToolsConfig.DribblingSkill
 		local current = localPlayer:GetAttribute(config.AttributeName)
@@ -620,6 +629,9 @@ local function createGui()
 	end))
 	table.insert(connections, resetBallButton.Activated:Connect(function()
 		sendDevRequest(DevToolsConfig.Actions.ResetBall)
+	end))
+	table.insert(connections, givePossessionButton.Activated:Connect(function()
+		sendDevRequest(DevToolsConfig.Actions.GivePossession)
 	end))
 
 	-- Reflect authoritative AI counts and skill back into the panel.

@@ -11,6 +11,7 @@ local FootballActionConfig = require(Shared.Config.FootballActionConfig)
 local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
 local GameConfig = require(Shared.Config.GameConfig)
 local BallControlMath = require(Shared.Football.BallControlMath)
+local TackleEvaluator = require(Shared.Football.TackleEvaluator)
 
 local InputController = require(script.Parent:WaitForChild("InputController"))
 local MovementController = require(script.Parent:WaitForChild("MovementController"))
@@ -31,22 +32,39 @@ local MovementController = require(script.Parent:WaitForChild("MovementControlle
 	Beyond 90 maps all three onto the one defensive input, by duration and by
 	whether sprint is also held:
 
-	    TAP                    -> TACKLE. An immediate challenge, unchanged.
-	    HOLD                   -> MATCH UP. Contain the carrier: close, then hold
-	                              a jockeying position goal-side of them and mirror
-	                              their movement. Never challenges by itself.
-	    HOLD + SPRINT          -> DASH & PRESSURE. The same containment with the
-	                              standoff pulled in and the speed cap lifted.
+	    TAP                    -> TACKLE. An immediate challenge at a moment of
+	                              the player's exact choosing.
+	    HOLD                   -> PRESS. Run the carrier down and challenge when
+	                              a legal challenge becomes available.
+	    HOLD + SPRINT          -> DASH & PRESSURE. The same, with the standoff
+	                              pulled in and the speed cap lifted.
 
-	What is deliberately absent is the automatic challenge the hold used to make.
-	It made pressing a lunge, which is not what pressing is, and it decided a
-	football question -- when to commit -- that AGENTS.md reserves to the player.
-	The long note on DefendingConfig.Press.AutoTackleScore sets that out in full.
+	THE HOLD CHALLENGES, AND WHY THAT IS NOT THE GAME DECIDING.
+
+	An earlier revision removed the automatic challenge, on the grounds that it
+	decided when to commit -- a football question AGENTS.md reserves to the
+	player -- and that it made pressing a lunge. Both objections were fair
+	against the version that existed. Neither survives the current one, and the
+	rule they appealed to has since been written down properly: see the "A Held
+	Input Is Itself A Decision" subsection of AGENTS.md section 2.
+
+	On WHO DECIDES: holding this input is not a request to stand near the
+	carrier, it is a request to take the ball off him, repeated for as long as
+	the player holds it. Letting go stops it immediately. The player is deciding
+	continuously and this is executing -- which is the side of the line
+	assistance belongs on. The tap remains for players who want the moment
+	themselves.
+
+	On LUNGING: answered by geometry rather than by argument. The challenge is
+	gated on the ball-duel angle (TackleEvaluator.BallDuelLikeliness, a close
+	port of GameplayFootball's own test), so a challenge whose path runs through
+	the carrier's body is never requested at all.
 
 	The assistance is bounded (§42): it approaches, positions and faces. It never
 	teleports, never exceeds normal speed, never ignores acceleration or stamina,
-	never wins the ball by fiat, and yields to manual movement input. The human
-	chooses whom to press, from which side, and when to go.
+	never wins the ball by fiat, and yields to manual movement input. It asks;
+	the server re-runs the full evaluation and is free to refuse. The human
+	chooses whom to press, from which side, and whether to commit at all.
 ]]
 local DefendingController = {}
 
@@ -65,6 +83,8 @@ local lastTackleRequestAt = 0
 -- Double-tap detection for the slide. See DefendingConfig.Slide.
 local lastTapAt = 0
 local pressTargetPosition: Vector3? = nil
+-- When the held press last asked for a challenge, so it asks once and waits.
+local lastAutoChallengeAt = 0
 local pressCarrierId: number? = nil
 
 local function log(message: string)
@@ -272,6 +292,12 @@ local function requestTackle()
 	end
 	lastTackleRequestAt = os.clock()
 	pressUntil = os.clock() + DefendingConfig.Press.Duration
+	--[[
+		A tap is a challenge too, so it also starts the held press's interval.
+		Without this, tapping and then holding would let the hold fire again on
+		the very next frame.
+	]]
+	lastAutoChallengeAt = os.clock()
 	requestRemote:FireServer({ ActionType = DefendingConfig.Tackle.ActionType })
 end
 
@@ -396,13 +422,91 @@ local function updatePress()
 	end
 
 	--[[
-		AND THAT IS ALL IT DOES.
+		AND WHEN IT ARRIVES, IT CHALLENGES.
 
-		No automatic challenge. Holding this input contains; taking the ball is
-		the player's decision and their tap. See the long note on AutoTackleScore
-		in DefendingConfig for why the auto-tackle that used to live here was both
-		unlike football and on the wrong side of the assistance line.
+		The automatic challenge used to live here, was removed as "unlike football
+		and on the wrong side of the assistance line", and is now back by explicit
+		design decision. Both positions are worth recording, because the second
+		is not a reversal of the first so much as a different reading of who
+		decided what.
+
+		The objection was that an auto-tackle decides WHEN TO COMMIT, which
+		AGENTS.md section 2 reserves to the player. The answer is that holding this
+		input IS the commitment -- the player is not asking to stand near the
+		carrier, they are asking to take the ball off him, exactly as eFootball's
+		Dash & Pressure does. The tap remains available for a challenge at a
+		moment of the player's precise choosing. What the hold delegates is
+		execution, which is the side of the line assistance belongs on.
+
+		The other half of the old objection -- that it "made pressing a lunge" --
+		is answered by the duel-angle gate below rather than by argument. A
+		challenge whose path runs through the carrier's body is refused, so this
+		cannot become a defender throwing himself through the back of an opponent
+		on a timer. That test is a close port of GameplayFootball's own
+		(TackleEvaluator.BallDuelLikeliness); the reference gates its automatic
+		challenge on precisely the same thing.
 	]]
+	if not (requestRemote and carrierRoot) then
+		return
+	end
+
+	--[[
+		Two gates, and the server is the third.
+
+		RANGE, from the standing tackle's own reach, so the challenge is only
+		asked for once it could actually connect. And the ANGLE, so a challenge
+		whose path runs through the carrier is never requested at all.
+
+		Nothing here decides the outcome. This asks; DefendingService.AttemptTackle
+		re-runs the full evaluation authoritatively and is free to refuse, exactly
+		as it does for a tapped challenge. The client is predicting the moment, not
+		awarding the ball.
+	]]
+	--[[
+		ASK ONCE PER CHALLENGE, NOT ONCE PER FRAME.
+
+		This ran every frame the press was held and the range gate was satisfied,
+		which fired a tackle request ~60 times a second. The server refused all
+		but the first -- the logs are walls of `rejected=already-committed` and
+		`rejected=recovering` -- so the press appeared to do nothing while
+		saturating the remote with requests that could never succeed.
+
+		Three things stop that, cheapest first: a committed challenge already
+		running, a local cooldown covering the server's own recovery, and only
+		then the football gates below. The behaviour the player asked for is
+		unchanged -- hold the input and it challenges when it can -- it just asks
+		once and waits for the answer.
+	]]
+	local character = rootPart.Parent
+	local committedUntil = character
+		and character:GetAttribute(DefendingConfig.ContactWindow.CommittedAttribute)
+	if typeof(committedUntil) == "number" and os.clock() < committedUntil then
+		return
+	end
+	local now = os.clock()
+	if now - lastAutoChallengeAt < DefendingConfig.Press.AutoChallengeIntervalSeconds then
+		return
+	end
+
+	local ballOffset = BallControlMath.GetHorizontal(ball.Position - rootPart.Position)
+	if ballOffset.Magnitude > DefendingConfig.Tackle.MaximumBallDistance then
+		return
+	end
+
+	local duel = TackleEvaluator.BallDuelLikeliness(
+		rootPart.Position,
+		BallControlMath.GetHorizontal(rootPart.AssemblyLinearVelocity),
+		carrierRoot.Position,
+		BallControlMath.GetHorizontal(carrierRoot.AssemblyLinearVelocity),
+		ball.Position,
+		BallControlMath.GetHorizontal(ball.AssemblyLinearVelocity)
+	)
+	if duel < DefendingConfig.AI.MinimumDuelLikeliness then
+		return
+	end
+
+	lastAutoChallengeAt = now
+	requestRemote:FireServer({ ActionType = DefendingConfig.Tackle.ActionType })
 end
 
 --[[
@@ -538,6 +642,10 @@ function DefendingController.GetPressState()
 		ball is loose, which is the one case where there is nothing to avoid.
 	]]
 	local carrierRoot = resolveCarrier(ball)
+	-- Gap to the man, which is what jockeying range and sprinting both key off.
+	local carrierGap = if carrierRoot and rootPart
+		then BallControlMath.GetHorizontal(carrierRoot.Position - rootPart.Position).Magnitude
+		else distance
 	return {
 		TargetPosition = pressTargetPosition,
 		BallPosition = ball.Position,
@@ -553,14 +661,27 @@ function DefendingController.GetPressState()
 			sprints -- a defender at top speed cannot turn, which is the whole
 			thing jockeying exists to preserve.
 		]]
-		ShouldSprint = pressDashing or distance > DefendingConfig.Press.SprintDistance,
+		ShouldSprint = pressDashing or carrierGap > DefendingConfig.Press.Contain.ContainRange,
 		Dashing = pressDashing,
 		--[[
 			Which of the two containment speed caps applies. DASH & PRESSURE is
 			allowed full commitment; MATCH UP is deliberately held below it so the
 			defender stays balanced and able to change direction.
 		]]
-		Containing = distance <= DefendingConfig.Press.Contain.ContainRange,
+		--[[
+			MEASURED TO THE CARRIER, NOT TO THE TARGET.
+
+			This used to test the distance to the press TARGET, which sits
+			goal-side of the carrier rather than on him. A defender still a long
+			way from the opponent could therefore be close to that point, get
+			flagged as jockeying, and be capped at the containment speed with
+			sprinting forbidden -- for the whole chase.
+
+			That is the second half of "the player is still not fast enough", and
+			the reason the run to get in front never happened at pace. Jockeying
+			range is a distance to the MAN, so that is what it now measures.
+		]]
+		Containing = carrierGap <= DefendingConfig.Press.Contain.ContainRange,
 		Config = DefendingConfig.Press,
 	}
 end

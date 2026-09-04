@@ -35,6 +35,32 @@ local ball: BasePart? = nil
 local keepers: { [number]: any } = {}
 local heldBy: any = nil
 local heldSince = 0
+
+--[[
+	WHO JUST LET GO OF IT, AND WHEN.
+
+	A keeper who has thrown or drop-kicked the ball was re-catching it on the
+	very next frame. The distribution releases the ball at the keeper's own
+	hands, so for one tick it is a FREE ball a fraction of a stud away -- which
+	is exactly what the assisted save and the assisted claim are built to
+	pounce on. The runtime log shows the whole round trip inside two
+	milliseconds:
+
+		[GK] Release: goalkeeper distribution
+		[GK] runo drop-kicked to HOME_AI_2
+		[GK] runo secured the football
+		[GK] runo caught the football (ballSpeed=100.8)
+
+	Every distribution "worked" and every one was instantly undone, which is
+	why both the throw and the drop kick read as doing nothing.
+
+	Football says the same thing the fix does: having released the ball, a
+	keeper may not handle it again until it has been touched by another player.
+	So the block is on that keeper alone, it lifts the moment anybody else
+	touches the ball, and it has a timeout so a kick that reaches nobody cannot
+	strand the keeper unable to use their hands.
+]]
+local lastReleaseById: { [number]: number } = {}
 local lastSaveAtById: { [number]: number } = {}
 local lastLogAt = 0
 local lastHandlingFoulAt = 0
@@ -120,6 +146,7 @@ function GoalkeeperService.Unregister(actorOrId)
 	end
 	keepers[id] = nil
 	lastSaveAtById[id] = nil
+	lastReleaseById[id] = nil
 end
 
 --[[
@@ -197,6 +224,13 @@ function GoalkeeperService.Hold(actor): boolean
 	if BallControlService.GetActiveController() or BallControlService.GetActiveAIController() then
 		return false
 	end
+	--[[
+		Not this keeper, not yet. See `lastReleaseById`: without this the keeper
+		catches their own throw or drop kick on the frame after taking it.
+	]]
+	if GoalkeeperService.IsInReleaseGrace(actor) then
+		return false
+	end
 	heldBy = actor
 	heldSince = os.clock()
 	ball:SetAttribute(GoalkeeperConfig.HeldAttributeName, true)
@@ -212,9 +246,67 @@ function GoalkeeperService.Hold(actor): boolean
 	return true
 end
 
+--[[
+	Has this keeper just let go of the ball?
+
+	True while the keeper is still inside the grace window AND nobody else has
+	touched the ball since -- so an opponent heading the clearance straight back
+	restores the keeper's hands immediately, exactly as the law does.
+]]
+function GoalkeeperService.IsInReleaseGrace(actor): boolean
+	if not actor then
+		return false
+	end
+	local expiresAt = lastReleaseById[actor.Id]
+	if not expiresAt then
+		return false
+	end
+	if os.clock() >= expiresAt then
+		lastReleaseById[actor.Id] = nil
+		return false
+	end
+	-- Somebody else has it: the ball has been touched, so the block is spent.
+	local controller = BallControlService.GetActiveController()
+	local aiController = BallControlService.GetActiveAIController()
+	if (controller and controller ~= actor.Player) or (aiController and aiController.Id ~= actor.Id) then
+		lastReleaseById[actor.Id] = nil
+		return false
+	end
+	return true
+end
+
 function GoalkeeperService.Release(actor, reason: string, launchVelocity: Vector3?): boolean
 	if not ball or not heldBy or (actor and heldBy.Id ~= actor.Id) then
 		return false
+	end
+	--[[
+		A DISTRIBUTION starts the grace, and so does DELIBERATELY PUTTING THE
+		BALL DOWN.
+
+		The drop was originally exempt, on the reasoning that releasing the ball
+		is not the same act as playing it away, so the keeper should be free to
+		pick straight back up. That was wrong, and the log shows exactly how
+		wrong -- the assisted claim re-secured the ball on the very next frame:
+
+			13:28:13.367  Release: keeper put the ball down
+			13:28:13.368  runo secured the football
+
+		one millisecond later, every time, which is why R looked like it did
+		nothing at all. Putting the ball down is a deliberate choice to play it
+		with the feet, and it has to survive long enough to actually do that --
+		so it gets its OWN, longer grace, and pressing R again lifts it early
+		because that is the player asking for their hands back.
+
+		A release with no launch and no deliberate drop is still exempt: the
+		ball being taken off the keeper by a reset, a foul, or removal should
+		not stop them using their hands next.
+	]]
+	local releaser = heldBy
+	local distribution = GoalkeeperConfig.Distribution
+	if launchVelocity then
+		lastReleaseById[releaser.Id] = os.clock() + distribution.ReleaseGraceSeconds
+	elseif reason == GoalkeeperConfig.DropReason then
+		lastReleaseById[releaser.Id] = os.clock() + distribution.DropGraceSeconds
 	end
 	heldBy = nil
 	heldSince = 0
@@ -231,7 +323,9 @@ function GoalkeeperService.Release(actor, reason: string, launchVelocity: Vector
 		ball:SetAttribute("FootballGrounded", false)
 		ball:SetAttribute("FootballBounceCount", 0)
 		ball:SetAttribute("LastFootballAction", "GoalkeeperDistribution")
-		ball:SetAttribute("LastFootballActionPlayerUserId", heldBy and heldBy.Id or 0)
+		-- `heldBy` is already nil by here, so this read was always writing 0 and
+		-- the distribution was credited to nobody.
+		ball:SetAttribute("LastFootballActionPlayerUserId", releaser.Id)
 		ball:SetAttribute("LastFootballActionTime", os.clock())
 	end
 	log(string.format("Release: %s", reason))
@@ -253,8 +347,38 @@ local function updateHeldBall()
 		BallControlMath.GetHorizontal(root.CFrame.LookVector),
 		Vector3.zAxis
 	)
+	--[[
+		Gathered into the chest. The root part is already at chest height on an
+		R15 rig, so this is a small offset from it rather than a computation
+		against the root's size -- see GoalkeeperConfig.Possession.HoldChestOffset.
+	]]
+	--[[
+		CARRYING IT OUT IS ALSO A HANDLING OFFENCE.
+
+		`Hold` is the choke point for STARTING to handle the ball, and it already
+		refuses a keeper who reaches for it outside their area. It cannot catch
+		this case: a keeper who gathers the ball legally inside the box and then
+		simply walks out with it never calls Hold again, so the offence went
+		unpunished -- reported by the player as "no foul when the keeper leaves
+		the box holding the ball".
+
+		Checked here because this is the one function that runs for every frame
+		the ball is in a keeper's hands, whoever the keeper is, so a human walking
+		out and an AI walking out are the same event.
+
+		The margin in `IsInsideOwnPenaltyArea` matters: a keeper standing on the
+		painted line is inside it, so this only triggers on a keeper who has
+		genuinely left.
+	]]
+	if not GoalkeeperService.IsInsideOwnPenaltyArea(heldBy) then
+		local offender = heldBy
+		GoalkeeperService.Release(offender, "carried outside the area")
+		penaliseHandling(offender)
+		return
+	end
+
 	local target = root.Position + forward * GoalkeeperConfig.Possession.HoldOffset
-		+ Vector3.yAxis * (GoalkeeperConfig.Possession.HoldHeight - root.Size.Y * 0.5)
+		+ Vector3.yAxis * GoalkeeperConfig.Possession.HoldChestOffset
 	ball.CFrame = CFrame.new(target)
 	ball.AssemblyLinearVelocity = root.AssemblyLinearVelocity
 	ball.AssemblyAngularVelocity = Vector3.zero
@@ -413,7 +537,30 @@ function GoalkeeperService.RequestDive(actor, interceptPoint: Vector3, goal): bo
 	end
 
 	local direction = BallControlMath.SafeUnit(toIntercept, goal.WidthAxis)
-	actor.RootPart.AssemblyLinearVelocity = direction * speed + Vector3.yAxis * lift
+	local diveVelocity = direction * speed + Vector3.yAxis * lift
+
+	--[[
+		WHO IS ALLOWED TO MOVE THE BODY.
+
+		An AI keeper's character is owned by the server, so writing the velocity
+		here IS the dive. A human keeper's character is owned by THEIR CLIENT, and
+		a server-side velocity write on a client-owned assembly is discarded by
+		the next replication tick -- which is exactly why human dives produced a
+		state change, an animation hook and a log line, but no travel at all.
+
+		So the server keeps the decision and publishes the launch it approved; the
+		client that actually owns the physics applies it. This is the split in
+		§32: the client may simulate the motion, the server decides what the
+		motion means. Nothing about validation moves to the client -- whether a
+		dive happens, in which direction and for how long is still decided here.
+	]]
+	if isHumanKeeper(actor) then
+		if actor.Character then
+			actor.Character:SetAttribute(GoalkeeperConfig.Attributes.DiveVelocity, diveVelocity)
+		end
+	else
+		actor.RootPart.AssemblyLinearVelocity = diveVelocity
+	end
 	actor.GoalkeeperDiveUntil = now + dive.Duration
 	actor.GoalkeeperDiveRecoveryUntil = now + dive.Duration + dive.RecoverySeconds
 	actor.GoalkeeperDiveKind = kind
@@ -460,6 +607,22 @@ end
 function GoalkeeperService.RequestSave(actor, interceptPoint: Vector3): string
 	if not ball or not actor or not actor.RootPart then
 		return "invalid-keeper"
+	end
+	--[[
+		A KEEPER DOES NOT SAVE THEIR OWN DISTRIBUTION.
+
+		Gated here rather than at each call site so it holds for the AI keeper
+		and the human one alike -- both were doing it. The AI's version is
+		visible in the log as a keeper distributing and re-securing the same
+		ball on the same tick, over and over:
+
+			[GK] AWAY_AI_91 distributed to AWAY_AI_2
+			[GK] AWAY_AI_91 secured the football
+
+		See `lastReleaseById`.
+	]]
+	if GoalkeeperService.IsInReleaseGrace(actor) then
+		return "own-distribution"
 	end
 	local config = GoalkeeperConfig.Save
 	local now = os.clock()
@@ -593,7 +756,7 @@ end
 	centre-back. With a hint and nobody usable in that direction, the ball is
 	cleared along the hint rather than at the far goal.
 ]]
-function GoalkeeperService.RequestDistribution(actor, directionHint: Vector3?): boolean
+function GoalkeeperService.RequestDistribution(actor, directionHint: Vector3?, dropKick: boolean?): boolean
 	if not ball or not heldBy or heldBy.Id ~= actor.Id then
 		return false
 	end
@@ -659,13 +822,27 @@ function GoalkeeperService.RequestDistribution(actor, directionHint: Vector3?): 
 
 	-- Keeper steps into the throw and recovers ~70% of that distance.
 	AIAnimationService.PlayAction(actor, "KeeperThrowPass")
-	local launch = direction * config.ClearanceSpeed + Vector3.yAxis * config.ClearanceLift
+	-- No drop-kick clip is authored yet; the throw stands in (see docs/animation).
+	--[[
+		THROW VERSUS DROP KICK.
+
+		Both release the same ball to the same target; they differ in flight, and
+		that difference is the whole reason a keeper picks one. A throw is flat,
+		short and accurate -- it finds a specific team-mate. A drop kick is
+		struck: much faster, much higher, and it clears distance the throw cannot
+		reach, at the cost of being a contest rather than a delivery.
+	]]
+	local speed = if dropKick then config.DropKickSpeed else config.ClearanceSpeed
+	local lift = if dropKick then config.DropKickLift else config.ClearanceLift
+	local launch = direction * speed + Vector3.yAxis * lift
 	GoalkeeperService.Release(actor, "goalkeeper distribution", launch)
 	if best then
 		ball:SetAttribute("LastFootballActionIntendedReceiverUserId", best.Id)
 		ball:SetAttribute("LastFootballActionIntendedReceiverName", best.DisplayName)
 	end
-	log(string.format("%s distributed to %s", actor.DisplayName, if best then best.DisplayName else "space"))
+	log(string.format("%s %s to %s", actor.DisplayName,
+		if dropKick then "drop-kicked" else "distributed",
+		if best then best.DisplayName else "space"))
 	return true
 end
 
@@ -747,6 +924,31 @@ local function updateHumanKeeper(actor, deltaTime: number, goal)
 			goal, ballPosition, positioning.DepthBias, positioning
 		)
 		character:SetAttribute(GoalkeeperConfig.Attributes.RestingPosition, resting)
+
+		--[[
+			OUTSIDE THE AREA, A KEEPER IS AN OUTFIELDER.
+
+			Published so the client can hand the player their normal controls
+			back. It is the honest model of the role: outside their box a keeper
+			has no hands, cannot dive for a save and is subject to exactly the
+			laws every other player is -- so keeping the keeper-only bindings
+			active out there would offer actions that are not legal anyway.
+
+			The server owns this because it owns the pitch frame and the same
+			test already governs whether handling is legal, so the controls the
+			player sees and the laws the server enforces cannot disagree.
+		]]
+		character:SetAttribute(
+			GoalkeeperConfig.Attributes.InsideOwnArea,
+			GoalkeeperService.IsInsideOwnPenaltyArea(actor)
+		)
+
+		--[[
+			Which way is out of the goal. Published so the client can bound the
+			keeper's turn to a sensible arc instead of letting them spin to face
+			their own net when the ball goes behind.
+		]]
+		character:SetAttribute(GoalkeeperConfig.Attributes.Pitchward, goal.InwardDirection)
 	end
 
 	if not playing then
@@ -796,6 +998,17 @@ local function updateHumanKeeper(actor, deltaTime: number, goal)
 	]]
 	local reach = BallControlMath.GetHorizontal(ballPosition - actor.RootPart.Position).Magnitude
 	local ballIsFree = activeBall:GetAttribute("State") == "Free"
+	--[[
+		Not their own distribution. Both assisted halves are gated together
+		here rather than separately: a keeper who has just thrown the ball
+		should neither catch it nor palm it away. See `lastReleaseById`.
+	]]
+	if GoalkeeperService.IsInReleaseGrace(actor) then
+		if character then
+			character:SetAttribute("Beyond90AIState", actor.State)
+		end
+		return
+	end
 	if reach <= human.AssistedSaveRadius
 		and ballPosition.Y <= actor.RootPart.Position.Y + saveConfig.MaximumSaveHeight
 		and (bound or ballIsFree)
@@ -921,6 +1134,44 @@ function GoalkeeperService.RequestHumanDive(actor, directionHint: Vector3?): (bo
 		target = actor.RootPart.Position + aim * human.SpeculativeDiveDistance
 	end
 
+	--[[
+		A SHOT-STOPPING DIVE GOES ACROSS THE GOAL.
+
+		The aim above is a direction toward the ball, and a ball up the pitch
+		produced a dive up the pitch. Measured over one session, three of eight
+		dives launched FORWARD off the line and one launched BACKWARD into the
+		net (angles relative to pitchward):
+
+			-90.0  95.8  77.8  -98.3   lateral, correct
+			 -3.8  21.8  49.3          forward, off the line
+			-174.3                     backward, into the goal
+
+		Squaring the keeper's body to the goal made the left/right CLIP honest,
+		but a clip cannot make a forward dive lateral -- the body genuinely
+		travelled that way, which is the reported "dive is still broken".
+
+		So the dive is projected onto the goal's width axis. The player's own
+		input still decides WHICH WAY -- the sign of the projection comes
+		straight from their aim, so left stays left and right stays right (§2:
+		assist the execution, do not choose the decision). What is removed is
+		only the component that was never a save: along the pitch.
+
+		A dive whose aim is almost perpendicular to the goal line has no side to
+		it, so it is refused rather than snapped to an arbitrary one; the caller
+		falls back to taking the save standing, which is the right action when
+		the ball is coming straight at the keeper.
+	]]
+	local widthAxis = BallControlMath.SafeUnit(
+		BallControlMath.GetHorizontal(goal.WidthAxis),
+		Vector3.xAxis
+	)
+	local toTarget = BallControlMath.GetHorizontal(target - actor.RootPart.Position)
+	local lateralReach = toTarget:Dot(widthAxis)
+	if math.abs(lateralReach) < human.MinimumLateralDiveReach then
+		return false, "no-lateral-component"
+	end
+	target = actor.RootPart.Position + widthAxis * lateralReach
+
 	local dived = GoalkeeperService.RequestDive(actor, target, goal)
 	if not dived then
 		-- Close enough that a dive is the wrong action: take it standing.
@@ -992,7 +1243,17 @@ function GoalkeeperService.UpdateKeeper(actor, deltaTime: number)
 		actor.Humanoid.WalkSpeed = 0
 		actor.Humanoid:Move(Vector3.zero, false)
 		actor.State = "GoalkeeperHeld"
-		if playing and os.clock() - heldSince >= GoalkeeperConfig.Possession.HoldSeconds then
+		--[[
+			The short beat before an AI keeper plays it out. A human keeper is
+			skipped entirely -- they release when they choose to, and this is
+			what was taking the ball out of their hands a second and a half after
+			every catch.
+		]]
+		if
+			playing
+			and not isHumanKeeper(actor)
+			and os.clock() - heldSince >= GoalkeeperConfig.Possession.HoldSeconds
+		then
 			GoalkeeperService.RequestDistribution(actor)
 		end
 		return
@@ -1173,9 +1434,20 @@ function GoalkeeperService.Update(deltaTime: number)
 	if not ball then
 		return
 	end
-	-- A held ball cannot be held forever.
-	if heldBy and os.clock() - heldSince >= GoalkeeperConfig.Possession.MaximumHoldSeconds then
-		GoalkeeperService.RequestDistribution(heldBy)
+	--[[
+		A held ball cannot be held forever -- by an AI keeper.
+
+		A human keeper is not released on a timer at all: see
+		`Possession.HumanMaximumHoldSeconds`. Distribution is a football decision
+		and it belongs to the player holding the ball.
+	]]
+	if heldBy then
+		local limit = if isHumanKeeper(heldBy)
+			then GoalkeeperConfig.Possession.HumanMaximumHoldSeconds or 0
+			else GoalkeeperConfig.Possession.MaximumHoldSeconds
+		if limit > 0 and os.clock() - heldSince >= limit then
+			GoalkeeperService.RequestDistribution(heldBy)
+		end
 	end
 	for _, actor in keepers do
 		if actor.Character and actor.Character.Parent and actor.Humanoid and actor.Humanoid.Health > 0 then
@@ -1208,7 +1480,34 @@ local function onKeeperAction(player: Player, action: unknown, directionHint: un
 	if typeof(action) ~= "string" then
 		return
 	end
-	local actor = FootballerRegistryService.GetHumanActor(player)
+	--[[
+		THE REGISTERED KEEPER, NOT A FRESH SNAPSHOT.
+
+		`GetHumanActor` BUILDS A NEW TABLE ON EVERY CALL. That is fine for a
+		one-shot query, and fatal for anything that stores state on the actor --
+		which every dive guard does:
+
+			actor.GoalkeeperDiveUntil          committed until
+			actor.GoalkeeperDiveRecoveryUntil  recovery window
+			actor.GoalkeeperHumanDiveAt        input cooldown
+
+		Written to a throwaway table, all three vanished the instant this handler
+		returned. So for a HUMAN keeper `IsDiving` was permanently false and
+		every request launched a brand-new dive on top of the one already
+		running -- republishing the launch direction and resetting the dive's
+		start stamp, which restarts the body roll from zero. The keeper thrashed
+		on the spot instead of travelling, and the animation flipped sides with
+		the direction:
+
+			19:59:11.696  runo dives LowDive toward (25.8, 4.5, 180.2)
+			19:59:11.853  runo dives LowDive toward (27.7, 4.5, 178.4)   <- 157ms
+			             KeeperDiveRight -> KeeperDiveLeft
+
+		`Register` already keeps the one long-lived table per keeper, so use it.
+		The fresh snapshot stays as the fallback for a player who is not a
+		registered keeper.
+	]]
+	local actor = keepers[player.UserId] or FootballerRegistryService.GetHumanActor(player)
 	if not actor or not keepers[actor.Id] then
 		return
 	end
@@ -1232,6 +1531,41 @@ local function onKeeperAction(player: Player, action: unknown, directionHint: un
 	elseif action == "Distribute" then
 		if heldBy and heldBy.Id == actor.Id then
 			GoalkeeperService.RequestDistribution(actor, hint)
+		end
+	elseif action == "DropKick" then
+		if heldBy and heldBy.Id == actor.Id then
+			GoalkeeperService.RequestDistribution(actor, hint, true)
+		end
+	elseif action == "DropBall" then
+		--[[
+			Put it down and play it with the feet.
+
+			Released with NO launch velocity, which matters twice: the ball is
+			set down rather than thrown, and `Release` only opens the
+			re-handling grace for a distribution -- so a keeper may pick straight
+			back up what they deliberately put down. Releasing the ball is not
+			the same act as playing it away.
+		]]
+		if heldBy and heldBy.Id == actor.Id then
+			GoalkeeperService.Release(actor, GoalkeeperConfig.DropReason)
+		end
+	elseif action == "PickUpBall" then
+		--[[
+			Pick it up again. `Hold` enforces the handling law by itself -- it
+			refuses outside the penalty area and penalises the attempt -- so this
+			only has to check the ball is close enough to reach and that nobody
+			else is playing it.
+		]]
+		if not heldBy and ball and actor.RootPart then
+			-- Asking for the ball back lifts the keeper's own drop grace.
+			lastReleaseById[actor.Id] = nil
+			local reach = BallControlMath.GetHorizontal(ball.Position - actor.RootPart.Position).Magnitude
+			local human = GoalkeeperConfig.Human
+			if reach <= human.AssistedClaimRadius
+				and ball.Position.Y <= actor.RootPart.Position.Y + GoalkeeperConfig.Save.MaximumSaveHeight
+			then
+				GoalkeeperService.Hold(actor)
+			end
 		end
 	end
 end

@@ -19,9 +19,9 @@
 	owns how it looks.
 ]]
 local UserInputService = game:GetService("UserInputService")
-local GuiService = game:GetService("GuiService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
 
 local React = require(ReplicatedStorage.Shared.ReactPackages).React
 local Assets = require(ReplicatedStorage.Shared.Config.UIAssetConfig)
@@ -33,19 +33,26 @@ local localPlayer = Players.LocalPlayer
 
 local MenuKit = {}
 
-MenuKit.PanelColor = Color3.fromRGB(10, 16, 38)
-MenuKit.PanelStroke = Color3.fromRGB(38, 56, 104)
+-- The menu family's own surface pair, kept in step with Theme's surfaces above
+-- (see the note there). These are the panels the player actually looks at most,
+-- so leaving them blue while the theme moved would have split the palette in two.
+MenuKit.PanelColor = Color3.fromRGB(16, 20, 32)
+MenuKit.PanelStroke = Color3.fromRGB(48, 60, 86)
 
 --[[
-	Scale a desktop size for the current viewport.
+	The responsive type scale, re-exported.
 
-	One helper rather than `if mobile then a else b` scattered through every
-	label, so the whole family shrinks by the same ratio and the hierarchy
-	between heading, body and caption survives the change of screen.
+	These three now live on Theme, beside the tokens they read -- MenuKit
+	requires MenuFooter, so anything MenuKit requires cannot call back into it,
+	and MenuFooter and BackButton both needed them. See Theme for the derivation,
+	the breakpoint and the development override.
+
+	Kept here because the menu family already calls MenuKit.Size in five screens
+	and there is no reason to churn those.
 ]]
-function MenuKit.Size(mobile: boolean, desktop: number): number
-	return if mobile then math.max(math.floor(desktop * 0.66), 7) else desktop
-end
+MenuKit.Compact = Theme.Compact
+MenuKit.TextScale = Theme.TextScale
+MenuKit.Size = Theme.Size
 
 --[[
 	A dark translucent card. The base surface of every panel in the mockups.
@@ -81,6 +88,24 @@ function MenuKit.Panel(props, children)
 	return React.createElement("Frame", merged, children)
 end
 
+--[[
+	`FitTo` MAKES A LABEL SHRINK TO ITS BOX INSTEAD OF SPILLING OUT OF IT.
+
+	A proportional box and a fixed TextSize disagree the moment the screen
+	changes size, and Roblox resolves that disagreement by drawing the text
+	outside the label -- there is no clipping unless an ancestor asks for it, so
+	an overlong caption lands on top of whatever is beside it. Measured at
+	780x360 before this existed, "RANKED MATCH" wanted 124px of a 105px card and
+	ran over the card's right edge into its neighbour.
+
+	Passing `FitTo = <size>` scales the text down until it fits, but never below
+	Theme.MinimumCompactTextSize, so it can never re-create the unreadable type
+	the floor exists to prevent. Text that already fits is unaffected: MaxTextSize
+	holds it at the size it was authored at.
+
+	Use it for short fixed-width labels -- titles, badges, stat captions. Prose
+	that should wrap wants TextWrapped instead.
+]]
 function MenuKit.Text(props)
 	local merged = {
 		BackgroundTransparency = 1,
@@ -88,8 +113,31 @@ function MenuKit.Text(props)
 		TextColor3 = Theme.Text,
 		TextXAlignment = Enum.TextXAlignment.Left,
 	}
+	local fitTo = props.FitTo
 	for key, value in props do
-		merged[key] = value
+		-- FitTo is this component's own prop. React applies every remaining key
+		-- straight onto the Instance, so leaking it through would throw.
+		if key ~= "FitTo" then
+			merged[key] = value
+		end
+	end
+	--[[
+		Any label that scales gets the floor, whether it asked for FitTo or set
+		TextScaled itself. A bare TextScaled label has NO lower bound -- it shrinks
+		to whatever its box allows -- so on a phone the account strip was rendering
+		the player's own name at about 6px. Flooring here rather than at each call
+		site means a label cannot acquire that behaviour by being written the
+		obvious way.
+	]]
+	if fitTo or merged.TextScaled then
+		merged.TextScaled = true
+		return React.createElement("TextLabel", merged, {
+			Fit = React.createElement("UITextSizeConstraint", {
+				MinTextSize = Theme.MinimumCompactTextSize,
+				-- No FitTo means "fill the box"; the constraint only adds a floor.
+				MaxTextSize = if fitTo then math.max(fitTo, Theme.MinimumCompactTextSize) else 100,
+			}),
+		})
 	end
 	return React.createElement("TextLabel", merged)
 end
@@ -121,6 +169,11 @@ function MenuKit.PanelHeading(props)
 			Text = props.Caption,
 			TextColor3 = Theme.MutedText,
 			TextSize = MenuKit.Size(mobile, 11),
+			-- A sentence, not a label: it wraps rather than running past the
+			-- panel edge. On a phone these captions are full sentences and the
+			-- panel is narrow, so one line is not always enough.
+			TextWrapped = true,
+			TextYAlignment = Enum.TextYAlignment.Top,
 			ZIndex = props.ZIndex or 3,
 		}) or nil,
 	})
@@ -212,7 +265,15 @@ function MenuKit.Slider(props)
 		BackgroundTransparency = 1,
 		ZIndex = props.ZIndex or 5,
 	}, {
-		-- Full-height invisible button: the grabbable area, sized for a thumb.
+		-- The whole control takes the touch-target floor, not just the hit area.
+		-- Flooring the button alone would have grown it past the track it is
+		-- supposed to cover and over whatever sits below; flooring the frame
+		-- keeps the grab area and the visible track the same shape. Measured at
+		-- 780x360 the slider was 24px tall against the ~48px target in
+		-- docs/ui/UI_AGENT_DECISION_RULES.md section 8 -- the volume control is
+		-- exactly the kind of drag a thumb needs room for.
+		MinimumHeight = ReactUI.MinimumSize(nil, Theme.MinimumTouchTarget),
+		-- Full-height invisible button: the grabbable area.
 		Hit = React.createElement("TextButton", {
 			Size = UDim2.fromScale(1, 1),
 			BackgroundTransparency = 1,
@@ -297,14 +358,30 @@ function MenuKit.StatTile(props)
 			TextXAlignment = Enum.TextXAlignment.Center,
 			ZIndex = (props.ZIndex or 3) + 1,
 		}),
+		--[[
+			The caption WRAPS on a phone, and is given the room to do it.
+
+			A stat tile is about 70px wide at 780x360, and these captions are
+			whole phrases -- "GOALS PER MATCH" needs 90px at the 11px readability
+			floor, "MATCHES PLAYED" 85px. On one line they cannot fit that tile at
+			any legible size, so before the floor existed they simply rendered at
+			7px instead, and afterwards they overflowed into their neighbours.
+
+			Two short lines inside the tile is the resolution that keeps both the
+			full label and a readable size. The band grows from 0.26 to 0.4 of the
+			tile on compact to hold the second line; on desktop the captions fit on
+			one line, so nothing there changes.
+		]]
 		Caption = MenuKit.Text({
 			Position = UDim2.fromScale(0, 0.6),
-			Size = UDim2.fromScale(1, 0.26),
+			Size = UDim2.fromScale(1, if mobile then 0.4 else 0.26),
 			Font = Theme.Fonts.Caption,
 			Text = props.Caption,
 			TextColor3 = Theme.MutedText,
 			TextSize = MenuKit.Size(mobile, 10),
+			TextWrapped = mobile,
 			TextXAlignment = Enum.TextXAlignment.Center,
+			TextYAlignment = Enum.TextYAlignment.Top,
 			ZIndex = (props.ZIndex or 3) + 1,
 		}),
 	})
@@ -381,7 +458,7 @@ function MenuKit.AccountStrip(props)
 			}),
 			B90 = MenuKit.Text({
 				Position = UDim2.fromScale(0.23, 0.18), Size = UDim2.fromScale(0.28, 0.64),
-				Font = Theme.Fonts.Statistics, Text = props.SoftCurrency or "0", TextScaled = true,
+				Font = Theme.Fonts.Statistics, Text = props.SoftCurrency or "0", FitTo = MenuKit.Size(mobile, 14),
 				ZIndex = (props.ZIndex or 6) + 1,
 			}),
 			PremiumIcon = React.createElement("ImageLabel", {
@@ -391,13 +468,26 @@ function MenuKit.AccountStrip(props)
 			}),
 			Premium = MenuKit.Text({
 				Position = UDim2.fromScale(0.73, 0.18), Size = UDim2.fromScale(0.23, 0.64),
-				Font = Theme.Fonts.Statistics, Text = props.HardCurrency or "0", TextScaled = true,
+				Font = Theme.Fonts.Statistics, Text = props.HardCurrency or "0", FitTo = MenuKit.Size(mobile, 14),
 				ZIndex = (props.ZIndex or 6) + 1,
 			}),
 		}),
 		Account = MenuKit.Panel({
 			Position = UDim2.fromScale(if mobile then 0.77 else 0.81, 0.018),
-			Size = UDim2.fromScale(if mobile then 0.21 else 0.17, if mobile then 0.09 else 0.075),
+			--[[
+				THE STRIP NEEDS HEIGHT BEFORE ITS TEXT CAN BE READ.
+
+				At 780x360 this was 164x32px holding an avatar, a username, a
+				level and an XP bar. Measured, that left the name a 9px-tall box
+				and "LEVEL 1" a 6px one, and because both labels are TextScaled
+				with no lower bound they simply shrank to fit -- the player's own
+				name rendered at about 6px.
+
+				Taller and a little wider on compact, which is the cheap half of
+				the fix; the other half is the floor on the labels below, so they
+				can no longer scale away to nothing whatever the box does.
+			]]
+			Size = UDim2.fromScale(if mobile then 0.26 else 0.17, if mobile then 0.15 else 0.075),
 			Transparency = 0.08,
 			ZIndex = props.ZIndex or 6,
 		}, {
@@ -406,14 +496,20 @@ function MenuKit.AccountStrip(props)
 				BackgroundTransparency = 1, Image = portrait, ScaleType = Enum.ScaleType.Crop,
 				ZIndex = (props.ZIndex or 6) + 1,
 			}, { Corner = ReactUI.Corner(40), Stroke = ReactUI.Stroke(Theme.AccentViolet, 1.5) }),
+			-- FitTo rather than a bare TextScaled: same fill-the-box behaviour,
+			-- but floored at the readability minimum. The caps are above what
+			-- either box allows on desktop, so nothing changes there.
 			Name = MenuKit.Text({
 				Position = UDim2.fromScale(0.27, 0.12), Size = UDim2.fromScale(0.68, 0.3),
-				Font = Theme.Fonts.Navigation, Text = localPlayer.DisplayName, TextScaled = true,
+				Font = Theme.Fonts.Navigation, Text = localPlayer.DisplayName,
+				FitTo = MenuKit.Size(mobile, 15),
+				TextTruncate = Enum.TextTruncate.AtEnd,
 				ZIndex = (props.ZIndex or 6) + 1,
 			}),
 			Level = MenuKit.Text({
-				Position = UDim2.fromScale(0.27, 0.45), Size = UDim2.fromScale(0.68, 0.2),
-				Text = props.LevelText or "LEVEL 1", TextColor3 = Theme.MutedText, TextScaled = true,
+				Position = UDim2.fromScale(0.27, 0.45), Size = UDim2.fromScale(0.68, 0.22),
+				Text = props.LevelText or "LEVEL 1", TextColor3 = Theme.MutedText,
+				FitTo = MenuKit.Size(mobile, 11),
 				ZIndex = (props.ZIndex or 6) + 1,
 			}),
 			XP = MenuKit.ProgressBar({
@@ -557,6 +653,11 @@ function MenuKit.BackButton(props)
 			end
 		end,
 	}, {
+		-- A proportional height has no floor. At 780x360 this came out 156x27
+		-- against the ~48px touch target docs/ui/UI_AGENT_DECISION_RULES.md
+		-- section 8 asks for. Back is the control a touch player reaches for
+		-- most, so it is the last one that should be hard to hit.
+		MinimumHeight = ReactUI.MinimumSize(nil, Theme.MinimumTouchTarget),
 		Corner = ReactUI.Corner(8),
 		Stroke = ReactUI.Stroke(MenuKit.PanelStroke, 1, 0.35),
 		Arrow = MenuKit.Text({
@@ -722,13 +823,23 @@ function MenuKit.ContentBand(mobile: boolean): (UDim2, UDim2)
 	return UDim2.fromScale(0.5, 0.47), UDim2.fromScale(0.93, 0.5)
 end
 
-function MenuKit.IsMobile(): boolean
-	local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
-	if viewport and viewport.X < 900 then
-		return true
-	end
-	local _, inset = GuiService:GetGuiInset()
-	return inset.Y > 0 and viewport ~= nil and viewport.X < 1100
-end
+--[[
+	THE MENU FAMILY HAS ONE BREAKPOINT, NOT TWO.
+
+	This used to be its own test -- viewport width under 900, or a bottom GUI
+	inset with width under 1100 -- and it fed the five content pages, while Home
+	and the prompts asked a different question entirely. Two breakpoints over one
+	menu meant the pages could switch to their compact layout while the screen
+	around them stayed full, at any width between them.
+
+	It also measured only WIDTH, so a short wide window -- the shape a phone
+	actually is in landscape -- did not register at all, and the inset clause put
+	tablets on the phone layout, which docs/ui/UI_RESPONSIVE_INPUT.md section 1
+	classes as medium landscape and expects to keep the fuller composition.
+
+	Now one definition, in Theme, used by every screen. Kept as a name because
+	the five pages read `props.Mobile` and that reads well where it is used.
+]]
+MenuKit.IsMobile = Theme.Compact
 
 return MenuKit

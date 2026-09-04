@@ -23,10 +23,36 @@ local localPlayer = Players.LocalPlayer
 local idleConfig = AnimationConfig.Locomotion.Idle
 local jogConfig = AnimationConfig.Locomotion.Jog
 local sprintConfig = AnimationConfig.Locomotion.Sprint
+local keeperSprintConfig = AnimationConfig.Goalkeeper.BackwardSprint
 local blendConfig = AnimationConfig.Blend
 local jumpConfig = AnimationConfig.Jump
 local passConfig = AnimationConfig.Pass
 local shootConfig = AnimationConfig.Shoot
+local celebrationConfig = AnimationConfig.Celebration
+local FootballActionConfig = require(Shared.Config.FootballActionConfig)
+local GoalConfig = require(Shared.Config.GoalConfig)
+local FootballTeamConfig = require(Shared.Config.FootballTeamConfig)
+-- Held so Destroy can drop the goal-remote listener with everything else.
+local celebrationConnection: RBXScriptConnection? = nil
+
+--[[
+	GETTING UP FROM A DIVE.
+
+	`keeperGetUpSlot` is the clip currently playing, empty when the keeper is not
+	getting up. `keeperGetUpUntil` is when it finishes -- published to the
+	character so MovementController can hold input for exactly that long instead
+	of running its own constant. `keeperWasDiving` is how the END of a dive is
+	detected: the attribute going true -> false is the only edge that exists.
+]]
+local keeperWasDiving = false
+local keeperDiveSide = "Right"
+local keeperGetUpSlot = ""
+local keeperGetUpUntil = 0
+-- Which sector the keeper was last judged to be travelling in, so the boundary
+-- can be widened in its favour (hysteresis). "" until the first decision.
+local keeperSector = ""
+-- Defined below Initialize (it needs startAction), so declared here.
+local connectCelebration: () -> ()
 local receptionConfig = AnimationConfig.Reception
 local stopTrapConfig = AnimationConfig.StopTrap
 local transitionConfig = AnimationConfig.Transitions or {}
@@ -127,6 +153,14 @@ end
 
 local function getHorizontal(vector: Vector3): Vector3
 	return Vector3.new(vector.X, 0, vector.Z)
+end
+
+-- Read from the character rather than cached at spawn: a player can change
+-- position between matches without the module reloading.
+local function isLocalGoalkeeper(): boolean
+	local model = localPlayer.Character
+	return model ~= nil
+		and model:GetAttribute(GoalkeeperConfig.RoleAttributeName) == GoalkeeperConfig.Role
 end
 
 local function angleBetweenDegrees(a: Vector3, b: Vector3): number
@@ -766,6 +800,8 @@ local function getActionConfig(slot: string)
 		return stopTrapConfig
 	elseif slot == "Shoot" then
 		return shootConfig
+	elseif slot == "Celebration" then
+		return celebrationConfig
 	elseif transitionConfig[slot] then
 		return transitionConfig[slot]
 	end
@@ -1398,10 +1434,53 @@ local function resolveBaseLocomotion(
 		return "AirborneFallback", currentLocomotionFamily, direction, sprintTurn, sprintTurnAngle
 	end
 
-	if sprintActive then
+	--[[
+		A KEEPER SPRINTING BACKWARDS RUNS THE BACKWARD CLIP, FASTER.
+
+		The sprint family is chosen from whether sprint is REQUESTED, not from
+		which way the body is going, and the only sprint clip is a forward one.
+		For an outfielder that is fine -- they turn and run. A keeper's facing is
+		pinned to the ball, so retreating toward their goal at pace is backward
+		travel with a forward-facing body, and the sprint clip had them running
+		face-first toward the ball while actually moving away from it:
+
+			State -> SprintForward family=Sprint direction=Forward angle=171.0
+
+		-- an angle of 171 degrees is very nearly straight backwards.
+
+		So for a keeper going backwards the jog set runs instead, which already
+		has a genuine backward clip, and the extra pace goes into playback rate.
+		Sprint stays LATCHED throughout, so this changes only what is drawn.
+	]]
+	local keeperBackwardSprint = sprintActive
+		and isLocalGoalkeeper()
+		and math.abs(movementAngle) >= keeperSprintConfig.BackwardAngleDegrees
+
+	if sprintActive and not keeperBackwardSprint then
 		direction, sprintTurnAngle = playSprint(speed, locomotionState, deltaTime)
 		sprintTurn = direction
 		currentLocomotionFamily = "Sprint"
+	elseif keeperBackwardSprint then
+		direction = playJog(movementAngle, speed, deltaTime)
+		currentLocomotionFamily = if hasBall then "BallJogPlaceholder" else "Jog"
+		--[[
+			The pace that would have gone into the sprint clip goes here instead.
+			Applied on top of whatever `playJog` settled on and clamped, so a
+			keeper backpedalling hard looks urgent without the legs blurring.
+		]]
+		local boosted = math.min(
+			currentPlaybackRate * keeperSprintConfig.BackwardPlaybackScale,
+			keeperSprintConfig.BackwardMaximumPlaybackRate
+		)
+		for _, jogDirection in jogConfig.DirectionOrder do
+			local record = activeTracks["Jog" .. jogDirection]
+			if record and record.Track.IsPlaying then
+				record.Track:AdjustSpeed(
+					boosted * (jogConfig.PerDirectionPlaybackMultiplier[jogDirection] or 1)
+				)
+			end
+		end
+		currentPlaybackRate = boosted
 	elseif jogConfig.Enabled and visualMovement then
 		direction = playJog(movementAngle, speed, deltaTime)
 		currentLocomotionFamily = if hasBall then "BallJogPlaceholder" else "Jog"
@@ -1443,6 +1522,107 @@ end
 
 	Returns whether it took ownership of the body this frame.
 ]]
+--[[
+	TASK 0 (M6.9) -- THE KEEPER'S OWN LOG LINE.
+
+	The shared `State ->` line has a fixed format built for outfield play, and the
+	keeper branch used to pass literal zeros into it:
+
+		updateDiagnostics(desired, "Goalkeeper", "Idle", 0, speed, ..., 0, 0, 0, false)
+
+	so every keeper state printed `angle=0.0 forward=0.00 right=0.00` no matter
+	what the body was doing. Three attempts at the side step were made against
+	that -- which is to say, blind. The milestone makes fixing it the
+	prerequisite for touching K1-K5.
+
+	This prints what the shared line structurally cannot:
+
+	  * SIGNED forward/right, so backwards is distinguishable from forwards
+	    (K4) and left from right.
+	  * `frame` -- the yaw of the body the decomposition was measured in. THE
+	    KEY FIELD. If travel is steady and `frame` swings, the measurement basis
+	    is rotating under the selector, which is the K5 hypothesis; if `frame`
+	    is steady and the clip still alternates, the hypothesis is wrong and the
+	    thrash is a threshold problem instead.
+	  * `facing` -- whether the keeper facing override is currently steering the
+	    body, since that override is the suspected rotator.
+	  * `dive` -- the published launch direction and the latched clip side, so a
+	    dive that travels the wrong way (K1) can be compared against what the
+	    server actually asked for.
+
+	Rate-limited and change-gated: a per-frame print would bury the log it is
+	meant to make readable.
+]]
+local lastKeeperLogAt = 0
+local lastKeeperLogClip = ""
+
+local function logKeeper(
+	clip: string,
+	travelAngle: number,
+	signedForward: number,
+	signedRight: number,
+	speed: number,
+	isDiving: boolean,
+	diveVelocity: any,
+	holdingBall: boolean,
+	rootPart: BasePart
+)
+	local now = os.clock()
+	-- Always print a clip change; otherwise sample, so steady states still show
+	-- whether the numbers underneath them are steady too.
+	local changed = clip ~= lastKeeperLogClip
+	if not changed and now - lastKeeperLogAt < GoalkeeperConfig.Debug.LogInterval then
+		return
+	end
+	lastKeeperLogAt = now
+	lastKeeperLogClip = clip
+
+	local frameYaw = math.deg(math.atan2(-rootPart.CFrame.LookVector.X, -rootPart.CFrame.LookVector.Z))
+	--[[
+		HOW FAR THE TURN ARC HAS SWUNG THE BODY.
+
+		There is no "facing override on/off" attribute, and a boolean would be the
+		less useful thing anyway. `Pitchward` is the published centre of the
+		keeper's turn arc (out of their own goal, toward the pitch), so the angle
+		between the body and it says exactly how far the override has rotated the
+		measurement frame -- bounded by `MaximumFacingArcDegrees`. If this number
+		swings while the player holds one direction, that is the K5 hypothesis
+		confirmed in one field.
+	]]
+	local model = rootPart.Parent
+	local pitchward = if model then model:GetAttribute(GoalkeeperConfig.Attributes.Pitchward) else nil
+	local arcOffsetText = "n/a"
+	if typeof(pitchward) == "Vector3" then
+		local flat = getHorizontal(pitchward)
+		if flat.Magnitude > 0.01 then
+			local facing = getHorizontal(rootPart.CFrame.LookVector)
+			if facing.Magnitude > 0.01 then
+				arcOffsetText = string.format("%.1f", math.deg(
+					math.atan2(facing.Unit:Cross(flat.Unit).Y, facing.Unit:Dot(flat.Unit))
+				))
+			end
+		end
+	end
+
+	local diveText = "none"
+	if isDiving then
+		local launch = if typeof(diveVelocity) == "Vector3" then getHorizontal(diveVelocity) else Vector3.zero
+		local launchAngle = if launch.Magnitude > 0.01
+			then math.deg(math.atan2(launch.X, -launch.Z))
+			else 0
+		diveText = string.format(
+			"side=%s launchWorldAngle=%.1f launchSpeed=%.1f",
+			keeperDiveSide, launchAngle, launch.Magnitude
+		)
+	end
+
+	log(string.format(
+		"[GK] clip=%s travelAngle=%.1f fwd=%+.2f right=%+.2f speed=%.1f frame=%.1f arcOffset=%s holding=%s dive=[%s]",
+		clip, travelAngle, signedForward, signedRight, speed, frameYaw,
+		arcOffsetText, tostring(holdingBall), diveText
+	))
+end
+
 local function updateGoalkeeperAnimation(rootPart: BasePart, speed: number, deltaTime: number): boolean
 	local model = localPlayer.Character
 	if not model or model:GetAttribute(GoalkeeperConfig.RoleAttributeName) ~= GoalkeeperConfig.Role then
@@ -1473,7 +1653,242 @@ local function updateGoalkeeperAnimation(rootPart: BasePart, speed: number, delt
 		box, and doing that in a standing pose is a footballer gliding across the
 		grass. Moving feet with the wrong arms beats a statue on rails.
 	]]
-	if speed > keeperConfig.RunThreshold then
+	--[[
+		WHICH SET A KEEPER USES DEPENDS ON WHICH WAY THEY ARE GOING.
+
+		Two wrong answers before this one. First the keeper handed over to the
+		outfield set above a flat speed threshold, so any quick movement played
+		the outfield SPRINT -- an outfielder in gloves. Then it never handed over
+		at all inside the box, so a keeper charging out to the edge of his area
+		shuffled the whole way and ONLY the sidestep ever played.
+
+		The distinction is not speed and it is not the penalty area. It is the
+		direction of travel relative to where the keeper is facing:
+
+		  ACROSS the goal  -> the keeper's own sidestep, which is what a keeper
+		                      shuffling along their line actually does.
+		  TOWARDS or AWAY  -> ordinary jog and sprint, because a keeper closing
+		                      down a striker or racing back to their line is
+		                      running, and running is running.
+
+		A keeper's facing is pinned to the ball, so "forward" here genuinely means
+		toward the play rather than toward some arbitrary heading.
+	]]
+	local travel = getHorizontal(rootPart.AssemblyLinearVelocity)
+	--[[
+		TASK 0 (M6.9): SIGNED FIRST, MAGNITUDE SECOND.
+
+		The selector only needs magnitudes, so magnitudes were all that existed --
+		and that is precisely why K3/K4/K5 survived three fix attempts. "Lateral
+		4.0" cannot tell you left from right, and "forward 3.0" cannot tell you
+		forward from BACKWARDS, which is the whole of K4.
+
+		Both are kept: the signed pair for diagnosis and for any future
+		direction-aware clip choice, the magnitudes for the existing tests.
+	]]
+	local signedRight = travel:Dot(rootPart.CFrame.RightVector)
+	local signedForward = travel:Dot(rootPart.CFrame.LookVector)
+	local lateralSpeed = math.abs(signedRight)
+	local forwardSpeed = math.abs(signedForward)
+	--[[
+		The travel angle in the frame the decision is ACTUALLY made in -- the
+		body's own. 0 is straight ahead, +90 is the keeper's right, 180 is
+		straight back. This is the number the milestone's K5 hypothesis is about:
+		if it swings while the player holds one direction, the frame is moving
+		rather than the player.
+	]]
+	--[[
+		THE SECTOR IS MEASURED AGAINST THE GOAL, NOT AGAINST THE BODY.
+
+		Same lesson as the dive's clip side ("Measure Against Something That Does
+		Not Move"), applied one layer up. Measured against the body, this angle
+		swung 17 degrees inside 41 milliseconds on a steady input, because the
+		BODY was swinging -- a 244 degree yaw span across one session:
+
+			14:17:00.750  outfield JogForwardRight  angle=52.1   -> Forward
+			14:17:00.791  KeeperSideStep            travelAngle=69.2 -> Sideways
+
+		`Pitchward` -- out of the keeper's own goal -- does not move, and it is
+		the frame the football meaning is expressed in: 0 is off the line, +/-90
+		is ACROSS THE GOAL (a side step), +/-180 is back into the net (jog
+		backwards). Those are the sectors the player is asking for.
+
+		The body-relative pair above is kept for the diagnostic and for the clip,
+		which plays on the body; with the facing arc now bounded to 45 degrees
+		the two frames agree to within that, so the selection and the clip no
+		longer contradict each other.
+
+		Falls back to the body when `Pitchward` has not been published, which is
+		the previous behaviour rather than no behaviour.
+	]]
+	local keeperTravelAngle = math.deg(math.atan2(signedRight, signedForward))
+	local pitchwardAttribute = model:GetAttribute(GoalkeeperConfig.Attributes.Pitchward)
+	if typeof(pitchwardAttribute) == "Vector3" then
+		local goalForward = getHorizontal(pitchwardAttribute)
+		if goalForward.Magnitude > 0.01 and travel.Magnitude > 0.01 then
+			goalForward = goalForward.Unit
+			-- look:Cross(up), verified against CFrame.RightVector in all four
+			-- cardinal orientations; the other order is mirrored.
+			local goalRight = goalForward:Cross(Vector3.yAxis)
+			keeperTravelAngle = math.deg(
+				math.atan2(travel:Dot(goalRight), travel:Dot(goalForward))
+			)
+		end
+	end
+	local holdingBall = model:GetAttribute(GoalkeeperConfig.Attributes.Holding) == true
+
+	--[[
+		A DIVE IS NEVER HANDED TO THE OUTFIELD SET.
+
+		The handover below asks "is this keeper travelling forward faster than a
+		shuffle?", and a dive launches at 19-31 studs/s -- so a keeper diving
+		FORWARD onto a ball, the commonest dive of all, answered yes and was
+		animated as an outfielder sprinting. The runtime log caught it exactly:
+
+			[GK] runo dives LowDive ... speed=27
+			State -> JogForward family=Jog speed=27.0 playback=1.60
+
+		A dive is the keeper's own action whichever way it goes, so it is
+		excluded from the handover before the question is asked.
+	]]
+	local isDiving = model:GetAttribute(GoalkeeperConfig.Attributes.Diving) == true
+
+	--[[
+		A RUNNING KEEPER IS A RUNNER, WHATEVER ANGLE THE BODY IS AT.
+
+		The handover used to require forward speed to BEAT lateral speed, which
+		sounds right and is wrong in practice: a keeper's body turns to face the
+		ball, so running out to close an attacker down is "sideways" as far as
+		the torso is concerned. Those runs stayed on the keeper set and were
+		animated with the shuffle clip at absurd rates -- the log has
+		`KeeperSideStep speed=45.2`, which is a sprint being played as a
+		side step.
+
+		Speed decides now, not angle. Past SideStepMaximumSpeed the outfield set
+		takes over, and that set has real directional clips, so a fast sideways
+		run gets JogLeft/JogRight rather than the shuffle stretched to fit. Below
+		it the keeper keeps their own clips and the side step means what it says:
+		working the line.
+
+		This is what was asked for -- jog and sprint when travelling, side step
+		when moving sideways along the line -- and it is camera-independent
+		because every quantity here is measured against the BODY, never the
+		camera.
+	]]
+	local travelSpeed = travel.Magnitude
+
+	--[[
+		WHICH SECTOR THE KEEPER IS TRAVELLING IN.
+
+		Forward / sideways / backward, decided by ANGLE rather than by a lateral
+		speed -- see AnimationConfig.Goalkeeper.ForwardSectorDegrees for the
+		runtime evidence that a studs/s threshold cannot express "sideways".
+
+		Hysteresis: the boundary is widened in favour of whichever sector is
+		already running, so a keeper holding a diagonal near a boundary keeps one
+		clip instead of alternating at frame rate.
+	]]
+	local absTravelAngle = math.abs(keeperTravelAngle)
+	local forwardEdge = keeperConfig.ForwardSectorDegrees
+	local backwardEdge = keeperConfig.BackwardSectorDegrees
+	local hysteresis = keeperConfig.SectorHysteresisDegrees
+	if keeperSector == "Forward" then
+		forwardEdge += hysteresis
+	elseif keeperSector == "Backward" then
+		backwardEdge -= hysteresis
+	elseif keeperSector == "Sideways" then
+		forwardEdge -= hysteresis
+		backwardEdge += hysteresis
+	end
+
+	--[[
+		STANDING STILL IS STANDING STILL.
+
+		The sector was HELD at a standstill so noise could not flap it -- but the
+		clip was chosen from that held sector, so a keeper who stopped after
+		moving sideways kept shuffling on the spot:
+
+			clip=KeeperSideStep travelAngle=0.0 fwd=+0.00 right=+0.00 speed=0.0
+
+		-- and only stopped when the player moved forward and the sector finally
+		changed. Reported exactly that way.
+
+		The sector is still held (it is the hysteresis memory, and that is worth
+		keeping), but `keeperStationary` now says plainly that there is no
+		movement to animate, and the clip choice reads that instead.
+	]]
+	local keeperStationary = travelSpeed < keeperConfig.SideStepMinimumSpeed
+	local sector
+	if keeperStationary then
+		sector = if keeperSector ~= "" then keeperSector else "Forward"
+	elseif absTravelAngle < forwardEdge then
+		sector = "Forward"
+	elseif absTravelAngle > backwardEdge then
+		sector = "Backward"
+	else
+		sector = "Sideways"
+	end
+	keeperSector = sector
+
+	if
+		not holdingBall
+		and not isDiving
+		-- A keeper on the floor getting back up is committed movement, exactly
+		-- like the dive that put them there. This is also where the absurd
+		-- `KeeperSideStep speed=45.2` readings came from before the get-up clip
+		-- existed: the body still carrying dive velocity after `Diving` had
+		-- already gone false.
+		and keeperGetUpSlot == ""
+		--[[
+			On the very frame a dive ENDS, `isDiving` is already false but the
+			get-up has not been chosen yet -- it is selected further down this
+			same function. Without this the keeper hands over to the outfield set
+			for exactly one frame, at full dive velocity, which is the flicker
+			the get-up clip exists to remove.
+		]]
+		and not keeperWasDiving
+		and (
+			--[[
+				GENUINELY RUNNING: travelling forward or backward faster than a
+				shuffle, and more that way than sideways. This is the original
+				test, and it was right -- a keeper closing a striker down or
+				sprinting back to their line is running.
+
+				Replacing it with a pure speed cap (the previous attempt) broke
+				exactly this case: a keeper running out at 26 studs/s fell
+				through every branch and played the IDLE clip, because the
+				movement was neither lateral enough to side step nor fast enough
+				to clear a 32 stud/s cap.
+			]]
+			--[[
+				Genuinely running STRAIGHT. The lateral test is the same one the
+				side step uses, so exactly one of the two can be true -- if there
+				is enough sideways movement to side step, this cannot fire, and
+				the keeper keeps their own clips.
+			]]
+			--[[
+				TRAVELLING STRAIGHT -- either way.
+
+				Forward hands to the outfield jog/sprint; BACKWARD hands to the
+				outfield jog-backward, which is the whole of K4. The previous
+				test could never reach the backward clip, because backward travel
+				always carries some lateral and the lateral test claimed it for
+				the side step first.
+			]]
+			(
+				not keeperStationary
+				and (sector == "Forward" or sector == "Backward")
+				and travelSpeed > keeperConfig.RunThreshold
+			)
+			--[[
+				BACKSTOP for speeds no keeper produces on their feet. With the
+				get-up clip now owning the whole dive recovery this should never
+				fire; it stays as the guard against any future path that leaves
+				the body carrying launch velocity outside a known state.
+			]]
+			or travelSpeed > keeperConfig.SideStepMaximumSpeed
+		)
+	then
 		if keeperPresentationActive then
 			stopFamily("Keeper", keeperConfig.FadeOutTime)
 			keeperPresentationActive = false
@@ -1481,12 +1896,150 @@ local function updateGoalkeeperAnimation(rootPart: BasePart, speed: number, delt
 		return false
 	end
 
+	--[[
+		THE DIVE OWNS THE KEEPER.
+
+		Chosen from the approved dive's own velocity rather than from the body's
+		current motion: the clip has to be picked at the instant the dive is
+		granted, before the keeper has actually gone anywhere, and the velocity
+		attribute is the only thing that knows the answer that early.
+
+		The clips are authored in place -- no lateral and no vertical travel --
+		so this supplies the pose only. The travel is the humanoid being driven
+		at the approved velocity (MovementController) and going to ground is the
+		roll applied there too.
+	]]
 	local desired = "KeeperIdle"
-	if model:GetAttribute(GoalkeeperConfig.Attributes.Holding) == true and activeTracks.KeeperIdleWithBall then
-		desired = "KeeperIdleWithBall"
-	else
-		local lateral = math.abs(getHorizontal(rootPart.AssemblyLinearVelocity):Dot(rootPart.CFrame.RightVector))
-		if lateral >= keeperConfig.SideStepMinimumSpeed and activeTracks.KeeperSideStep then
+	local diveVelocity = model:GetAttribute(GoalkeeperConfig.Attributes.DiveVelocity)
+	if isDiving and typeof(diveVelocity) == "Vector3" then
+		local lateral = getHorizontal(diveVelocity)
+		if lateral.Magnitude > 0.05 then
+			--[[
+				THE SIDE IS DECIDED ONCE, ON THE FIRST FRAME OF THE DIVE.
+
+				It used to be recomputed every frame against
+				`rootPart.CFrame.RightVector` -- but MovementController rolls that
+				CFrame 78 degrees during the dive, so as the body tipped past
+				vertical the dot product flipped and the clip flipped with it:
+
+					KeeperDiveLeft  speed=0.2
+					KeeperDiveRight speed=16.2
+					KeeperDiveLeft  speed=12.8
+
+				Three clip restarts inside one dive, each one resetting the
+				animation to frame zero, which is why the keeper appeared to
+				thrash in place rather than dive. The body is only upright on the
+				first frame, so that is the only frame the question has an honest
+				answer.
+			]]
+			if not keeperWasDiving then
+				--[[
+					MEASURED AGAINST THE GOAL, NOT AGAINST THE BODY.
+
+					This used to be the SIGN of `lateral:Dot(RightVector)`, and a
+					sign cannot tell a dive to the right from a dive backwards --
+					both have a positive right-component. The runtime showed
+					exactly that: dives launched 164.6 and 178.5 degrees from the
+					body, i.e. straight BEHIND the keeper, still selecting a
+					sideways clip.
+
+						launchWorld=90.0  frame= -1.3  ->  +91.3  to their right
+						launchWorld=-90.9 frame= 90.6  -> +178.5  BEHIND
+						launchWorld=89.4  frame=-75.2  -> +164.6  BEHIND
+
+					The body is the wrong reference because it turns: the keeper
+					may face up to `MaximumFacingArcDegrees` off the pitch, and at
+					that extreme a ball in front of goal IS behind them.
+					`Pitchward` -- out of their own goal, the published centre of
+					the turn arc -- does not move, so left and right measured
+					against it mean what they say for the whole dive.
+
+					Falls back to the body when `Pitchward` is unavailable, which
+					is the old behaviour rather than no behaviour.
+				]]
+				local reference = nil
+				local pitchward = model:GetAttribute(GoalkeeperConfig.Attributes.Pitchward)
+				if typeof(pitchward) == "Vector3" then
+					local flat = getHorizontal(pitchward)
+					if flat.Magnitude > 0.01 then
+						reference = flat.Unit
+					end
+				end
+				if not reference then
+					reference = getHorizontal(rootPart.CFrame.LookVector)
+					reference = if reference.Magnitude > 0.01 then reference.Unit else Vector3.zAxis
+				end
+				--[[
+					`look:Cross(up)`, NOT `up:Cross(look)`. Verified against
+					`CFrame.lookAt(...).RightVector` in all four cardinal
+					orientations: the other order is mirrored every time, which
+					would have swapped left and right for every dive.
+				]]
+				local right = reference:Cross(Vector3.yAxis)
+				keeperDiveSide = if lateral.Unit:Dot(right) >= 0 then "Right" else "Left"
+			end
+			local slot = "KeeperDive" .. keeperDiveSide
+			if activeTracks[slot] then
+				desired = slot
+			end
+		end
+	end
+
+	--[[
+		THE DIVE ENDING STARTS THE GET-UP.
+
+		Detected on the true -> false edge of `Diving`, because that is the only
+		moment the dive announces it is over. The side is remembered from the
+		dive itself: getting up from a left dive is a different movement from
+		getting up from a right one, and by now the body's velocity has decayed
+		too far to tell them apart.
+	]]
+	local now = os.clock()
+	if keeperWasDiving and not isDiving then
+		-- Cleared here so the NEXT dive has to wait for its own clip.
+		model:SetAttribute(keeperConfig.DiveStartedAttribute or "Beyond90KeeperDiveClipStarted", nil)
+		local slot = "KeeperGetUp" .. keeperDiveSide
+		local record = activeTracks[slot]
+		if record and record.Track then
+			local length = record.Track.Length
+			if length <= 0 then
+				length = keeperConfig.GetUpFallbackDuration
+			end
+			keeperGetUpSlot = slot
+			keeperGetUpUntil = now + length / math.max(keeperConfig.GetUpPlaybackRate, 0.01)
+			--[[
+				Published so MovementController holds the body for exactly as
+				long as the CLIP runs. Two timers for one event is how they end
+				up disagreeing.
+			]]
+			model:SetAttribute(keeperConfig.GetUpAttribute, keeperGetUpUntil)
+		end
+	end
+	keeperWasDiving = isDiving
+
+	if keeperGetUpSlot ~= "" then
+		if now >= keeperGetUpUntil or isDiving then
+			keeperGetUpSlot = ""
+			keeperGetUpUntil = 0
+			model:SetAttribute(keeperConfig.GetUpAttribute, nil)
+		elseif activeTracks[keeperGetUpSlot] then
+			desired = keeperGetUpSlot
+		end
+	end
+
+	if desired == "KeeperIdle" then
+		if holdingBall and activeTracks.KeeperIdleWithBall then
+			desired = "KeeperIdleWithBall"
+		elseif sector == "Sideways" and not keeperStationary and activeTracks.KeeperSideStep then
+			--[[
+				ANY LEFT OR RIGHT MOVEMENT SIDE STEPS. Asked for directly, three
+				times, and the previous qualifier is why it kept not happening:
+				requiring `lateralSpeed >= forwardSpeed` meant a diagonal --
+				which is most real keeper movement -- fell through to the
+				outfield jog. A keeper going even slightly across their goal is
+				side-stepping; only travel that is essentially straight
+				forward or straight back is a run.
+			]]
 			desired = "KeeperSideStep"
 		end
 	end
@@ -1497,17 +2050,115 @@ local function updateGoalkeeperAnimation(rootPart: BasePart, speed: number, delt
 		keeperPresentationActive = true
 	end
 	if currentKeeperClip ~= desired then
-		for _, slot in { "KeeperIdle", "KeeperIdleWithBall", "KeeperSideStep" } do
+		for _, slot in {
+			"KeeperIdle",
+			"KeeperIdleWithBall",
+			"KeeperSideStep",
+			"KeeperDiveLeft",
+			"KeeperDiveRight",
+			"KeeperGetUpLeft",
+			"KeeperGetUpRight",
+		} do
 			if slot ~= desired then
-				stopTrack(slot, keeperConfig.FadeOutTime)
+				--[[
+					A dive leaves on a longer fade than the guard clips. Coming
+					off the floor into `KeeperIdleWithBall` is the visible end of
+					a save, and cutting it at the guard-step fade snaps the
+					keeper upright the instant the ball is gathered.
+				]]
+				local fade = if slot == "KeeperDiveLeft" or slot == "KeeperDiveRight"
+					then keeperConfig.DiveExitBlendTime
+					else keeperConfig.FadeOutTime
+				stopTrack(slot, fade)
 			end
 		end
 		currentKeeperClip = desired
 	end
-	playTrack(desired, keeperConfig.FadeInTime, 1, keeperConfig.PlaybackRate)
-	currentBasePlaybackRate = keeperConfig.PlaybackRate
-	currentPlaybackRate = keeperConfig.PlaybackRate
-	updateDiagnostics(desired, "Goalkeeper", "Idle", 0, speed, false, false, "Forward", 0, 0, 0, false)
+	--[[
+		Faster feet, same clip. See AnimationConfig keeper presentation: a keeper
+		moving at pace plays its own animation quicker rather than handing over to
+		the outfield sprint, which reads as an outfielder in gloves.
+	]]
+	--[[
+		A dive plays at its authored rate, not at a speed-scaled one. Scaling by
+		speed would run it at the clamped maximum every time -- a dive launches
+		far above the reference speed -- and a dive that finishes in a third of
+		its length reads as a flinch rather than as going to ground.
+	]]
+	if desired == "KeeperDiveLeft" or desired == "KeeperDiveRight" then
+		playTrack(desired, keeperConfig.DiveFadeInTime, 1, keeperConfig.DivePlaybackRate)
+		currentBasePlaybackRate = keeperConfig.DivePlaybackRate
+		currentPlaybackRate = keeperConfig.DivePlaybackRate
+		--[[
+			THE CLIP ANNOUNCES THAT IT HAS STARTED.
+
+			MovementController holds the launch until this appears, so the body
+			and the animation begin on the same frame instead of the body going
+			first. See `DiveStartedAttribute`.
+		]]
+		local startedAttribute = keeperConfig.DiveStartedAttribute or "Beyond90KeeperDiveClipStarted"
+		if model:GetAttribute(startedAttribute) == nil then
+			model:SetAttribute(startedAttribute, os.clock())
+		end
+		updateDiagnostics(
+			desired, "Goalkeeper", "Dive", keeperTravelAngle, speed, holdingBall, false,
+			"Forward", 0, signedForward, signedRight, false
+		)
+		logKeeper(
+			desired, keeperTravelAngle, signedForward, signedRight, speed,
+			isDiving, diveVelocity, holdingBall, rootPart
+		)
+		return true
+	end
+
+	--[[
+		THE GET-UP PLAYS AT THE RATE ITS WINDOW WAS SIZED WITH.
+
+		It used to fall through to the speed-scaled rate below, which at a
+		standstill clamps to `MinimumPlaybackRate` -- so a keeper pushing up off
+		the grass, who is by definition not moving, always got the SLOWEST clip
+		in the set. Meanwhile `keeperGetUpUntil` was computed from
+		`GetUpPlaybackRate`, so the window and the clip disagreed by that ratio
+		and MovementController handed the body back early.
+
+		One rate, used for both, in the branch that owns the clip.
+	]]
+	if keeperGetUpSlot ~= "" and desired == keeperGetUpSlot then
+		local getUpRate = math.max(keeperConfig.GetUpPlaybackRate, 0.01)
+		playTrack(desired, keeperConfig.FadeInTime, 1, getUpRate)
+		currentBasePlaybackRate = getUpRate
+		currentPlaybackRate = getUpRate
+		updateDiagnostics(
+			desired, "Goalkeeper", "Idle", keeperTravelAngle, speed, holdingBall, false,
+			"Forward", 0, signedForward, signedRight, false
+		)
+		logKeeper(
+			desired, keeperTravelAngle, signedForward, signedRight, speed,
+			isDiving, diveVelocity, holdingBall, rootPart
+		)
+		return true
+	end
+
+	local rate = keeperConfig.PlaybackRate
+	if keeperConfig.SpeedScaledPlayback == true then
+		local reference = math.max(keeperConfig.PlaybackReferenceSpeed or 6, 0.1)
+		rate = math.clamp(
+			keeperConfig.PlaybackRate * (speed / reference),
+			keeperConfig.MinimumPlaybackRate or 0.85,
+			keeperConfig.MaximumPlaybackRate or 1.9
+		)
+	end
+	playTrack(desired, keeperConfig.FadeInTime, 1, rate)
+	currentBasePlaybackRate = rate
+	currentPlaybackRate = rate
+	updateDiagnostics(
+		desired, "Goalkeeper", "Idle", keeperTravelAngle, speed, holdingBall, false,
+		"Forward", 0, signedForward, signedRight, false
+	)
+	logKeeper(
+		desired, keeperTravelAngle, signedForward, signedRight, speed,
+		isDiving, diveVelocity, holdingBall, rootPart
+	)
 	return true
 end
 
@@ -1688,6 +2339,7 @@ local function configureCharacter(character: Model)
 	loadTrack("Jump", assets.Locomotion.Jump, "B90_LOC_Jump", jumpConfig.Priority, false)
 	loadTrack("Pass", assets.Actions.Pass, "B90_ACT_Pass", passConfig.Priority, false)
 	loadTrack("Shoot", assets.Actions.Shoot, "B90_ACT_Shoot", shootConfig.Priority, false)
+	loadTrack("Celebration", assets.Actions.Celebration, "B90_ACT_Celebration", celebrationConfig.Priority, false)
 
 	--[[
 		THE KEEPER SET.
@@ -1709,6 +2361,27 @@ local function configureCharacter(character: Model)
 		loadTrack("KeeperSideStep", keeperAssets.SideStep, "B90_GK_SideStep", keeperConfig.MovementPriority, true)
 		loadTrack("KeeperCatchStanding", keeperAssets.CatchStanding, "B90_GK_CatchStanding", keeperConfig.ActionPriority, false)
 		loadTrack("KeeperThrowPass", keeperAssets.ThrowPass, "B90_GK_ThrowPass", keeperConfig.ActionPriority, false)
+		--[[
+			Looped, despite being one-shot clips. A dive lasts as long as the
+			server says it lasts, and holding the final frame is what keeps the
+			keeper on the floor for the rest of it -- a non-looping track would
+			expire and let the rig stand back up underneath a dive still in
+			progress. The clips end on the grounded pose, so looping reads as
+			lying there rather than as a repeat.
+		]]
+		loadTrack("KeeperDiveLeft", keeperAssets.DiveLeft, "B90_GK_DiveLeft", keeperConfig.ActionPriority, true)
+		loadTrack("KeeperDiveRight", keeperAssets.DiveRight, "B90_GK_DiveRight", keeperConfig.ActionPriority, true)
+
+		--[[
+			The get-up clips, NOT looped -- unlike the dives.
+
+			A dive loops because it has to hold the grounded pose for as long as
+			the server says the dive lasts. Getting up is the opposite: it runs
+			once, and its length is precisely the thing being used as the
+			recovery window, so looping it would make that window meaningless.
+		]]
+		loadTrack("KeeperGetUpLeft", keeperAssets.GetUpLeft, "B90_GK_GetUpLeft", keeperConfig.ActionPriority, false)
+		loadTrack("KeeperGetUpRight", keeperAssets.GetUpRight, "B90_GK_GetUpRight", keeperConfig.ActionPriority, false)
 	end
 	for slot, animationId in transitionAssets do
 		local slotConfig = transitionConfig[slot]
@@ -1752,6 +2425,55 @@ function AnimationController.Initialize()
 	end))
 	table.insert(appConnections, FootballActionController.GetPresentationEvent().Event:Connect(onFootballActionPresentation))
 	renderConnection = RunService.RenderStepped:Connect(updateAnimation)
+	connectCelebration()
+end
+
+--[[
+	Play the goal celebration.
+
+	Public because the trigger is a MATCH event, not a movement one -- the
+	client learns about a goal from the goal remote, and nothing in the
+	locomotion state machine can know a goal was scored.
+
+	Refused while an action is already committed: a celebration must never cut
+	off the shot that caused it.
+]]
+function AnimationController.PlayCelebration(): boolean
+	if celebrationConfig.Enabled ~= true or not activeTracks.Celebration then
+		return false
+	end
+	startAction("Celebration")
+	return true
+end
+
+--[[
+	Listen for goals and celebrate the ones this player's team scored.
+
+	The goal remote reports which goal the ball ENTERED, and a team's attacking
+	goal is published on the character -- so "we scored" is those two agreeing.
+	Conceding plays nothing, which is the point: a celebration that fired on
+	every goal would be worse than none.
+]]
+function connectCelebration()
+	task.spawn(function()
+		local remotes = ReplicatedStorage:WaitForChild(FootballActionConfig.RemotesFolderName, 10)
+		local goalRemote = remotes and remotes:WaitForChild(GoalConfig.GoalScoredRemoteName, 10)
+		if not goalRemote or not goalRemote:IsA("RemoteEvent") then
+			return
+		end
+		celebrationConnection = goalRemote.OnClientEvent:Connect(function(payload)
+			if typeof(payload) ~= "table" then
+				return
+			end
+			local character = localPlayer.Character
+			local attacking = character
+				and character:GetAttribute(FootballTeamConfig.AttackingGoalAttributeName)
+			if attacking == nil or payload.EnteredGoal ~= attacking then
+				return
+			end
+			AnimationController.PlayCelebration()
+		end)
+	end)
 end
 
 function AnimationController.Destroy()
@@ -1762,6 +2484,10 @@ function AnimationController.Destroy()
 	if renderConnection then
 		renderConnection:Disconnect()
 		renderConnection = nil
+	end
+	if celebrationConnection then
+		celebrationConnection:Disconnect()
+		celebrationConnection = nil
 	end
 	for _, connection in appConnections do
 		connection:Disconnect()

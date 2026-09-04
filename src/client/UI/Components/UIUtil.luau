@@ -9,8 +9,11 @@ function UIUtil.AddCorner(instance: GuiObject, radius: UDim?)
 	return corner
 end
 
+-- Border only. Contextual (the default) outlines the GLYPHS on a text control
+-- rather than the frame; see ReactUI.Stroke for what that looked like.
 function UIUtil.AddStroke(instance: GuiObject, color: Color3?, thickness: number?)
 	local stroke = Instance.new("UIStroke")
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 	stroke.Color = color or Theme.Stroke
 	stroke.Thickness = thickness or 1
 	stroke.Transparency = 0.2

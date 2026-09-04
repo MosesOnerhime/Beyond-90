@@ -76,10 +76,51 @@ local function inspectCrossing(goal, previous: Vector3, current: Vector3)
 	local crossingPosition = previous:Lerp(current, alpha)
 	local lateral = math.abs((crossingPosition - goal.MouthCenter):Dot(goal.WidthAxis))
 	local insideWidth = lateral <= goal.Width / 2 - radius - GoalConfig.GeometrySafetyMargin
-	local insideHeight = crossingPosition.Y >= goal.BottomY + radius
+
+	--[[
+		THERE IS NO BOTTOM BAR ON A GOAL.
+
+		The lower bound used to be `Y >= BottomY + radius` -- the same "clear the
+		frame by a whole ball" test the crossbar needs. But the bottom of a goal
+		is the GRASS. A ball rolling over the line along the ground is the most
+		ordinary goal in football, and it was being asked to float a full radius
+		above the goal's bottom edge to count.
+
+		On the development stadium that left 0.200 studs of clearance for a ball
+		whose centre rests at 0.975. Any dip -- a sample taken mid-bounce, a
+		fraction of compression against the turf -- failed the test. Every goal
+		in the logs that DID register was airborne (Y = 2.05, 4.07, 5.20); the
+		ones that went missing were the ones on the deck.
+
+		So the floor is the floor: a ball at or above ground level is in. The
+		crossbar keeps its radius and margin, because that bar is really there.
+	]]
+	local insideHeight = crossingPosition.Y >= goal.BottomY
 		and crossingPosition.Y <= goal.TopY - radius - GoalConfig.GeometrySafetyMargin
 
 	if not insideWidth or not insideHeight then
+		--[[
+			NEVER FAIL A GOAL SILENTLY.
+
+			This returned with no log, so a shot that crossed the line and was
+			judged out of frame left NOTHING behind -- which is exactly why "goals
+			sometimes don't register" could not be diagnosed from a playtest log.
+			Say which test failed and by how much.
+		]]
+		log(string.format(
+			"goal=%s NO GOAL -- ball crossed the line but was judged outside the frame."
+				.. " position=%s insideWidth=%s (lateral=%.2f limit=%.2f)"
+				.. " insideHeight=%s (y=%.2f band=%.2f..%.2f)",
+			goal.Id,
+			tostring(crossingPosition),
+			tostring(insideWidth),
+			lateral,
+			goal.Width / 2 - radius - GoalConfig.GeometrySafetyMargin,
+			tostring(insideHeight),
+			crossingPosition.Y,
+			goal.BottomY,
+			goal.TopY - radius - GoalConfig.GeometrySafetyMargin
+		))
 		return
 	end
 
@@ -160,6 +201,40 @@ function GoalService.Initialize(ball: BasePart, ballSampledEvent: BindableEvent?
 			liveBallScored = false
 			return
 		end
+		--[[
+			THE LATCH HAS TO CLEAR ITSELF.
+
+			`liveBallScored` is a GLOBAL block -- once a goal is counted, every
+			further crossing at either end is ignored until it clears. And the
+			only thing that cleared it was `isReset`, a full ball reset. Any
+			restart that repositions the ball WITHOUT going through a reset left
+			the flag stuck on, and from that moment no goal could ever be scored
+			again for the rest of the match. Silently, because the guard sits
+			above the near-miss logging.
+
+			That is the "sometimes a goal doesn't register" report: it is not
+			random, it is everything after the first goal that restarts the wrong
+			way.
+
+			Rather than wire every restart path to remember to clear it, the
+			latch now heals on the only condition that actually matters -- the
+			ball being back out in play, clear of both goals. A ball that has
+			left the net cannot still be the goal that was already counted.
+		]]
+		if liveBallScored then
+			local clearOfEveryGoal = true
+			for _, goal in goals do
+				local depth = (current - goal.LinePoint):Dot(goal.InwardDirection)
+				if depth > -GoalConfig.LatchClearDistance then
+					clearOfEveryGoal = false
+				end
+			end
+			if clearOfEveryGoal then
+				table.clear(scoredLatch)
+				liveBallScored = false
+			end
+		end
+
 		if previousPosition then
 			for _, goal in goals do
 				inspectCrossing(goal, previousPosition, current)
